@@ -47,10 +47,23 @@ jobs:
           done
           if [ -n "$missing" ]; then exit 1; fi
 
+      - name: Достать свежую память из кэша
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/solaris-cache
+          key: state-none
+          restore-keys: |
+            state-
+
       - name: Расшифровать состояние
         run: |
-          if [ -f state.enc ]; then
-            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STATE_KEY -in state.enc -out "$STATE_FILE" || echo "состояние не расшифровалось, начинаем с чистого"
+          SRC=state.enc
+          if [ -f /tmp/solaris-cache/state.enc ]; then SRC=/tmp/solaris-cache/state.enc; fi
+          if [ -f "$SRC" ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STATE_KEY -in "$SRC" -out "$STATE_FILE" || {
+              echo "память из кэша не расшифровалась, берём из репозитория"
+              if [ -f state.enc ]; then openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STATE_KEY -in state.enc -out "$STATE_FILE" || echo "начинаем с чистого"; fi
+            }
           fi
 
       - name: Запуск
@@ -60,11 +73,26 @@ jobs:
           if [ "${{ github.event.schedule }}" = "17 7 1 * *" ]; then MODE=report; fi
           python monitor.py "${MODE:-check}"
 
-      - name: Сохранить состояние (зашифровано)
+      - name: Зашифровать память
         if: always()
         run: |
-          if [ -f "$STATE_FILE.changed" ] && [ -f "$STATE_FILE" ]; then
-            openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STATE_KEY -in "$STATE_FILE" -out state.enc
+          mkdir -p /tmp/solaris-cache
+          if [ -f "$STATE_FILE" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STATE_KEY -in "$STATE_FILE" -out /tmp/solaris-cache/state.enc
+          fi
+
+      - name: Сохранить память в кэш
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/solaris-cache
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Сохранить память в репозиторий (только при важных изменениях)
+        if: always()
+        run: |
+          if [ -f "$STATE_FILE.commit" ] && [ -f /tmp/solaris-cache/state.enc ]; then
+            cp /tmp/solaris-cache/state.enc state.enc
             git config user.name "solaris-monitor"
             git config user.email "monitor@users.noreply.github.com"
             git add state.enc

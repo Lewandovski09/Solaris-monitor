@@ -103,6 +103,7 @@ class Telegram:
         self.staff = env("TELEGRAM_CHAT_ID")
         self.sent = 0
         self.last_id = None
+        self.blocked = set()
 
     def photo(self, chat, path, caption, markup=None):
         """Картинка с подписью. Если не получилось - обычный текст."""
@@ -139,6 +140,8 @@ class Telegram:
             except Exception:
                 self.last_id = None
             self.sent += 1 if r.ok else 0
+            if r.status_code == 403 and str(chat) != str(self.staff):
+                self.blocked.add(str(chat))  # клиент заблокировал бота или удалил чат
             if not r.ok:
                 print("Telegram: сообщение не ушло, код", r.status_code)
             return r.ok
@@ -149,10 +152,19 @@ class Telegram:
     def staff_msg(self, text):
         return self.send(self.staff, text)
 
-    def clients(self, chats, text):
+    def quiet(self):
+        """Тихие часы у клиентов: с 23:00 до 07:00 по Киеву."""
+        h = now().hour
+        return h >= 23 or h < 7
+
+    def clients(self, chats, text, urgent=False):
+        """Клиентам. Ночью уходит только срочное (свет отключили / включили), остальное - в утренней сводке."""
+        if not urgent and self.quiet():
+            return False
         for chat in dict.fromkeys(str(c) for c in (chats or []) if c):
             if chat != str(self.staff):
                 self.send(chat, text)
+        return True
 
     def both(self, chats, text):
         """Сотрудникам всегда, клиентам - всем чатам, привязанным к станции."""
@@ -332,6 +344,48 @@ def planned_now(dtek, q, t, margin_min=40):
     return False if (dtek["days"].get(t.strftime("%Y-%m-%d")) or {}).get(q) is not None else None
 
 
+def planned_end(dtek, q, t):
+    """Когда по графику очереди закончится текущее отключение."""
+    if not dtek or not q:
+        return None
+    cur = t.replace(minute=30 if t.minute >= 30 else 0, second=0, microsecond=0)
+    for _ in range(96):
+        sl = (dtek["days"].get(cur.strftime("%Y-%m-%d")) or {}).get(q)
+        if sl is None:
+            return None if cur.date() == t.date() else cur  # график на завтра ещё не вышел - считаем до полуночи
+        if sl[cur.hour * 2 + (1 if cur.minute >= 30 else 0)] != 2:
+            return cur if cur > t else None
+        cur += timedelta(minutes=30)
+    return None
+
+
+def usual_rate(st, sid):
+    """Обычная скорость разряда без сети, % в час: медиана по отключениям за 30 дней."""
+    cut = (now() - timedelta(days=30)).isoformat()
+    r = sorted((x["soc_start"] - x["soc_end"]) / (x["min"] / 60) for x in st["log"]
+               if x.get("sid") == sid and x.get("start", "") >= cut and x.get("min", 0) >= 45
+               and x.get("soc_start") is not None and x.get("soc_end") is not None and x["soc_start"] > x["soc_end"])
+    return r[len(r) // 2] if len(r) >= 2 else None
+
+
+def forecast_line(st, sid, soc, t, until, rate=None):
+    """Строка «хватит ли заряда до конца отключения»."""
+    out = f"\nЗа графіком світло мають дати о {hm(until)}." if until else ""
+    rate = rate or usual_rate(st, sid)
+    if soc is None or not rate or rate <= 0:
+        return out
+    left_h = max(0, (soc - 15) / rate)
+    empty = t + timedelta(hours=left_h)
+    if until:
+        if empty >= until + timedelta(minutes=30):
+            out += f" Заряду має вистачити: за звичного споживання його стане до ~{hm(empty)}."
+        else:
+            out += f"\n⚠️ Заряду може не вистачити: за звичного споживання АКБ опуститься до 15% близько {hm(empty)}. Вимкніть потужні прилади."
+    else:
+        out += f"\nЗа звичного споживання заряду вистачить приблизно на {dur(left_h * 60)}."
+    return out
+
+
 def is_emergency(text):
     t = EMERGENCY_NEG.sub("", text or "")
     return bool(EMERGENCY.search(t))
@@ -426,12 +480,21 @@ def queue_grid(prefix, extra=None):
     return {"inline_keyboard": rows}
 
 
-def ask_queue(tg, st, chat, change=False):
-    mine = [p for p in st["stations"].values() if chat in (p.get("clients") or [])]
-    cur = queue_key(mine[0].get("queue")) if len(mine) == 1 else None
-    head = (f"Зараз ваша черга ДТЕК: <b>{cur.replace('GPV', '')}</b>.\nОберіть нову:" if cur and change
-            else "Оберіть вашу чергу ДТЕК — так бот знатиме ваш графік відключень:")
-    tg.send(chat, head, queue_grid("cq:", {"text": "Не знаю свою чергу", "callback_data": "cq:?"}))
+def ask_queue(tg, st, chat, change=False, sid=None):
+    mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
+    if sid is None and len(mine) > 1:  # несколько объектов - сначала выбрать объект
+        tg.send(chat, "Для якого об'єкта вказати чергу ДТЕК?", {"inline_keyboard": [[
+            {"text": str(st["stations"][k].get("title") or st["stations"][k].get("name"))[:40], "callback_data": f"cs:{k}"}] for k in mine]})
+        return
+    sid = sid or (mine[0] if mine else None)
+    if not sid:
+        return
+    p = st["stations"][sid]
+    cur = queue_key(p.get("queue"))
+    name = f"<b>{esc(p.get('title') or p.get('name'))}</b>. " if len(mine) > 1 else ""
+    head = (f"{name}Зараз черга ДТЕК: <b>{cur.replace('GPV', '')}</b>.\nОберіть нову:" if cur
+            else f"{name}Оберіть вашу чергу ДТЕК — так бот знатиме ваш графік відключень:")
+    tg.send(chat, head, queue_grid(f"cq:{sid}:", {"text": "Не знаю свою чергу", "callback_data": "cq:?"}))
 
 
 def match_stations(st, text):
@@ -464,11 +527,16 @@ PICK = {"/link": ("L", "Для какой станции нужна ссылка
 def callback(tg, st, chat, data, who, dtek):
     """Нажатие кнопки под сообщением."""
     kind, _, rest = (data or "").partition(":")
+    if kind == "cs":  # клиент выбрал объект
+        if chat in (st["stations"].get(rest, {}).get("clients") or []):
+            ask_queue(tg, st, chat, sid=rest)
+        return
     if kind == "cq":  # клиент выбрал очередь
         if rest == "?":
             tg.send(chat, HOWTO + "\n\nКоли дізнаєтесь — натисніть «" + BTN_QUEUE + "» і оберіть її.", KEYBOARD)
         else:
-            client_queue(tg, st, chat, rest, who)
+            c_sid, _, q = rest.rpartition(":")
+            client_queue(tg, st, chat, q, who, c_sid or None)
         return
     if chat != str(tg.staff):
         return
@@ -539,6 +607,10 @@ def client_status(st, chat):
                     left = (last["soc"] - 15) / rate if rate > 0 else 0
                     if left > 0:
                         line += f"\nЗа такого споживання заряду вистачить ще приблизно на {dur(left * 60)} (до залишку 15%)."
+                        until = datetime.fromisoformat(p["off_until"]) if p.get("off_until") else None
+                        if until and until > now():
+                            ok = now() + timedelta(hours=left) >= until + timedelta(minutes=30)
+                            line += f"\nЗа графіком світло мають дати о {hm(until)} — " + ("заряду має вистачити." if ok else "⚠️ заряду може не вистачити, вимкніть потужні прилади.")
             line += f"\nДані станом на {last.get('at', '')[11:16]}."
         out.append(line)
     return "\n\n".join(out)
@@ -666,6 +738,7 @@ def commands(tg, st, dtek=None):
             p = st["stations"][sid]
             if chat not in (p.get("clients") or []):
                 p.setdefault("clients", []).append(chat)
+            p.setdefault("names", {})[chat] = who
             title = esc(p.get("title") or p.get("name"))
             ask = ""
             tg.photo(chat, os.path.join(HERE, "assets", "logo.jpg"),
@@ -707,7 +780,7 @@ HOWTO = ("Дізнатися чергу просто, це 1 хвилина:\n"
          "Не виходить — напишіть менеджеру адресу об'єкта, він підкаже.")
 
 
-def client_queue(tg, st, chat, text, who):
+def client_queue(tg, st, chat, text, who, sid=None):
     """Клиент прислал очередь («3.1», «очередь 3,1», «3 1») или что-то другое."""
     mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
     if not mine:
@@ -722,11 +795,12 @@ def client_queue(tg, st, chat, text, who):
             ask_queue(tg, st, chat)
         return
     q = f"{m.group(1)}.{m.group(2)}"
-    if len(mine) > 1:
-        tg.send(chat, "У вас кілька об'єктів. Напишіть менеджеру, яка черга в якого об'єкта.")
-        tg.staff_msg(f"👤 Клиент {who} (несколько объектов) сообщил очередь ДТЭК {q} — уточните, для какого объекта, и задайте командой /queue.")
+    if sid not in mine:
+        sid = None
+    if len(mine) > 1 and not sid:
+        ask_queue(tg, st, chat)  # спросим объект, потом очередь
         return
-    p = st["stations"][mine[0]]
+    p = st["stations"][sid or mine[0]]
     p["queue"] = "GPV" + q
     tg.send(chat, f"✅ Чергу ДТЕК {q} записано. Графік відключень надійде за кілька хвилин.")
     joined = (p.get("joins") or {}).pop(chat, None)
@@ -826,7 +900,7 @@ def staff_command(tg, st, cmd, arg):
         if err:
             tg.staff_msg(err)
             return
-        tg.clients(S[sid].get("clients"), "Сповіщення по об'єкту вимкнено менеджером.")
+        tg.clients(S[sid].get("clients"), "Сповіщення по об'єкту вимкнено менеджером.", urgent=True)
         S[sid]["clients"], S[sid]["code"] = [], secrets.token_urlsafe(9)
         tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b>: клиенты отключены. Новая ссылка:\nhttps://t.me/{bot}?start={S[sid]['code']}")
     elif cmd == "/contact":
@@ -1070,6 +1144,125 @@ def advice(tg, st, sid, p, title, dev, load, t):
         p["lowv_min"] = 999
 
 
+def morning(tg, st, dtek, t):
+    """Утренняя сводка клиенту в 7:00: что со светом сегодня и что было ночью."""
+    day = t.strftime("%Y-%m-%d")
+    if st.get("morning_day") == day or not (7 <= t.hour < 11):
+        return
+    st["morning_day"] = day
+    per_chat = {}
+    for sid, p in st["stations"].items():
+        for chat in p.get("clients") or []:
+            per_chat.setdefault(chat, []).append((sid, p))
+    emerg = st["dtek"].get("emerg")
+    for chat, items in per_chat.items():
+        parts = []
+        for sid, p in items:
+            title = esc(p.get("title") or p.get("name"))
+            last = p.get("last") or {}
+            if p.get("offline"):
+                head = f"🔴 <b>{title}</b>: станція не на зв'язку" + (f" з {p['offline_since'][11:16]}" if p.get("offline_since") else "") + "."
+                cause = p.get("off_cause")
+                head += {"wifi": " Схоже, причина — інтернет або Wi-Fi: перевірте роутер і логер (маленький модуль з антеною знизу інвертора).",
+                         "battery": " Схоже, розрядилась батарея: станція увімкнеться сама, коли з'явиться мережа.",
+                         "inverter": " Логер на зв'язку, а інвертор не відповідає — перевірте його екран і напишіть менеджеру."}.get(cause, "")
+            elif p.get("no_grid"):
+                since = datetime.fromisoformat(p["off_since"])
+                head = f"🟠 <b>{title}</b>: світла немає з ~{hm(since)}, об'єкт працює від станції."
+            else:
+                head = f"🟢 <b>{title}</b>: світло є."
+            if last.get("soc") is not None and not p.get("offline"):
+                head += f" АКБ {last['soc']:.0f}%."
+            q = queue_key(p.get("queue"))
+            sl = (dtek["days"].get(day) or {}).get(q) if dtek and q else None
+            if sl is not None:
+                head += f"\nСьогодні, черга {q.replace('GPV', '')}: {fmt_intervals(sl)}"
+                offs = intervals(sl, 2)
+                rate = usual_rate(st, sid)
+                if offs and rate and last.get("soc") is not None:
+                    longest = max(b - a for a, b in offs) / 2
+                    can = max(0, (100 - 15) / rate)
+                    head += (f"\nНайдовше відключення — {longest:g} год. Повного заряду за звичного споживання вистачає приблизно на {can:.0f} год"
+                             + (" — має вистачити." if can >= longest + 0.5 else " — ⚠️ може не вистачити, заощаджуйте заряд."))
+            elif not q:
+                head += f"\nЧерга ДТЕК не вказана — натисніть «{BTN_QUEUE}», щоб отримувати графік."
+            else:
+                head += "\nГрафік ДТЕК на сьогодні ще не опубліковано."
+            night = [r for r in st["log"] if r.get("sid") == sid and r.get("end", "") >= (t - timedelta(hours=8)).isoformat()
+                     and (datetime.fromisoformat(r["end"]).hour >= 23 or datetime.fromisoformat(r["end"]).hour < 7)]
+            if night:
+                head += f"\nУночі світла не було: {dur(sum(r['min'] for r in night))}."
+            parts.append(head)
+        text = "☀️ <b>Доброго ранку!</b>\n\n" + "\n\n".join(parts)
+        if emerg:
+            text += "\n\n🚨 ДТЕК повідомляє про екстрені відключення: графіки можуть не діяти."
+        tg.send(chat, text, KEYBOARD)
+
+
+def blocked_clients(tg, st):
+    """Клиент заблокировал бота или удалил чат - отключаем его и сообщаем в группу."""
+    for chat in tg.blocked:
+        for p in st["stations"].values():
+            if chat in (p.get("clients") or []):
+                p["clients"].remove(chat)
+                (p.get("joins") or {}).pop(chat, None)
+                who = (p.get("names") or {}).pop(chat, None) or "клиент"
+                tg.staff_msg(f"🚫 {who} заблокировал бота или удалил чат с ним — уведомления по <b>{esc(p.get('title') or p.get('name'))}</b> ему больше не доходят, он отключён от станции.\n"
+                             f"Если это случайно, отправьте ему ссылку заново: <code>/link {esc(p.get('name'))}</code>"
+                             "\n\n<b>Как определено:</b> Telegram вернул отказ (код 403) при отправке сообщения этому клиенту.")
+    tg.blocked.clear()
+
+
+PV_KEYS = [f"DCPowerPV{i}" for i in range(1, 5)]
+
+
+def pv_strings(tg, p, title, dev, t):
+    """Сравнение стрингов панелей: каждый стринг сравнивается со своей же обычной долей в выработке."""
+    today = t.strftime("%Y-%m-%d")
+    pv = p.setdefault("pv", {"day": today, "sum": [0, 0, 0, 0], "n": 0})
+    if pv["day"] != today:
+        # день закончился - подводим итог
+        if pv["n"] >= 20 and sum(pv["sum"]) > 0:
+            tot = sum(pv["sum"])
+            hist = p.setdefault("pv_hist", [])
+            hist.append({"d": pv["day"], "share": [round(x / tot, 4) for x in pv["sum"]]})
+            del hist[:-21]
+            sent = p.setdefault("pv_sent", {})
+            for i in range(4):
+                key = f"PV{i + 1}"
+                base_days = [h["share"][i] for h in hist[:-1]]
+                if len(base_days) < 3:
+                    continue
+                base = sorted(base_days)[len(base_days) // 2]
+                cur = hist[-1]["share"][i]
+                last = sent.get(key)
+                if base < 0.08 or (last and (t - datetime.fromisoformat(last)).days < 7):
+                    continue
+                d = pv["day"]
+                if cur < 0.01:
+                    sent[key] = t.isoformat()
+                    tg.staff_msg(f"🛠 <b>{title}</b>: стринг панелей {key} не дал энергии за {d[8:]}.{d[5:7]}.\n"
+                                 "<b>Возможные причины:</b> отключён или выбит автомат / разъединитель DC, сгорел предохранитель, отошёл или оплавился коннектор MC4, обрыв кабеля.\n"
+                                 "<b>Что сделать:</b> проверить напряжение стринга на входе инвертора и защиту в DC-щитке."
+                                 f"\n\n<b>Как посчитано:</b> обычно {key} даёт около {base * 100:.0f}% выработки станции (медиана за {len(base_days)} дн.), а за этот день — {cur * 100:.1f}%, при том что остальные стринги работали. Сравнение идёт со своей же обычной долей, поэтому разный размер и направление стрингов не мешают.")
+                elif len(hist) >= 8 and all(h["share"][i] < 0.7 * base for h in hist[-3:]):
+                    older = sorted(h["share"][i] for h in hist[:-3])
+                    base2 = older[len(older) // 2]
+                    if base2 >= 0.08 and all(h["share"][i] < 0.7 * base2 for h in hist[-3:]):
+                        sent[key] = t.isoformat()
+                        avg = sum(h["share"][i] for h in hist[-3:]) / 3
+                        tg.staff_msg(f"🛠 <b>{title}</b>: стринг панелей {key} просел — даёт заметно меньше обычного уже 3 дня подряд.\n"
+                                     "<b>Возможные причины:</b> новое затенение (дерево, постройка, снег на части панелей), сильное загрязнение, неисправная панель или диод в стринге.\n"
+                                     "<b>Что сделать:</b> осмотреть панели этого стринга; если чисто и тени нет — замерить напряжение и ток стринга."
+                                     f"\n\n<b>Как посчитано:</b> обычная доля {key} в выработке — {base2 * 100:.0f}% (медиана за {len(older)} дн.), за последние 3 дня — {avg * 100:.0f}%, то есть на {100 - avg / base2 * 100:.0f}% меньше. Порог: меньше 70% от обычной доли три дня подряд. "
+                                     "Зимой низкое солнце даёт сезонные тени, поэтому перед выездом стоит посмотреть, не от них ли это.")
+        pv = p["pv"] = {"day": today, "sum": [0, 0, 0, 0], "n": 0}
+    vals = [num(dev.get(k)) or 0 for k in PV_KEYS]
+    if max(vals) > 300:  # считаем только когда панели реально работают
+        pv["sum"] = [round(a + b) for a, b in zip(pv["sum"], vals)]
+        pv["n"] += 1
+
+
 def check(api, tg, st, dtek):
     cfgs = station_cfg()
     low_soc = float(env("LOW_SOC", "40"))
@@ -1170,6 +1363,8 @@ def check(api, tg, st, dtek):
                     tg.staff_msg(f"🔴 <b>{title}</b>: инвертор не отвечает ({gone_ru}), при этом логгер на связи — это не Wi-Fi. Свяжитесь с клиентом."
                                  "\n\n<b>Как определено:</b> Deye Cloud показывает логгер «на связи», а инвертор «не на связи». Значит интернет на объекте есть, а данные не отдаёт сам инвертор: выключен, в аварии или потеряна связь логгера с ним.")
                 p["off_staff"] = cause == "inverter"  # Wi-Fi и севший АКБ - только клиенту
+                if tg.quiet():
+                    p["night_off"] = True  # ночью не будим: если к 7:00 связь не вернётся, скажем в утренней сводке
             elif not p.get("off_staff") and p.get("offline_since") and \
                     (t - datetime.fromisoformat(p["offline_since"])).total_seconds() > 24 * 3600:
                 p["off_staff"] = True
@@ -1178,7 +1373,8 @@ def check(api, tg, st, dtek):
                               + (f", последний известный заряд АКБ {p['last_soc']:.0f}%" if p.get("last_soc") is not None else "")
                               + (", сети в тот момент не было." if p.get("no_grid") else ", сеть в тот момент была."))
         if p.get("offline") and not offline:
-            tg.clients(chat, f"🟢 <b>{title}</b>: станція знову на зв'язку.")
+            if not p.pop("night_off", None):
+                tg.clients(chat, f"🟢 <b>{title}</b>: станція знову на зв'язку.")
             if p.get("off_staff"):
                 tg.staff_msg(f"🟢 <b>{title}</b>: снова на связи.")
             for k in ("off_cause", "offline_since", "off_staff"):
@@ -1212,7 +1408,10 @@ def check(api, tg, st, dtek):
                 else:
                     kind = "чергу ДТЕК для об'єкта не вказано" if not q else "графік ДТЕК зараз недоступний"
                 bat = f"\nАКБ {soc:.0f}%, навантаження {load / 1000:.1f} кВт." if soc is not None else f"\nНавантаження {load / 1000:.1f} кВт."
-                tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}\nОб'єкт працює від станції.")
+                until = planned_end(dtek, q, t) if plan is True else None
+                p["off_until"] = until.isoformat() if until else None
+                fore = forecast_line(st, sid, soc, t, until)
+                tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{fore}\nОб'єкт працює від станції.", urgent=True)
         elif no_grid is False:
             p["off_n"] = 0
             if p.get("no_grid"):
@@ -1229,8 +1428,8 @@ def check(api, tg, st, dtek):
                     if p.get("on_soc", soc) is not None and p.get("off_soc") is not None:
                         bat = f"\nАКБ: було {p['off_soc']:.0f}%, найменше {min(p.get('min_soc', 100), p.get('on_soc', soc)):.0f}%, зараз {soc:.0f}%." if soc is not None else ""
                     fl = f"\nЗа цей час світло з'являлось і знову зникало: {p['flaps']} раз(и)." if p.get("flaps") else ""
-                    tg.clients(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(back)}, мережа стабільна.\nБез мережі: {dur(mins)}.{fl}{bat}")
-                    for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc"):
+                    tg.clients(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(back)}, мережа стабільна.\nБез мережі: {dur(mins)}.{fl}{bat}", urgent=True)
+                    for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until"):
                         p.pop(k, None)
                 elif "on_soc" not in p and soc is not None:
                     p["on_soc"] = soc
@@ -1250,6 +1449,7 @@ def check(api, tg, st, dtek):
             except Exception:
                 pass
         advice(tg, st, sid, p, title, dev, load, t)
+        pv_strings(tg, p, title, dev, t)
 
     if do_alerts:
         st["alerts_at"] = t.isoformat()
@@ -1260,6 +1460,7 @@ def check(api, tg, st, dtek):
             if (t - datetime.fromisoformat(j["at"])).total_seconds() > 1800:
                 tg.staff_msg(f"👤 {j['who']} подключился к <b>{esc(p.get('title') or p.get('name'))}</b>. Очередь ДТЭК не указал — задайте сами: /queue {esc(p.get('name'))} 3.1")
                 p["joins"].pop(chat_id)
+    morning(tg, st, dtek, t)
     return len(stations)
 
 
@@ -1518,12 +1719,28 @@ def main():
         dtek_alerts(tg, st, dtek)
         st["last_check"] = now().strftime("%Y-%m-%d %H:%M")
         print(f"Проверено станций: {n}, сообщений: {tg.sent}, ДТЭК: {'ок' if dtek else 'нет'}")
-    # «изменилось ли состояние» - без учёта времени последней проверки
-    a, b = json.loads(before), json.loads(json.dumps(st, sort_keys=True, ensure_ascii=False))
-    a.pop("last_check", None); b.pop("last_check", None)
+    blocked_clients(tg, st)
+    # Память сохраняется в кэш каждый запуск, а в репозиторий - только когда изменилось важное
+    # (клиенты, очереди, отключения, отправленные сообщения) или раз в 6 часов как резервная копия.
+    def durable(x):
+        x = json.loads(json.dumps(x, sort_keys=True, ensure_ascii=False))
+        for k in ("last_check", "alerts_at", "committed_at"):
+            x.pop(k, None)
+        x.get("tg", {}).pop("done", None)
+        x.get("tg", {}).pop("offset", None)
+        for k in ("fail", "fail_since"):
+            x.get("dtek", {}).pop(k, None)
+        for q in x.get("stations", {}).values():
+            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how"):
+                q.pop(k, None)
+        return x
+
+    last_commit = st.get("committed_at")
+    stale = not last_commit or (now() - datetime.fromisoformat(last_commit)).total_seconds() > 6 * 3600
+    if durable(json.loads(before)) != durable(st) or stale or os.path.exists(STATE + ".changed"):
+        st["committed_at"] = now().isoformat()
+        open(STATE + ".commit", "w").close()
     save_state(st)
-    if a != b:
-        open(STATE + ".changed", "w").close()
 
 
 if __name__ == "__main__":
