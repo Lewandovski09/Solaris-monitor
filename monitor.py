@@ -341,8 +341,9 @@ def find_station(st, text):
 
 
 HELP = ("<b>Команды (работают только в этом чате, ответ приходит при следующей проверке, до ~10 минут):</b>\n"
-        "/stations — станции, их очереди ДТЭК и подключённые клиенты\n"
-        "/links — ссылки-приглашения для клиентов\n"
+        "/link Название — ссылка-приглашение для клиента одной станции\n"
+        "/stations Название — очередь, клиенты и сеть по одной станции\n"
+        "/links и /stations без названия — список по всем станциям\n"
         "/queue Название 3.1 — указать очередь ДТЭК\n"
         "/title Название = Как называть в сообщениях\n"
         "/reset Название — отключить всех клиентов станции и выдать новую ссылку")
@@ -399,11 +400,29 @@ def staff_command(tg, st, cmd, arg):
     S, bot = st["stations"], st.get("tg", {}).get("bot", "")
     if not S and cmd != "/help":
         tg.staff_msg("Станции ещё не загружены, повторите команду через 10 минут.")
+    elif cmd == "/stations" and arg:
+        sid, err = find_station(st, arg)
+        if err:
+            tg.staff_msg(err)
+            return
+        p = S[sid]
+        tg.staff_msg(f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
+                     f"\nочередь ДТЭК: {(queue_key(p.get('queue')) or 'не указана').replace('GPV', '')} · клиентов: {len(p.get('clients') or [])}"
+                     f"\nсеть: {'НЕТ с ' + p['off_since'][11:16] if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}")
     elif cmd == "/stations":
         tg.staff_msg("\n\n".join(
             f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
             f"\nочередь ДТЭК: {(queue_key(p.get('queue')) or 'не указана').replace('GPV', '')} · клиентов: {len(p.get('clients') or [])}"
             for p in S.values()))
+    elif cmd in ("/link", "/links") and arg:
+        sid, err = find_station(st, arg)
+        if err:
+            tg.staff_msg(err)
+            return
+        p = S[sid]
+        tg.staff_msg(f"Ссылка для клиента, <b>{esc(p.get('title') or p.get('name'))}</b>:\nhttps://t.me/{bot}?start={p.get('code')}")
+    elif cmd == "/link":
+        tg.staff_msg("Напишите станцию, можно часть названия. Пример: /link пбс\nВсе ссылки сразу: /links")
     elif cmd == "/links":
         tg.staff_msg("Ссылки для клиентов (кто откроет и нажмёт Start — будет получать уведомления по станции):\n\n" + "\n\n".join(
             f"<b>{esc(p.get('title') or p.get('name'))}</b>\nhttps://t.me/{bot}?start={p.get('code')}" for p in S.values() if p.get("code")))
