@@ -60,6 +60,11 @@ def num(v):
         return None
 
 
+def kw(v, div=1000, nd=1):
+    v = num(v)
+    return "—" if v is None else f"{v / div:.{nd}f}"
+
+
 def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -586,8 +591,8 @@ def diag(api, tg, st, dtek):
         ng, how = grid_state(lt, dev)
         volts = {k: v for k, v in dev.items() if k and VOLT_KEY.search(k)}
         lines.append(f"\n<b>{esc(name)}</b> (id {sid})\nсеть: {'НЕТ' if ng else 'есть' if ng is False else 'неясно'} · способ: {how}"
-                     f"\nнапряжение сети: {esc(volts) if volts else 'нет в данных'}"
-                     f"\nАКБ {lt.get('batterySOC')}% · нагрузка {lt.get('consumptionPower')} Вт · сеть {lt.get('wirePower', lt.get('gridPower'))} Вт"
+                     f"\nнапряжение сети: {', '.join(str(v) for k, v in sorted(volts.items()) if 'L1L2' not in k) + ' В' if volts else 'нет в данных'}"
+                     f"\nАКБ {kw(lt.get('batterySOC'), 1, 0)}% · нагрузка {kw(lt.get('consumptionPower'))} кВт · из сети {kw(lt.get('wirePower', lt.get('gridPower')))} кВт"
                      f"\nочередь ДТЭК: {queue_key(c.get('queue')) or 'не указана'} · чат клиента: {'есть' if c.get('client_chat') else 'нет'}")
     if dtek:
         lines.append(f"\nДТЭК: график обновлён {esc(dtek['updated'])}, дни: {', '.join(sorted(dtek['days']))}")
