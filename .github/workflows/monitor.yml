@@ -35,7 +35,7 @@ jobs:
       STATE_KEY: ${{ secrets.STATE_KEY }}
       LOW_SOC: ${{ vars.LOW_SOC }}
       STALE_MIN: ${{ vars.STALE_MIN }}
-      STATE_FILE: ${{ runner.temp }}/state.json
+      STATE_FILE: /tmp/solaris-state.json
     steps:
       - uses: actions/checkout@v4
 
