@@ -161,7 +161,32 @@ class Deye:
         return self._pages("/station/list")
 
     def stations_with_devices(self):
-        return self._pages("/station/listWithDevice")
+        """Станции + серийные номера инверторов. Пробуем два способа, которые есть в OpenAPI."""
+        self.dev_note = ""
+        try:
+            return self._pages("/station/listWithDevice", {"deviceType": "INVERTER"})
+        except Exception as e:
+            self.dev_note = "listWithDevice: " + str(e)[-40:]
+        sts = self._pages("/station/list")
+        ids = [s.get("id") or s.get("stationId") for s in sts]
+        try:
+            by = {}
+            for i in range(0, len(ids), 10):
+                page = 1
+                while page < 20:
+                    d = self._post("/station/device", {"page": page, "size": 100, "stationIds": ids[i:i + 10]})
+                    items = d.get("deviceListItems") or d.get("list") or []
+                    for it in items:
+                        by.setdefault(str(it.get("stationId")), []).append(it)
+                    if len(items) < 100:
+                        break
+                    page += 1
+            for s in sts:
+                s["deviceListItems"] = by.get(str(s.get("id") or s.get("stationId")), [])
+            self.dev_note += " | station/device: ok"
+        except Exception as e:
+            self.dev_note += " | station/device: " + str(e)[-40:]
+        return sts
 
     def latest(self, sid):
         return self._post("/station/latest", {"stationId": sid})
@@ -303,10 +328,7 @@ def check(api, tg, st, dtek):
     t = now()
     try:
         api.login()
-        try:
-            stations = api.stations_with_devices()
-        except Exception:
-            stations = api.stations()
+        stations = api.stations_with_devices()
         st["api_fail"] = 0
     except Exception as e:
         st["api_fail"] = st.get("api_fail", 0) + 1
@@ -540,23 +562,23 @@ def report(api, tg, st):
 def diag(api, tg, st, dtek):
     cfgs = station_cfg()
     api.login()
-    try:
-        stations = api.stations_with_devices()
-        mode = "listWithDevice"
-    except Exception:
-        stations, mode = api.stations(), "list"
-    lines = [f"🔧 <b>Диагностика</b>: станций {len(stations)} ({mode})"]
+    stations = api.stations_with_devices()
+    mode = api.dev_note or "listWithDevice: ok"
+    keys, types = set(), set()
+    lines = [f"🔧 <b>Диагностика</b>: станций {len(stations)}"]
     for s in stations[:25]:
         sid = str(s.get("id") or s.get("stationId"))
         name = s.get("name") or s.get("stationName") or sid
         c = cfg_for(cfgs, sid, name)
+        types |= {str(d.get("deviceType")) for d in s.get("deviceListItems") or []}
         sn = [str(d.get("deviceSn")) for d in s.get("deviceListItems") or [] if str(d.get("deviceType", "")).upper() == "INVERTER"]
         dev = {}
         try:
             for v in (api.device_latest(sn) if sn else {}).values():
                 dev.update(v)
-        except Exception:
-            pass
+        except Exception as e:
+            mode += " | device/latest: " + str(e)[-40:]
+        keys |= set(k for k in dev if k)
         try:
             lt = api.latest(int(sid))
         except Exception:
@@ -572,6 +594,10 @@ def diag(api, tg, st, dtek):
     else:
         lines.append("\nДТЭК: график сейчас недоступен")
     tg.staff_msg("\n".join(lines))
+    # в журнал - только технические названия полей, без станций и значений
+    print("DIAG mode:", mode)
+    print("DIAG device types:", sorted(types))
+    print("DIAG device keys:", sorted(keys))
 
 
 def main():
