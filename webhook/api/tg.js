@@ -27,8 +27,12 @@ module.exports = async (req, res) => {
     return res.status(403).send("forbidden");
 
   const upd = req.body || {};
-  const text = ((upd.message || {}).text || "").trim();
-  if (!upd.update_id || !text.startsWith("/")) return res.status(200).send("skip");
+  const msg = upd.message || {};
+  const text = (msg.text || "").trim();
+  const isPrivate = (msg.chat || {}).type === "private";
+  // groups: commands only; private chats: also short plain replies (e.g. the outage queue "3.1")
+  if (!upd.update_id || !text || text.length > 300 || (!text.startsWith("/") && !isPrivate))
+    return res.status(200).send("skip");
 
   const iv = crypto.randomBytes(16);
   const c = crypto.createCipheriv("aes-256-cbc", crypto.createHash("sha256").update(key).digest(), iv);

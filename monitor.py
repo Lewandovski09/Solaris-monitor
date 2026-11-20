@@ -399,7 +399,8 @@ def commands(tg, st):
         m = u.get("message") or {}
         chat = str((m.get("chat") or {}).get("id", ""))
         text = (m.get("text") or "").strip()
-        if not chat or not text.startswith("/"):
+        private = (m.get("chat") or {}).get("type", "private") == "private"
+        if not chat or not text or (not text.startswith("/") and (chat == str(tg.staff) or not private)):
             continue
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
@@ -415,25 +416,12 @@ def commands(tg, st):
             if chat not in (p.get("clients") or []):
                 p.setdefault("clients", []).append(chat)
             title = esc(p.get("title") or p.get("name"))
-            ask = "" if queue_key(p.get("queue")) else ("\n\nЧтобы приходил график отключений, напишите свою очередь ДТЭК, например: /queue 3.1"
-                                                        "\nОчередь указана в приложении и на сайте ДТЭК по вашему адресу.")
+            ask = "" if queue_key(p.get("queue")) else ("\n\nЧтобы приходил график отключений, пришлите в ответ вашу очередь ДТЭК — просто две цифры, например: 3.1"
+                                                        "\nНе знаете очередь? Напишите «не знаю» — пришлю короткую инструкцию.")
             tg.send(chat, f"✅ Подключено: <b>{title}</b>.\nСюда будут приходить сообщения, когда на объекте отключают и включают свет, графики ДТЭК и отчёт за месяц.\nОтключить уведомления: /stop{ask}")
             tg.staff_msg(f"👤 К станции <b>{title}</b> подключился клиент: {who}.")
-        elif cmd == "/queue":
-            mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
-            m = re.fullmatch(r"\s*([1-6])\s*[.,]\s*([12])\s*", arg)
-            if not mine:
-                tg.send(chat, "Сначала подключитесь по ссылке от менеджера.")
-            elif not m:
-                tg.send(chat, "Напишите очередь так: /queue 3.1\nОчереди бывают от 1.1 до 6.2. Если не знаете свою — напишите менеджеру адрес объекта.")
-            elif len(mine) > 1:
-                tg.send(chat, "У вас несколько объектов. Напишите менеджеру, какая очередь у какого объекта.")
-                tg.staff_msg(f"👤 Клиент {who} (несколько объектов) сообщил очередь ДТЭК {m.group(1)}.{m.group(2)} — уточните, для какого объекта, и задайте командой /queue.")
-            else:
-                p = st["stations"][mine[0]]
-                p["queue"] = f"GPV{m.group(1)}.{m.group(2)}"
-                tg.send(chat, f"✅ Очередь ДТЭК {m.group(1)}.{m.group(2)} записана. График отключений придёт в течение 10 минут.")
-                tg.staff_msg(f"👤 Клиент {who} указал очередь ДТЭК {m.group(1)}.{m.group(2)} для <b>{esc(p.get('title') or p.get('name'))}</b>. Изменить: /queue {esc(p.get('name'))} X.Y")
+        elif cmd == "/queue" or not text.startswith("/"):
+            client_queue(tg, st, chat, arg if cmd == "/queue" else text, who)
         elif cmd == "/stop":
             n = 0
             for p in st["stations"].values():
@@ -443,6 +431,40 @@ def commands(tg, st):
             tg.send(chat, "Уведомления отключены." if n else "Вы не были подключены.")
             if n:
                 tg.staff_msg(f"👤 Клиент {who} отключил уведомления.")
+
+
+HOWTO = ("Узнать очередь просто, это 1 минута:\n"
+         "1. Откройте сайт ДТЭК Одесские электросети: dtek-oem.com.ua\n"
+         "2. Зайдите в раздел «Графіки відключень» и введите свой адрес: населённый пункт, улицу, номер дома.\n"
+         "3. Сайт покажет график и номер вашей очереди, например «3.1».\n"
+         "4. Пришлите сюда эти две цифры, например: 3.1\n\n"
+         "Очередь также показывает чат-бот ДТЭК в Viber: https://chats.viber.com/dtekodeskielektromerezhi\n"
+         "Не получается — напишите менеджеру адрес объекта, он подскажет.")
+
+
+def client_queue(tg, st, chat, text, who):
+    """Клиент прислал очередь («3.1», «очередь 3,1», «3 1») или что-то другое."""
+    mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
+    if not mine:
+        tg.send(chat, "Здравствуйте! Это бот уведомлений Solaris. Чтобы подключиться, откройте ссылку, которую вам прислал менеджер.")
+        return
+    m = re.search(r"(?<!\d)([1-6])\s*[.,/ ]\s*([12])(?!\d)", text or "")
+    if not m:
+        if queue_key(st["stations"][mine[0]].get("queue")) and len(mine) == 1:
+            q = st["stations"][mine[0]]["queue"].replace("GPV", "")
+            tg.send(chat, f"Ваша очередь ДТЭК сейчас: {q}. Чтобы изменить, пришлите новую, например: 3.1\nПо другим вопросам напишите, пожалуйста, вашему менеджеру.")
+        else:
+            tg.send(chat, "Пришлите вашу очередь ДТЭК двумя цифрами, например: 3.1 (бывают от 1.1 до 6.2).\n\n" + HOWTO)
+        return
+    q = f"{m.group(1)}.{m.group(2)}"
+    if len(mine) > 1:
+        tg.send(chat, "У вас несколько объектов. Напишите менеджеру, какая очередь у какого объекта.")
+        tg.staff_msg(f"👤 Клиент {who} (несколько объектов) сообщил очередь ДТЭК {q} — уточните, для какого объекта, и задайте командой /queue.")
+        return
+    p = st["stations"][mine[0]]
+    p["queue"] = "GPV" + q
+    tg.send(chat, f"✅ Очередь ДТЭК {q} записана. График отключений придёт в течение 10 минут.")
+    tg.staff_msg(f"👤 Клиент {who} указал очередь ДТЭК {q} для <b>{esc(p.get('title') or p.get('name'))}</b>. Изменить: /queue {esc(p.get('name'))} X.Y")
 
 
 def staff_command(tg, st, cmd, arg):
