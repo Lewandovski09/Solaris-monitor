@@ -42,4 +42,33 @@ jobs:
 
       - name: Проверка секретов
         run: |
-          for k in DEYE_APP_ID DEYE_APP_SECRET DEYE_EMAIL
+          for k in DEYE_APP_ID DEYE_APP_SECRET DEYE_EMAIL DEYE_PASSWORD TELEGRAM_TOKEN TELEGRAM_CHAT_ID STATE_KEY; do
+            if [ -z "${!k}" ]; then echo "Не заполнен секрет $k"; missing=1; fi
+          done
+          if [ -n "$missing" ]; then exit 1; fi
+
+      - name: Расшифровать состояние
+        run: |
+          if [ -f state.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STATE_KEY -in state.enc -out "$STATE_FILE" || echo "состояние не расшифровалось, начинаем с чистого"
+          fi
+
+      - name: Запуск
+        run: |
+          pip install -q requests
+          MODE="${{ github.event.inputs.mode }}"
+          if [ "${{ github.event.schedule }}" = "17 7 1 * *" ]; then MODE=report; fi
+          python monitor.py "${MODE:-check}"
+
+      - name: Сохранить состояние (зашифровано)
+        if: always()
+        run: |
+          if [ -f "$STATE_FILE.changed" ] && [ -f "$STATE_FILE" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STATE_KEY -in "$STATE_FILE" -out state.enc
+            git config user.name "solaris-monitor"
+            git config user.email "monitor@users.noreply.github.com"
+            git add state.enc
+            git add -A inbox 2>/dev/null || true
+            git commit -q -m "state" || exit 0
+            git push -q || (git pull -q --rebase && git push -q) || (sleep 3 && git pull -q --rebase && git push -q)
+          fi
