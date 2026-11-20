@@ -601,21 +601,65 @@ def check(api, tg, st, dtek):
         load = num(lt.get("consumptionPower")) or 0
 
         offline = bool((status and status not in OK_STATUS) or (age is not None and age > stale))
-        if offline and not p.get("offline"):
-            why = f"нет данных {age:.0f} мин" if age and age > stale else "логгер не отвечает"
-            extra = " Перед этим на объекте не было сети — возможно, сел АКБ или выключился роутер." if p.get("no_grid") else ""
-            tg.staff_msg(f"🔴 <b>{title}</b>: станция не на связи ({why}).{extra}\nПроверьте интернет / Wi-Fi логгер или позвоните клиенту.")
-            why_ua = f"немає даних {age:.0f} хв" if age and age > stale else "логер не відповідає"
-            extra_ua = " Перед цим на об'єкті не було мережі — можливо, розрядився АКБ або вимкнувся роутер." if p.get("no_grid") else ""
-            tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({why_ua}).{extra_ua}\n"
-                             "Сама станція при цьому може працювати нормально — зник лише зв'язок із нею.\n"
-                             "Перевірте, будь ласка, інтернет і Wi-Fi роутер на об'єкті. Якщо не допоможе — напишіть менеджеру.")
+        if offline:
+            # Почему пропала связь: смотрим, что было перед этим, и отвечает ли логгер.
+            devs = s.get("deviceListItems") or []
+            st_of = lambda kind: [str(d.get("connectStatus", d.get("connectionStatus", ""))).upper() for d in devs
+                                  if str(d.get("deviceType", "")).upper() == kind]
+            on = ("1", "NORMAL", "ONLINE")
+            logger_ok = any(x in on for x in st_of("COLLECTOR"))
+            inv_bad = any(x and x not in on for x in st_of("INVERTER"))
+            last = p.get("last_soc")
+            if logger_ok and inv_bad:
+                cause = "inverter"
+            elif p.get("no_grid") and last is not None and last < max(low_soc, 30):
+                cause = "battery"
+            else:
+                cause = "wifi"
+            gone = f"немає даних {age:.0f} хв" if age and age > stale else "логер не відповідає"
+            gone_ru = f"нет данных {age:.0f} мин" if age and age > stale else "логгер не отвечает"
+            if not p.get("offline"):
+                p["off_cause"], p["offline_since"] = cause, t.isoformat()
+                if cause == "wifi":
+                    was = ("перед цим на об'єкті не було світла, але заряд АКБ був достатній"
+                           + (f" ({last:.0f}%)" if last is not None else "") if p.get("no_grid")
+                           else "перед цим станція працювала нормально, мережа була")
+                    tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({gone}).\n"
+                                     f"Схоже, причина — <b>інтернет або Wi-Fi</b>: {was}.\n"
+                                     "Сама станція, найімовірніше, працює — ми просто перестали її бачити.\n\n"
+                                     "Що перевірити:\n"
+                                     "1. Чи працює інтернет на об'єкті.\n"
+                                     "2. Чи увімкнений роутер. Коли вимикають світло, роутер має живитися від станції.\n"
+                                     "3. Чи не змінювали пароль або назву Wi-Fi, чи не міняли роутер.\n"
+                                     "4. Логер — маленький модуль з антеною знизу інвертора. Вийміть його на 10 секунд і вставте назад.\n\n"
+                                     "Якщо світло в приміщенні є — хвилюватися не варто. Не допомогло — напишіть менеджеру.")
+                elif cause == "battery":
+                    tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({gone}).\n"
+                                     f"Схоже, причина <b>не у Wi-Fi</b>: перед цим на об'єкті не було світла, а заряд АКБ був лише {last:.0f}%.\n"
+                                     "Імовірно, батарея розрядилася і станція вимкнулась. Вона увімкнеться сама, коли з'явиться мережа.\n"
+                                     "Якщо світло вже дали, а станція не запрацювала — напишіть менеджеру.")
+                    tg.staff_msg(f"🔴 <b>{title}</b>: станция не на связи ({gone_ru}).\nПохоже, сел АКБ: перед этим сети не было, заряд был {last:.0f}%. Свяжитесь с клиентом.")
+                else:
+                    tg.clients(chat, f"🔴 <b>{title}</b>: інвертор не відповідає ({gone}).\n"
+                                     "Причина <b>не у Wi-Fi</b>: логер на зв'язку, інтернет працює, а даних від інвертора немає.\n"
+                                     "Перевірте, чи увімкнений інвертор і чи немає помилки на його екрані, та напишіть менеджеру.")
+                    tg.staff_msg(f"🔴 <b>{title}</b>: инвертор не отвечает ({gone_ru}), при этом логгер на связи — это не Wi-Fi. Свяжитесь с клиентом.")
+                p["off_staff"] = cause != "wifi"
+            elif not p.get("off_staff") and p.get("offline_since") and \
+                    (t - datetime.fromisoformat(p["offline_since"])).total_seconds() > 24 * 3600:
+                p["off_staff"] = True
+                tg.staff_msg(f"🔴 <b>{title}</b>: станция не на связи уже больше суток. Сначала это было похоже на интернет / Wi-Fi, но клиент, видимо, не починил. Стоит позвонить.")
         if p.get("offline") and not offline:
-            tg.staff_msg(f"🟢 <b>{title}</b>: снова на связи.")
             tg.clients(chat, f"🟢 <b>{title}</b>: станція знову на зв'язку.")
+            if p.get("off_staff"):
+                tg.staff_msg(f"🟢 <b>{title}</b>: снова на связи.")
+            for k in ("off_cause", "offline_since", "off_staff"):
+                p.pop(k, None)
         p["offline"] = offline
         if offline:
             continue  # пока нет связи, про сеть и АКБ ничего утверждать нельзя
+        if soc is not None:
+            p["last_soc"] = soc
 
         no_grid, how = grid_state(lt, dev)
         p["how"] = how
@@ -824,6 +868,8 @@ def diag(api, tg, st, dtek):
     # в журнал - только технические названия полей, без станций и значений
     print("DIAG mode:", mode)
     print("DIAG device types:", sorted(types))
+    print("DIAG device item fields:", sorted({k for s in stations for d in s.get("deviceListItems") or [] for k in d}))
+    print("DIAG device statuses:", sorted({str(d.get("connectStatus", d.get("connectionStatus"))) for s in stations for d in s.get("deviceListItems") or []}))
     print("DIAG device keys:", sorted(keys))
 
 
