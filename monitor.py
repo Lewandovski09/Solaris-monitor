@@ -50,7 +50,7 @@ def hm(dt):
 def dur(minutes):
     minutes = int(round(minutes))
     h, m = divmod(minutes, 60)
-    return f"{h} ч {m:02d} мин" if h else f"{m} мин"
+    return f"{h} год {m:02d} хв" if h else f"{m} хв"
 
 
 def num(v):
@@ -259,9 +259,9 @@ def fmt_intervals(sl):
     off = ", ".join(f"{slot_time(a)}–{slot_time(b)}" for a, b in intervals(sl, 2))
     may = ", ".join(f"{slot_time(a)}–{slot_time(b)}" for a, b in intervals(sl, 1))
     hours = sum(1 for v in sl if v == 2) / 2
-    txt = f"без света: {off} (всего {hours:g} ч)" if off else "отключений по графику нет"
+    txt = f"без світла: {off} (разом {hours:g} год)" if off else "відключень за графіком немає"
     if may:
-        txt += f"\nвозможны отключения: {may}"
+        txt += f"\nможливі відключення: {may}"
     return txt
 
 
@@ -410,15 +410,15 @@ def commands(tg, st):
         elif cmd == "/start":
             sid = next((k for k, p in st["stations"].items() if arg and p.get("code") == arg), None)
             if not sid:
-                tg.send(chat, "Здравствуйте! Это бот уведомлений Solaris. Чтобы подключиться, откройте ссылку, которую вам прислал менеджер.")
+                tg.send(chat, "Вітаємо! Це бот сповіщень Solaris. Щоб підключитися, відкрийте посилання, яке вам надіслав менеджер.")
                 continue
             p = st["stations"][sid]
             if chat not in (p.get("clients") or []):
                 p.setdefault("clients", []).append(chat)
             title = esc(p.get("title") or p.get("name"))
-            ask = "" if queue_key(p.get("queue")) else ("\n\nЧтобы приходил график отключений, пришлите в ответ вашу очередь ДТЭК — просто две цифры, например: 3.1"
-                                                        "\nНе знаете очередь? Напишите «не знаю» — пришлю короткую инструкцию.")
-            tg.send(chat, f"✅ Подключено: <b>{title}</b>.\nСюда будут приходить сообщения, когда на объекте отключают и включают свет, графики ДТЭК и отчёт за месяц.\nОтключить уведомления: /stop{ask}")
+            ask = "" if queue_key(p.get("queue")) else ("\n\nЩоб надходив графік відключень, надішліть у відповідь вашу чергу ДТЕК — просто дві цифри, наприклад: 3.1"
+                                                        "\nНе знаєте чергу? Напишіть «не знаю» — надішлю коротку інструкцію.")
+            tg.send(chat, f"✅ Підключено: <b>{title}</b>.\nСюди надходитимуть повідомлення, коли на об'єкті вимикають і вмикають світло, графіки ДТЕК і звіт за місяць.\nВимкнути сповіщення: /stop{ask}")
             tg.staff_msg(f"👤 К станции <b>{title}</b> подключился клиент: {who}.")
         elif cmd == "/queue" or not text.startswith("/"):
             client_queue(tg, st, chat, arg if cmd == "/queue" else text, who)
@@ -428,42 +428,42 @@ def commands(tg, st):
                 if chat in (p.get("clients") or []):
                     p["clients"].remove(chat)
                     n += 1
-            tg.send(chat, "Уведомления отключены." if n else "Вы не были подключены.")
+            tg.send(chat, "Сповіщення вимкнено." if n else "Ви не були підключені.")
             if n:
                 tg.staff_msg(f"👤 Клиент {who} отключил уведомления.")
 
 
-HOWTO = ("Узнать очередь просто, это 1 минута:\n"
-         "1. Откройте сайт ДТЭК Одесские электросети: dtek-oem.com.ua\n"
-         "2. Зайдите в раздел «Графіки відключень» и введите свой адрес: населённый пункт, улицу, номер дома.\n"
-         "3. Сайт покажет график и номер вашей очереди, например «3.1».\n"
-         "4. Пришлите сюда эти две цифры, например: 3.1\n\n"
-         "Очередь также показывает чат-бот ДТЭК в Viber: https://chats.viber.com/dtekodeskielektromerezhi\n"
-         "Не получается — напишите менеджеру адрес объекта, он подскажет.")
+HOWTO = ("Дізнатися чергу просто, це 1 хвилина:\n"
+         "1. Відкрийте сайт ДТЕК Одеські електромережі: dtek-oem.com.ua\n"
+         "2. Зайдіть у розділ «Графіки відключень» і введіть свою адресу: населений пункт, вулицю, номер будинку.\n"
+         "3. Сайт покаже графік і номер вашої черги, наприклад «3.1».\n"
+         "4. Надішліть сюди ці дві цифри, наприклад: 3.1\n\n"
+         "Чергу також показує чат-бот ДТЕК у Viber: https://chats.viber.com/dtekodeskielektromerezhi\n"
+         "Не виходить — напишіть менеджеру адресу об'єкта, він підкаже.")
 
 
 def client_queue(tg, st, chat, text, who):
     """Клиент прислал очередь («3.1», «очередь 3,1», «3 1») или что-то другое."""
     mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
     if not mine:
-        tg.send(chat, "Здравствуйте! Это бот уведомлений Solaris. Чтобы подключиться, откройте ссылку, которую вам прислал менеджер.")
+        tg.send(chat, "Вітаємо! Це бот сповіщень Solaris. Щоб підключитися, відкрийте посилання, яке вам надіслав менеджер.")
         return
     m = re.search(r"(?<!\d)([1-6])\s*[.,/ ]\s*([12])(?!\d)", text or "")
     if not m:
         if queue_key(st["stations"][mine[0]].get("queue")) and len(mine) == 1:
             q = st["stations"][mine[0]]["queue"].replace("GPV", "")
-            tg.send(chat, f"Ваша очередь ДТЭК сейчас: {q}. Чтобы изменить, пришлите новую, например: 3.1\nПо другим вопросам напишите, пожалуйста, вашему менеджеру.")
+            tg.send(chat, f"Ваша черга ДТЕК зараз: {q}. Щоб змінити, надішліть нову, наприклад: 3.1\nЗ інших питань напишіть, будь ласка, вашому менеджеру.")
         else:
-            tg.send(chat, "Пришлите вашу очередь ДТЭК двумя цифрами, например: 3.1 (бывают от 1.1 до 6.2).\n\n" + HOWTO)
+            tg.send(chat, "Надішліть вашу чергу ДТЕК двома цифрами, наприклад: 3.1 (бувають від 1.1 до 6.2).\n\n" + HOWTO)
         return
     q = f"{m.group(1)}.{m.group(2)}"
     if len(mine) > 1:
-        tg.send(chat, "У вас несколько объектов. Напишите менеджеру, какая очередь у какого объекта.")
+        tg.send(chat, "У вас кілька об'єктів. Напишіть менеджеру, яка черга в якого об'єкта.")
         tg.staff_msg(f"👤 Клиент {who} (несколько объектов) сообщил очередь ДТЭК {q} — уточните, для какого объекта, и задайте командой /queue.")
         return
     p = st["stations"][mine[0]]
     p["queue"] = "GPV" + q
-    tg.send(chat, f"✅ Очередь ДТЭК {q} записана. График отключений придёт в течение 10 минут.")
+    tg.send(chat, f"✅ Чергу ДТЕК {q} записано. Графік відключень надійде протягом 10 хвилин.")
     tg.staff_msg(f"👤 Клиент {who} указал очередь ДТЭК {q} для <b>{esc(p.get('title') or p.get('name'))}</b>. Изменить: /queue {esc(p.get('name'))} X.Y")
 
 
@@ -521,7 +521,7 @@ def staff_command(tg, st, cmd, arg):
         if err:
             tg.staff_msg(err)
             return
-        tg.clients(S[sid].get("clients"), "Уведомления по объекту отключены менеджером.")
+        tg.clients(S[sid].get("clients"), "Сповіщення по об'єкту вимкнено менеджером.")
         S[sid]["clients"], S[sid]["code"] = [], secrets.token_urlsafe(9)
         tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b>: клиенты отключены. Новая ссылка:\nhttps://t.me/{bot}?start={S[sid]['code']}")
     elif cmd in ("/help", "/start"):
@@ -623,14 +623,14 @@ def check(api, tg, st, dtek):
                 plan = planned_now(dtek, q, t)
                 p["off_planned"] = plan
                 if plan is True:
-                    kind = "по графику ДТЭК"
+                    kind = "за графіком ДТЕК"
                 elif plan is False:
-                    kind = "⚡ <b>вне графика</b> — похоже на экстренное или аварийное отключение"
+                    kind = "⚡ <b>поза графіком</b> — схоже на екстрене або аварійне відключення"
                 else:
-                    kind = "очередь ДТЭК для объекта не указана" if not q else "график ДТЭК сейчас недоступен"
-                bat = f"\nАКБ {soc:.0f}%, нагрузка {load / 1000:.1f} кВт." if soc is not None else f"\nНагрузка {load / 1000:.1f} кВт."
+                    kind = "чергу ДТЕК для об'єкта не вказано" if not q else "графік ДТЕК зараз недоступний"
+                bat = f"\nАКБ {soc:.0f}%, навантаження {load / 1000:.1f} кВт." if soc is not None else f"\nНавантаження {load / 1000:.1f} кВт."
                 left = ""
-                tg.both(chat, f"🟠 <b>{title}</b>: свет отключили в ~{hm(t)}.\n{kind}.{bat}{left}\nОбъект работает от станции.")
+                tg.both(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{left}\nОб'єкт працює від станції.")
         elif no_grid is False:
             p["off_n"] = 0
             if p.get("no_grid"):
@@ -641,15 +641,15 @@ def check(api, tg, st, dtek):
                                   "soc_start": p.get("off_soc"), "soc_end": soc})
                 bat = ""
                 if soc is not None and p.get("off_soc") is not None:
-                    bat = f"\nАКБ: было {p['off_soc']:.0f}%, осталось {soc:.0f}%."
-                tg.both(chat, f"🟢 <b>{title}</b>: свет включили в ~{hm(t)}.\nБез сети: {dur(mins)}.{bat}")
+                    bat = f"\nАКБ: було {p['off_soc']:.0f}%, залишилось {soc:.0f}%."
+                tg.both(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(t)}.\nБез мережі: {dur(mins)}.{bat}")
                 for k in ("no_grid", "off_since", "off_soc", "off_planned", "low_sent"):
                     p.pop(k, None)
 
         low = soc is not None and soc < low_soc
         if low and not p.get("low_soc"):
             if p.get("no_grid"):
-                tg.both(chat, f"🔋 <b>{title}</b>: заряд АКБ {soc:.0f}%, света всё ещё нет.\nСтоит отключить мощные приборы (бойлер, кондиционер, плиту), чтобы хватило дольше.")
+                tg.both(chat, f"🔋 <b>{title}</b>: заряд АКБ {soc:.0f}%, світла досі немає.\nВарто вимкнути потужні прилади (бойлер, кондиціонер, плиту), щоб вистачило довше.")
             else:
                 tg.staff_msg(f"🔋 <b>{title}</b>: заряд АКБ {soc:.0f}% при наличии сети (порог {low_soc:.0f}%). Если отключат свет — резерва может не хватить.")
         p["low_soc"] = bool(low)
@@ -679,7 +679,7 @@ def dtek_alerts(tg, st, dtek):
         emerg = is_emergency(att)
         if D.get("att_hash") is not None or emerg:
             if emerg:
-                msg = "🚨 <b>ДТЭК Одесса: экстренные / аварийные отключения</b>\nГрафики сейчас могут не действовать, свет могут отключить без предупреждения.\n\n" + esc(att[:700])
+                msg = "🚨 <b>ДТЕК Одеса: екстрені / аварійні відключення</b>\nГрафіки зараз можуть не діяти, світло можуть вимкнути без попередження.\n\n" + esc(att[:700])
                 tg.staff_msg(msg)
                 tg.clients(all_chats, msg)
             elif D.get("emerg"):
@@ -690,7 +690,7 @@ def dtek_alerts(tg, st, dtek):
 
     # 2. графики по очередям: новый / изменился
     seen = D.setdefault("sched", {})
-    for day, label in ((today, "сегодня"), (tomorrow, "завтра")):
+    for day, label in ((today, "сьогодні"), (tomorrow, "завтра")):
         for q, people in by_q.items():
             sl = (dtek["days"].get(day) or {}).get(q)
             if sl is None:
@@ -701,13 +701,13 @@ def dtek_alerts(tg, st, dtek):
                 continue
             changed = key in seen
             seen[key] = sig
-            head = "изменился график" if changed else "график"
+            head = "змінився графік" if changed else "графік"
             qn = q.replace("GPV", "")
-            body = f"очередь {qn}, {label} ({day[8:]}.{day[5:7]}):\n{fmt_intervals(sl)}"
+            body = f"черга {qn}, {label} ({day[8:]}.{day[5:7]}):\n{fmt_intervals(sl)}"
             names = ", ".join(esc(n) for n, _ in people)
-            tg.staff_msg(f"🗓 <b>ДТЭК: {head}</b>, {body}\nОбъекты: {names}")
+            tg.staff_msg(f"🗓 <b>ДТЕК: {head}</b>, {body}\nОб'єкти: {names}")
             for n, chats in people:
-                tg.clients(chats, f"🗓 <b>{esc(n)}</b>: {head} отключений ДТЭК, {body}")
+                tg.clients(chats, f"🗓 <b>{esc(n)}</b>: {head} відключень ДТЕК, {body}")
     for k in [k for k in seen if k.split("|")[0] < today]:
         seen.pop(k)
 
@@ -724,7 +724,7 @@ def dtek_alerts(tg, st, dtek):
             if 0 < left <= 35 and key not in warned:
                 warned[key] = 1
                 for n, chat in people:
-                    txt = f"⏰ <b>{esc(n)}</b>: по графику ДТЭК свет отключат в {slot_time(a)} (через ~{left:.0f} мин), до {slot_time(b)}."
+                    txt = f"⏰ <b>{esc(n)}</b>: за графіком ДТЕК світло вимкнуть о {slot_time(a)} (через ~{left:.0f} хв), до {slot_time(b)}."
                     tg.both(chat, txt)
     for k in [k for k in warned if k.split("|")[0] < today]:
         warned.pop(k)
@@ -732,7 +732,7 @@ def dtek_alerts(tg, st, dtek):
 
 
 # ---------------------------------------------------------------- отчёт за месяц
-MONTHS = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+MONTHS = ["", "січень", "лютий", "березень", "квітень", "травень", "червень", "липень", "серпень", "вересень", "жовтень", "листопад", "грудень"]
 
 
 def report(api, tg, st):
@@ -748,32 +748,32 @@ def report(api, tg, st):
         st["stations"].setdefault(sid, {}).setdefault("name", name)
         c = setup(st, cfgs, sid)
         title = esc(c["title"])
-        lines = [f"📊 <b>{title}</b> — отчёт за {MONTHS[m]} {y}"]
+        lines = [f"📊 <b>{title}</b> — звіт за {MONTHS[m]} {y}"]
         try:
             rows = [r for r in api.history(int(sid), 3, ym, ym) if int(num(r.get("month")) or m) == m] or []
             r = rows[0] if rows else {}
             g, cns, buy = num(r.get("generationValue")), num(r.get("consumptionValue")), num(r.get("purchaseValue"))
             if g is not None:
-                lines.append(f"☀️ Панели выработали: {g:,.0f} кВт·ч".replace(",", " "))
+                lines.append(f"☀️ Панелі виробили: {g:,.0f} кВт·год".replace(",", " "))
             if cns is not None:
-                lines.append(f"🏠 Объект потребил: {cns:,.0f} кВт·ч".replace(",", " "))
+                lines.append(f"🏠 Об'єкт спожив: {cns:,.0f} кВт·год".replace(",", " "))
             if buy is not None:
-                lines.append(f"🔌 Куплено из сети: {buy:,.0f} кВт·ч".replace(",", " "))
+                lines.append(f"🔌 Куплено з мережі: {buy:,.0f} кВт·год".replace(",", " "))
             if cns and buy is not None:
-                lines.append(f"✅ Своей энергией покрыто: {max(0, (1 - buy / cns) * 100):.0f}%")
+                lines.append(f"✅ Власною енергією покрито: {max(0, (1 - buy / cns) * 100):.0f}%")
         except Exception:
-            lines.append("Данные по выработке за месяц Deye Cloud не отдал.")
+            lines.append("Даних про виробіток за місяць Deye Cloud не надав.")
         out = [r for r in st["log"] if r.get("sid") == sid and r.get("start", "")[:7] == ym]
         if out:
             total = sum(r["min"] for r in out)
             unpl = [r for r in out if r.get("planned") is False]
-            lines.append(f"\n💡 Отключений света: {len(out)}, всего {dur(total)}.")
-            lines.append(f"Самое долгое: {dur(max(r['min'] for r in out))}.")
+            lines.append(f"\n💡 Відключень світла: {len(out)}, разом {dur(total)}.")
+            lines.append(f"Найдовше: {dur(max(r['min'] for r in out))}.")
             if unpl:
-                lines.append(f"Вне графика (экстренные/аварийные): {len(unpl)}, {dur(sum(r['min'] for r in unpl))}.")
-            lines.append("Всё это время объект работал от станции.")
+                lines.append(f"Поза графіком (екстрені/аварійні): {len(unpl)}, {dur(sum(r['min'] for r in unpl))}.")
+            lines.append("Увесь цей час об'єкт працював від станції.")
         else:
-            lines.append("\n💡 Отключений света за месяц программа не зафиксировала.")
+            lines.append("\n💡 Відключень світла за місяць програма не зафіксувала.")
         tg.both(c["chats"], "\n".join(lines))
         n += 1
     return n
