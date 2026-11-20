@@ -379,12 +379,12 @@ def find_station(st, text):
 
 
 HELP = ("📋 <b>Команды бота</b>\n"
-        "Пишутся в этой группе. Ответ приходит примерно за минуту. <b>Название станции можно не писать:</b> отправьте команду без него — бот покажет станции кнопками, нажмите нужную. Или напишите часть названия маленькими буквами: <code>пбс</code>, <code>dyn</code>, <code>home</code>.\n\n"
+        "Пишутся в этой группе. Ответ приходит примерно за минуту. <b>Название станции</b> пишите как в Deye Cloud, регистр букв не важен. Если не помните точно — напишите часть, бот покажет подходящие кнопками.\n\n"
         "<b>Дать клиенту доступ</b>\n"
         "<code>/link пбс</code> — бот пришлёт ссылку. Отправьте её клиенту, он нажимает Start и начинает получать сообщения о свете.\n\n"
         "<b>Посмотреть станцию</b>\n"
         "<code>/stations пбс</code> — очередь ДТЭК, сколько клиентов подключено, есть ли сейчас свет и связь.\n"
-        "<code>/stations</code> — то же по всем станциям сразу.\n\n"
+        "<code>/stations</code> — сводка: где сейчас нет света, кто не на связи, у кого низкий заряд.\n\n"
         "<b>Указать очередь ДТЭК</b>\n"
         "<code>/queue пбс 3.1</code> — после этого клиенту идут графики и напоминания. Обычно клиент присылает очередь сам.\n\n"
         "<b>Назвать объект по-человечески</b>\n"
@@ -393,8 +393,7 @@ HELP = ("📋 <b>Команды бота</b>\n"
         "<code>/contact Георгий, +380 00 000 00 00</code> — клиент увидит его в памятке бота.\n\n"
         "<b>Отключить клиента</b>\n"
         "<code>/reset пбс</code> — отключает всех клиентов станции и выдаёт новую ссылку. Старая перестаёт работать.\n\n"
-        "<b>Все ссылки разом</b>\n"
-        "<code>/links</code>\n\n"
+
         "<b>Эта памятка</b>\n"
         "<code>/help</code>\n\n"
         "В группу бот сам пишет только то, что требует действий: ошибки инвертора и АКБ, что стоит поменять в настройках или предложить клиенту, и кто из клиентов подключился. Про свет и графики он пишет клиентам.")
@@ -437,8 +436,14 @@ def ask_queue(tg, st, chat, change=False):
 
 def match_stations(st, text):
     t = str(text or "").strip().lower()
+    if not t:
+        return []
+    exact = [sid for sid, p in st["stations"].items()
+             if t == sid or t == str(p.get("name", "")).strip().lower() or t == str(p.get("title", "")).strip().lower()]
+    if exact:  # полное название как в Deye - берём сразу, даже если оно часть других названий
+        return exact
     return [sid for sid, p in st["stations"].items()
-            if not t or t == sid or t in str(p.get("name", "")).lower() or t in str(p.get("title", "")).lower()]
+            if t in str(p.get("name", "")).lower() or t in str(p.get("title", "")).lower()]
 
 
 def pick_station(tg, st, action, prompt, sids=None, all_button=None):
@@ -734,26 +739,31 @@ def staff_command(tg, st, cmd, arg):
     if not S and cmd != "/help":
         tg.staff_msg("Станции ещё не загружены, повторите команду через 10 минут.")
         return
+    if cmd == "/stations" and not arg:
+        arg = "*"
     if cmd in PICK and arg != "*":
-        # название не дописали или подходит несколько станций - даём выбрать кнопкой
+        # Станций много, поэтому списком их не показываем: нужно название как в Deye Cloud.
         name = re.sub(r"\s+\d\s*[.,]\s*\d\s*$", "", arg) if cmd == "/queue" else arg
-        hits = match_stations(st, name)
         letter, prompt = PICK[cmd]
-        if not hits:
-            tg.staff_msg(f"Станция «{esc(name)}» не найдена.")
-            pick_station(tg, st, letter, prompt)
+        example = {"/link": "/link ПБС", "/stations": "/stations ПБС", "/queue": "/queue ПБС 3.1", "/reset": "/reset ПБС"}[cmd]
+        if not name:
+            tg.staff_msg(f"Напишите после команды название станции, как в Deye Cloud. Пример: <code>{example}</code>\n"
+                         "Не помните точно — напишите часть названия, покажу подходящие.")
             return
-        if len(hits) > 1 or not name:
-            if len(S) == 1 and not name:
-                arg = hits[0]
-            else:
-                pick_station(tg, st, letter, prompt if not name else f"Подходит несколько станций. {prompt}", hits,
-                             {"text": "📋 Все станции", "callback_data": "S:*"} if cmd == "/stations" and not name else None)
-                return
-        elif cmd == "/queue" and name == arg:  # станция есть, очередь не написали
+        hits = match_stations(st, name)
+        if not hits:
+            tg.staff_msg(f"Станция «{esc(name)}» не найдена. Проверьте название в Deye Cloud или напишите его часть.")
+            return
+        if len(hits) > 12:
+            tg.staff_msg(f"К «{esc(name)}» подходит {len(hits)} станций. Напишите название точнее.")
+            return
+        if len(hits) > 1:
+            pick_station(tg, st, letter, f"К «{esc(name)}» подходит несколько станций. {prompt}", hits)
+            return
+        if cmd == "/queue" and name == arg:  # станция есть, очередь не написали
             callback(tg, st, str(tg.staff), f"Q:{hits[0]}", "", None)
             return
-        elif cmd == "/reset" and arg != hits[0]:  # набрано текстом - переспросим
+        if cmd == "/reset" and arg != hits[0]:  # набрано текстом - переспросим
             callback(tg, st, str(tg.staff), f"R:{hits[0]}", "", None)
             return
     if cmd == "/stations" and arg and arg != "*":
@@ -766,10 +776,20 @@ def staff_command(tg, st, cmd, arg):
                      f"\nочередь ДТЭК: {(queue_key(p.get('queue')) or 'не указана').replace('GPV', '')} · клиентов: {len(p.get('clients') or [])}"
                      f"\nсеть: {'НЕТ с ' + p['off_since'][11:16] if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}")
     elif cmd == "/stations":
-        tg.staff_msg("\n\n".join(
-            f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
-            f"\nочередь ДТЭК: {(queue_key(p.get('queue')) or 'не указана').replace('GPV', '')} · клиентов: {len(p.get('clients') or [])}"
-            for p in S.values()))
+        def names(ps, n=15):
+            lst = [esc(p.get("name")) for p in ps]
+            return ", ".join(lst[:n]) + (f" и ещё {len(lst) - n}" if len(lst) > n else "") if lst else "нет"
+        P = list(S.values())
+        dark = [p for p in P if p.get("no_grid") and not p.get("offline")]
+        off = [p for p in P if p.get("offline")]
+        low = [p for p in P if (p.get("last") or {}).get("soc") is not None and p["last"]["soc"] < 40 and not p.get("offline")]
+        tg.staff_msg(f"📊 <b>Станций: {len(P)}</b>\n\n"
+                     f"🟠 Без света сейчас ({len(dark)}): {names(dark)}\n"
+                     f"🔴 Не на связи ({len(off)}): {names(off)}\n"
+                     f"🔋 АКБ ниже 40% ({len(low)}): {names(low)}\n\n"
+                     f"Без очереди ДТЭК: {len([p for p in P if not queue_key(p.get('queue'))])}\n"
+                     f"Без подключённых клиентов: {len([p for p in P if not p.get('clients')])}\n\n"
+                     "Подробно по одной: <code>/stations название</code>")
     elif cmd in ("/link", "/links") and arg:
         sid, err = find_station(st, arg)
         if err:
@@ -777,6 +797,8 @@ def staff_command(tg, st, cmd, arg):
             return
         p = S[sid]
         tg.staff_msg(f"Ссылка для клиента, <b>{esc(p.get('title') or p.get('name'))}</b>:\nhttps://t.me/{bot}?start={p.get('code')}")
+    elif cmd == "/links" and len(S) > 25:
+        tg.staff_msg("Станций слишком много для одного сообщения. Берите ссылку по одной: <code>/link название</code>")
     elif cmd == "/links":
         tg.staff_msg("Ссылки для клиентов (кто откроет и нажмёт Start — будет получать уведомления по станции):\n\n" + "\n\n".join(
             f"<b>{esc(p.get('title') or p.get('name'))}</b>\nhttps://t.me/{bot}?start={p.get('code')}" for p in S.values() if p.get("code")))
