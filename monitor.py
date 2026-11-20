@@ -415,8 +415,25 @@ def commands(tg, st):
             if chat not in (p.get("clients") or []):
                 p.setdefault("clients", []).append(chat)
             title = esc(p.get("title") or p.get("name"))
-            tg.send(chat, f"✅ Подключено: <b>{title}</b>.\nСюда будут приходить сообщения, когда на объекте отключают и включают свет, графики ДТЭК и отчёт за месяц.\nОтключить уведомления: /stop")
+            ask = "" if queue_key(p.get("queue")) else ("\n\nЧтобы приходил график отключений, напишите свою очередь ДТЭК, например: /queue 3.1"
+                                                        "\nОчередь указана в приложении и на сайте ДТЭК по вашему адресу.")
+            tg.send(chat, f"✅ Подключено: <b>{title}</b>.\nСюда будут приходить сообщения, когда на объекте отключают и включают свет, графики ДТЭК и отчёт за месяц.\nОтключить уведомления: /stop{ask}")
             tg.staff_msg(f"👤 К станции <b>{title}</b> подключился клиент: {who}.")
+        elif cmd == "/queue":
+            mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
+            m = re.fullmatch(r"\s*([1-6])\s*[.,]\s*([12])\s*", arg)
+            if not mine:
+                tg.send(chat, "Сначала подключитесь по ссылке от менеджера.")
+            elif not m:
+                tg.send(chat, "Напишите очередь так: /queue 3.1\nОчереди бывают от 1.1 до 6.2. Если не знаете свою — напишите менеджеру адрес объекта.")
+            elif len(mine) > 1:
+                tg.send(chat, "У вас несколько объектов. Напишите менеджеру, какая очередь у какого объекта.")
+                tg.staff_msg(f"👤 Клиент {who} (несколько объектов) сообщил очередь ДТЭК {m.group(1)}.{m.group(2)} — уточните, для какого объекта, и задайте командой /queue.")
+            else:
+                p = st["stations"][mine[0]]
+                p["queue"] = f"GPV{m.group(1)}.{m.group(2)}"
+                tg.send(chat, f"✅ Очередь ДТЭК {m.group(1)}.{m.group(2)} записана. График отключений придёт в течение 10 минут.")
+                tg.staff_msg(f"👤 Клиент {who} указал очередь ДТЭК {m.group(1)}.{m.group(2)} для <b>{esc(p.get('title') or p.get('name'))}</b>. Изменить: /queue {esc(p.get('name'))} X.Y")
         elif cmd == "/stop":
             n = 0
             for p in st["stations"].values():
