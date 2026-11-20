@@ -13,7 +13,7 @@ station/listWithDevice, device/latest. Никаких настроек инве�
 Все пароли и токены берутся из переменных окружения (GitHub Secrets).
 В журнал GitHub программа не пишет ни названий станций, ни адресов, ни данных.
 """
-import hashlib, json, os, re, sys, time
+import hashlib, json, os, re, secrets, sys, time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -115,11 +115,19 @@ class Telegram:
     def staff_msg(self, text):
         return self.send(self.staff, text)
 
-    def both(self, client_chat, text, staff_prefix=""):
-        """Сотрудникам всегда, клиенту - если у станции указан его чат."""
-        self.staff_msg(staff_prefix + text)
-        if client_chat and str(client_chat) != str(self.staff):
-            self.send(client_chat, text)
+    def clients(self, chats, text):
+        for chat in dict.fromkeys(str(c) for c in (chats or []) if c):
+            if chat != str(self.staff):
+                self.send(chat, text)
+
+    def both(self, chats, text):
+        """Сотрудникам всегда, клиентам - всем чатам, привязанным к станции."""
+        self.staff_msg(text)
+        self.clients(chats, text)
+
+    def api(self, method, **params):
+        r = requests.get(f"https://api.telegram.org/bot{self.token}/{method}", params=params, timeout=25)
+        return r.json().get("result")
 
 
 # ---------------------------------------------------------------- Deye Cloud
@@ -306,6 +314,130 @@ def cfg_for(cfgs, sid, name):
     return cfgs.get(str(sid).lower()) or cfgs.get(str(name).strip().lower()) or {}
 
 
+def setup(st, cfgs, sid):
+    """Настройки станции: из команд в чате сотрудников (память) и из STATIONS_JSON."""
+    p = st["stations"].get(sid, {})
+    c = cfg_for(cfgs, sid, p.get("name", ""))
+    chats = list(p.get("clients") or [])
+    if c.get("client_chat"):
+        chats.append(str(c["client_chat"]))
+    return {"title": p.get("title") or c.get("title") or p.get("name") or sid,
+            "queue": queue_key(p.get("queue") or c.get("queue")),
+            "chats": chats}
+
+
+def find_station(st, text):
+    """Станция по id или по части названия. Возвращает (sid, None) или (None, сообщение)."""
+    t = str(text or "").strip().lower()
+    if not t:
+        return None, "Не указана станция."
+    hits = [sid for sid, p in st["stations"].items()
+            if t == sid or t in str(p.get("name", "")).lower() or t in str(p.get("title", "")).lower()]
+    if len(hits) == 1:
+        return hits[0], None
+    if not hits:
+        return None, "Станция «%s» не найдена. Список: /stations" % esc(text)
+    return None, "Подходит несколько станций: " + ", ".join(esc(st["stations"][h].get("name")) for h in hits)
+
+
+HELP = ("<b>Команды (работают только в этом чате, ответ приходит при следующей проверке, до ~10 минут):</b>\n"
+        "/stations — станции, их очереди ДТЭК и подключённые клиенты\n"
+        "/links — ссылки-приглашения для клиентов\n"
+        "/queue Название 3.1 — указать очередь ДТЭК\n"
+        "/title Название = Как называть в сообщениях\n"
+        "/reset Название — отключить всех клиентов станции и выдать новую ссылку")
+
+
+def commands(tg, st):
+    """Читает сообщения боту: /start <код> от клиентов и команды из чата сотрудников."""
+    if not tg.token:
+        return
+    T = st.setdefault("tg", {})
+    try:
+        ups = tg.api("getUpdates", offset=T.get("offset", 0), timeout=0,
+                     allowed_updates=json.dumps(["message"])) or []
+        if "bot" not in T:
+            T["bot"] = (tg.api("getMe") or {}).get("username", "")
+    except Exception:
+        print("Telegram: команды не прочитаны")
+        return
+    for u in ups:
+        T["offset"] = u["update_id"] + 1
+        m = u.get("message") or {}
+        chat = str((m.get("chat") or {}).get("id", ""))
+        text = (m.get("text") or "").strip()
+        if not chat or not text.startswith("/"):
+            continue
+        cmd, _, arg = text.partition(" ")
+        cmd, arg = cmd.split("@")[0].lower(), arg.strip()
+        who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
+        if chat == str(tg.staff):
+            staff_command(tg, st, cmd, arg)
+        elif cmd == "/start":
+            sid = next((k for k, p in st["stations"].items() if arg and p.get("code") == arg), None)
+            if not sid:
+                tg.send(chat, "Здравствуйте! Это бот уведомлений Solaris. Чтобы подключиться, откройте ссылку, которую вам прислал менеджер.")
+                continue
+            p = st["stations"][sid]
+            if chat not in (p.get("clients") or []):
+                p.setdefault("clients", []).append(chat)
+            title = esc(p.get("title") or p.get("name"))
+            tg.send(chat, f"✅ Подключено: <b>{title}</b>.\nСюда будут приходить сообщения, когда на объекте отключают и включают свет, графики ДТЭК и отчёт за месяц.\nОтключить уведомления: /stop")
+            tg.staff_msg(f"👤 К станции <b>{title}</b> подключился клиент: {who}.")
+        elif cmd == "/stop":
+            n = 0
+            for p in st["stations"].values():
+                if chat in (p.get("clients") or []):
+                    p["clients"].remove(chat)
+                    n += 1
+            tg.send(chat, "Уведомления отключены." if n else "Вы не были подключены.")
+            if n:
+                tg.staff_msg(f"👤 Клиент {who} отключил уведомления.")
+
+
+def staff_command(tg, st, cmd, arg):
+    S, bot = st["stations"], st.get("tg", {}).get("bot", "")
+    if not S and cmd != "/help":
+        tg.staff_msg("Станции ещё не загружены, повторите команду через 10 минут.")
+    elif cmd == "/stations":
+        tg.staff_msg("\n\n".join(
+            f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
+            f"\nочередь ДТЭК: {(queue_key(p.get('queue')) or 'не указана').replace('GPV', '')} · клиентов: {len(p.get('clients') or [])}"
+            for p in S.values()))
+    elif cmd == "/links":
+        tg.staff_msg("Ссылки для клиентов (кто откроет и нажмёт Start — будет получать уведомления по станции):\n\n" + "\n\n".join(
+            f"<b>{esc(p.get('title') or p.get('name'))}</b>\nhttps://t.me/{bot}?start={p.get('code')}" for p in S.values() if p.get("code")))
+    elif cmd == "/queue":
+        m = re.match(r"(.+?)\s+(\d\s*[.,]\s*\d)\s*$", arg)
+        if not m:
+            tg.staff_msg("Пример: /queue ПБС 3.1")
+            return
+        sid, err = find_station(st, m.group(1))
+        if err:
+            tg.staff_msg(err)
+            return
+        S[sid]["queue"] = queue_key(m.group(2))
+        tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b>: очередь ДТЭК {S[sid]['queue'].replace('GPV', '')}. График придёт при следующей проверке.")
+    elif cmd == "/title":
+        name, _, title = arg.partition("=")
+        sid, err = find_station(st, name)
+        if err or not title.strip():
+            tg.staff_msg(err or "Пример: /title ПБС = Офис на Хуторской")
+            return
+        S[sid]["title"] = title.strip()[:60]
+        tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b> теперь в сообщениях называется «{esc(S[sid]['title'])}».")
+    elif cmd == "/reset":
+        sid, err = find_station(st, arg)
+        if err:
+            tg.staff_msg(err)
+            return
+        tg.clients(S[sid].get("clients"), "Уведомления по объекту отключены менеджером.")
+        S[sid]["clients"], S[sid]["code"] = [], secrets.token_urlsafe(9)
+        tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b>: клиенты отключены. Новая ссылка:\nhttps://t.me/{bot}?start={S[sid]['code']}")
+    elif cmd in ("/help", "/start"):
+        tg.staff_msg(HELP)
+
+
 # ---------------------------------------------------------------- сеть есть / нет
 VOLT_KEY = re.compile(r"grid.*volt|volt.*grid", re.I)
 
@@ -358,10 +490,11 @@ def check(api, tg, st, dtek):
     for s in stations:
         sid = str(s.get("id") or s.get("stationId"))
         name = s.get("name") or s.get("stationName") or sid
-        c = cfg_for(cfgs, sid, name)
-        title = esc(c.get("title") or name)
-        chat = c.get("client_chat")
-        q = queue_key(c.get("queue"))
+        p = st["stations"].setdefault(sid, {})
+        p["name"] = name
+        p.setdefault("code", secrets.token_urlsafe(9))
+        cfg = setup(st, cfgs, sid)
+        title, chat, q = esc(cfg["title"]), cfg["chats"], cfg["queue"]
         try:
             lt = api.latest(int(sid))
         except Exception:
@@ -376,8 +509,6 @@ def check(api, tg, st, dtek):
             age = (time.time() - (upd / 1000 if upd > 1e11 else upd)) / 60
         soc = num(lt.get("batterySOC"))
         load = num(lt.get("consumptionPower")) or 0
-        p = st["stations"].setdefault(sid, {})
-        p["name"] = name
 
         offline = bool((status and status not in OK_STATUS) or (age is not None and age > stale))
         if offline and not p.get("offline"):
@@ -444,13 +575,12 @@ def dtek_alerts(tg, st, dtek):
     t = now()
     today, tomorrow = t.strftime("%Y-%m-%d"), (t + timedelta(days=1)).strftime("%Y-%m-%d")
     # кто на какой очереди
-    by_q = {}
-    for key, c in cfgs.items():
-        q = queue_key(c.get("queue"))
-        if q:
-            real = next((v.get("name") for k, v in st["stations"].items()
-                         if key in (k.lower(), str(v.get("name", "")).strip().lower())), None)
-            by_q.setdefault(q, []).append((c.get("title") or real or key, c.get("client_chat")))
+    by_q, all_chats = {}, []
+    for sid in st["stations"]:
+        c = setup(st, cfgs, sid)
+        all_chats += c["chats"]
+        if c["queue"]:
+            by_q.setdefault(c["queue"], []).append((c["title"], c["chats"]))
 
     # 1. общий текст ДТЭК: экстренные / аварийные
     att = dtek["attention"]
@@ -461,9 +591,7 @@ def dtek_alerts(tg, st, dtek):
             if emerg:
                 msg = "🚨 <b>ДТЭК Одесса: экстренные / аварийные отключения</b>\nГрафики сейчас могут не действовать, свет могут отключить без предупреждения.\n\n" + esc(att[:700])
                 tg.staff_msg(msg)
-                for chat in {c for v in by_q.values() for _, c in v if c} | {c.get("client_chat") for c in cfgs.values() if c.get("client_chat")}:
-                    if str(chat) != str(tg.staff):
-                        tg.send(chat, msg)
+                tg.clients(all_chats, msg)
             elif D.get("emerg"):
                 tg.staff_msg("✅ <b>ДТЭК Одесса</b>: сообщение об экстренных отключениях снято.\n\n" + esc(att[:500]))
             else:
@@ -483,17 +611,13 @@ def dtek_alerts(tg, st, dtek):
                 continue
             changed = key in seen
             seen[key] = sig
-            if not changed and label == "сегодня" and D.get("started"):
-                # график на сегодня уже присылали вчера как «завтра» под тем же ключом
-                pass
             head = "изменился график" if changed else "график"
             qn = q.replace("GPV", "")
             body = f"очередь {qn}, {label} ({day[8:]}.{day[5:7]}):\n{fmt_intervals(sl)}"
             names = ", ".join(esc(n) for n, _ in people)
             tg.staff_msg(f"🗓 <b>ДТЭК: {head}</b>, {body}\nОбъекты: {names}")
-            for n, chat in people:
-                if chat and str(chat) != str(tg.staff):
-                    tg.send(chat, f"🗓 <b>{esc(n)}</b>: {head} отключений ДТЭК, {body}")
+            for n, chats in people:
+                tg.clients(chats, f"🗓 <b>{esc(n)}</b>: {head} отключений ДТЭК, {body}")
     for k in [k for k in seen if k.split("|")[0] < today]:
         seen.pop(k)
 
@@ -531,8 +655,9 @@ def report(api, tg, st):
     for s in api.stations():
         sid = str(s.get("id") or s.get("stationId"))
         name = s.get("name") or s.get("stationName") or sid
-        c = cfg_for(cfgs, sid, name)
-        title = esc(c.get("title") or name)
+        st["stations"].setdefault(sid, {}).setdefault("name", name)
+        c = setup(st, cfgs, sid)
+        title = esc(c["title"])
         lines = [f"📊 <b>{title}</b> — отчёт за {MONTHS[m]} {y}"]
         try:
             rows = [r for r in api.history(int(sid), 3, ym, ym) if int(num(r.get("month")) or m) == m] or []
@@ -559,7 +684,7 @@ def report(api, tg, st):
             lines.append("Всё это время объект работал от станции.")
         else:
             lines.append("\n💡 Отключений света за месяц программа не зафиксировала.")
-        tg.both(c.get("client_chat"), "\n".join(lines))
+        tg.both(c["chats"], "\n".join(lines))
         n += 1
     return n
 
@@ -574,7 +699,8 @@ def diag(api, tg, st, dtek):
     for s in stations[:25]:
         sid = str(s.get("id") or s.get("stationId"))
         name = s.get("name") or s.get("stationName") or sid
-        c = cfg_for(cfgs, sid, name)
+        st["stations"].setdefault(sid, {}).setdefault("name", name)
+        c = setup(st, cfgs, sid)
         types |= {str(d.get("deviceType")) for d in s.get("deviceListItems") or []}
         sn = [str(d.get("deviceSn")) for d in s.get("deviceListItems") or [] if str(d.get("deviceType", "")).upper() == "INVERTER"]
         dev = {}
@@ -593,7 +719,7 @@ def diag(api, tg, st, dtek):
         lines.append(f"\n<b>{esc(name)}</b> (id {sid})\nсеть: {'НЕТ' if ng else 'есть' if ng is False else 'неясно'} · способ: {how}"
                      f"\nнапряжение сети: {', '.join(str(v) for k, v in sorted(volts.items()) if 'L1L2' not in k) + ' В' if volts else 'нет в данных'}"
                      f"\nАКБ {kw(lt.get('batterySOC'), 1, 0)}% · нагрузка {kw(lt.get('consumptionPower'))} кВт · из сети {kw(lt.get('wirePower', lt.get('gridPower')))} кВт"
-                     f"\nочередь ДТЭК: {queue_key(c.get('queue')) or 'не указана'} · чат клиента: {'есть' if c.get('client_chat') else 'нет'}")
+                     f"\nочередь ДТЭК: {(c['queue'] or 'не указана').replace('GPV', '')} · клиентов подключено: {len(c['chats'])}")
     if dtek:
         lines.append(f"\nДТЭК: график обновлён {esc(dtek['updated'])}, дни: {', '.join(sorted(dtek['days']))}")
     else:
@@ -636,6 +762,7 @@ def main():
             tg.staff_msg("⚠️ Отчёт за месяц не собрался: Deye Cloud не ответил. Запустите его вручную позже (Actions → monitor → report).")
             print("Отчёт: ошибка,", type(e).__name__)
     else:
+        commands(tg, st)
         n = check(api, tg, st, dtek)
         dtek_alerts(tg, st, dtek)
         st["last_check"] = now().strftime("%Y-%m-%d %H:%M")
