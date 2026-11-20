@@ -13,7 +13,7 @@ station/listWithDevice, device/latest. Никаких настроек инве�
 Все пароли и токены берутся из переменных окружения (GitHub Secrets).
 В журнал GitHub программа не пишет ни названий станций, ни адресов, ни данных.
 """
-import hashlib, json, os, re, secrets, sys, time
+import glob, hashlib, json, os, re, secrets, subprocess, sys, time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -340,7 +340,7 @@ def find_station(st, text):
     return None, "Подходит несколько станций: " + ", ".join(esc(st["stations"][h].get("name")) for h in hits)
 
 
-HELP = ("<b>Команды (работают только в этом чате, ответ приходит при следующей проверке, до ~10 минут):</b>\n"
+HELP = ("<b>Команды (работают только в этом чате):</b>\n"
         "/link Название — ссылка-приглашение для клиента одной станции\n"
         "/stations Название — очередь, клиенты и сеть по одной станции\n"
         "/links и /stations без названия — список по всем станциям\n"
@@ -349,21 +349,53 @@ HELP = ("<b>Команды (работают только в этом чате, 
         "/reset Название — отключить всех клиентов станции и выдать новую ссылку")
 
 
+INBOX = os.path.join(HERE, "inbox")
+
+
+def hook_secret():
+    return hashlib.sha256(("tg:" + env("INBOX_KEY")).encode()).hexdigest()
+
+
+def read_inbox():
+    """Команды, которые приёмник (Vercel) положил в папку inbox зашифрованными."""
+    out, key = [], env("INBOX_KEY")
+    for path in sorted(glob.glob(os.path.join(INBOX, "*.txt"))):
+        try:
+            iv, body = open(path, encoding="utf-8").read().split("\n", 1)
+            r = subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-base64", "-A",
+                                "-K", hashlib.sha256(key.encode()).hexdigest(), "-iv", iv.strip()],
+                               input=body.replace("\n", "").encode(), capture_output=True, timeout=20)
+            if r.returncode == 0:
+                out.append(json.loads(r.stdout.decode("utf-8")))
+        except Exception:
+            print("inbox: файл не прочитан")
+        os.remove(path)
+    return out
+
+
 def commands(tg, st):
     """Читает сообщения боту: /start <код> от клиентов и команды из чата сотрудников."""
     if not tg.token:
         return
     T = st.setdefault("tg", {})
+    ups = read_inbox() if env("INBOX_KEY") else []
+    if ups:
+        open(STATE + ".changed", "w").close()
     try:
-        ups = tg.api("getUpdates", offset=T.get("offset", 0), timeout=0,
-                     allowed_updates=json.dumps(["message"])) or []
+        if not T.get("webhook"):
+            ups += tg.api("getUpdates", offset=T.get("offset", 0), timeout=0,
+                          allowed_updates=json.dumps(["message"])) or []
         if "bot" not in T:
             T["bot"] = (tg.api("getMe") or {}).get("username", "")
     except Exception:
         print("Telegram: команды не прочитаны")
-        return
-    for u in ups:
-        T["offset"] = u["update_id"] + 1
+    done = set(T.get("done") or [])
+    for u in sorted(ups, key=lambda x: x.get("update_id", 0)):
+        if u.get("update_id") in done:
+            continue
+        done.add(u.get("update_id"))
+        T["done"] = sorted(done)[-200:]
+        T["offset"] = max(T.get("offset", 0), u["update_id"] + 1)
         m = u.get("message") or {}
         chat = str((m.get("chat") or {}).get("id", ""))
         text = (m.get("text") or "").strip()
@@ -768,7 +800,26 @@ def main():
         if st["dtek"]["fail"] == 12:
             tg.staff_msg("⚠️ Графики ДТЭК не загружаются уже час. Отключения по станциям по-прежнему отслеживаются.")
     api = Deye()
-    if mode == "diag":
+    if mode == "cmd":
+        commands(tg, st)
+        print("Команды обработаны, сообщений:", tg.sent)
+    elif mode in ("webhook", "webhook-off"):
+        url = ""
+        try:
+            url = open(os.path.join(HERE, "webhook_url.txt"), encoding="utf-8").read().strip()
+        except Exception:
+            pass
+        if mode == "webhook" and url and env("INBOX_KEY"):
+            ok = tg.api("setWebhook", url=url, secret_token=hook_secret(),
+                        allowed_updates=json.dumps(["message"]))
+            st.setdefault("tg", {})["webhook"] = bool(ok)
+            tg.staff_msg("⚡ Быстрые команды включены: бот отвечает примерно за минуту." if ok else "⚠️ Быстрые команды включить не получилось.")
+        else:
+            tg.api("deleteWebhook")
+            st.setdefault("tg", {})["webhook"] = False
+            tg.staff_msg("Быстрые команды выключены: бот снова отвечает при очередной проверке.")
+        print("webhook:", st["tg"]["webhook"])
+    elif mode == "diag":
         try:
             diag(api, tg, st, dtek)
         except Exception as e:

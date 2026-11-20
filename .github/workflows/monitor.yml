@@ -10,7 +10,7 @@ on:
         description: "check - проверка, test - тест Telegram, diag - диагностика, report - отчёт"
         default: "check"
         type: choice
-        options: [check, test, diag, report]
+        options: [check, cmd, test, diag, report, webhook, webhook-off]
 
 permissions:
   contents: write
@@ -33,6 +33,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       STATIONS_JSON: ${{ secrets.STATIONS_JSON }}
       STATE_KEY: ${{ secrets.STATE_KEY }}
+      INBOX_KEY: ${{ secrets.INBOX_KEY }}
       LOW_SOC: ${{ vars.LOW_SOC }}
       STALE_MIN: ${{ vars.STALE_MIN }}
       STATE_FILE: /tmp/solaris-state.json
@@ -67,6 +68,7 @@ jobs:
             git config user.name "solaris-monitor"
             git config user.email "monitor@users.noreply.github.com"
             git add state.enc
+            git add -A inbox 2>/dev/null || true
             git commit -q -m "state" || exit 0
-            git push -q || (git pull -q --rebase && git push -q)
+            git push -q || (git pull -q --rebase && git push -q) || (sleep 3 && git pull -q --rebase && git push -q)
           fi
