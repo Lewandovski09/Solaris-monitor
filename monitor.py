@@ -102,14 +102,42 @@ class Telegram:
         self.token = env("TELEGRAM_TOKEN")
         self.staff = env("TELEGRAM_CHAT_ID")
         self.sent = 0
+        self.last_id = None
 
-    def send(self, chat, text):
+    def photo(self, chat, path, caption, markup=None):
+        """Картинка с подписью. Если не получилось - обычный текст."""
+        try:
+            data = {"chat_id": chat, "caption": caption[:1000], "parse_mode": "HTML"}
+            if markup:
+                data["reply_markup"] = json.dumps(markup)
+            with open(path, "rb") as f:
+                r = requests.post(f"https://api.telegram.org/bot{self.token}/sendPhoto", data=data, files={"photo": f}, timeout=30)
+            if r.ok:
+                self.sent += 1
+                return True
+        except Exception:
+            pass
+        return self.send(chat, caption, markup)
+
+    def call(self, method, **params):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params, timeout=20)
+            return r.json() if r.content else {}
+        except Exception:
+            return {}
+
+    def send(self, chat, text, markup=None):
         if not self.token or not chat:
             return False
         try:
-            r = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                              json={"chat_id": chat, "text": text[:4000], "parse_mode": "HTML",
-                                    "disable_web_page_preview": True}, timeout=20)
+            body = {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
+            if markup:
+                body["reply_markup"] = markup
+            r = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json=body, timeout=20)
+            try:
+                self.last_id = r.json().get("result", {}).get("message_id")
+            except Exception:
+                self.last_id = None
             self.sent += 1 if r.ok else 0
             if not r.ok:
                 print("Telegram: сообщение не ушло, код", r.status_code)
@@ -361,6 +389,8 @@ HELP = ("📋 <b>Команды бота</b>\n"
         "<code>/queue пбс 3.1</code> — после этого клиенту идут графики и напоминания. Обычно клиент присылает очередь сам.\n\n"
         "<b>Назвать объект по-человечески</b>\n"
         "<code>/title пбс = Офис на Хуторской</code> — так объект будет называться в сообщениях клиенту.\n\n"
+        "<b>Контакт менеджера для клиентов</b>\n"
+        "<code>/contact Георгий, +380 00 000 00 00</code> — клиент увидит его в памятке бота.\n\n"
         "<b>Отключить клиента</b>\n"
         "<code>/reset пбс</code> — отключает всех клиентов станции и выдаёт новую ссылку. Старая перестаёт работать.\n\n"
         "<b>Все ссылки разом</b>\n"
@@ -368,6 +398,119 @@ HELP = ("📋 <b>Команды бота</b>\n"
         "<b>Эта памятка</b>\n"
         "<code>/help</code>\n\n"
         "В группу бот сам пишет только то, что требует действий: ошибки инвертора и АКБ, что стоит поменять в настройках или предложить клиенту, и кто из клиентов подключился. Про свет и графики он пишет клиентам.")
+
+
+# ---------------------------------------------------------------- меню клиента
+BTN_STATUS, BTN_SCHED, BTN_HELP = "🔌 Стан станції", "🗓 Графік", "❓ Допомога"
+KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_HELP}]],
+            "resize_keyboard": True, "is_persistent": True}
+CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
+                   ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
+                   ("help", "Що вміє бот і як змінити чергу"),
+                   ("stop", "Вимкнути сповіщення")]
+STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
+                  ("stations", "Станции: очередь, клиенты, свет"),
+                  ("queue", "Очередь ДТЭК: /queue пбс 3.1"),
+                  ("title", "Название для клиента: /title пбс = Офис"),
+                  ("contact", "Контакт менеджера для клиентов"),
+                  ("reset", "Отключить клиентов станции"),
+                  ("links", "Все ссылки"),
+                  ("help", "Памятка")]
+
+
+def client_help(st):
+    c = st.get("contact")
+    return ("ℹ️ <b>Бот Solaris стежить за вашою станцією і сам пише, коли щось змінюється:</b>\n"
+            "• вимкнули або увімкнули світло;\n"
+            "• графік відключень ДТЕК і нагадування за 30 хвилин;\n"
+            "• екстрені відключення;\n"
+            "• станція зникла зі зв'язку — і чому;\n"
+            "• звіт за місяць.\n\n"
+            "<b>Кнопки внизу екрана:</b>\n"
+            f"{BTN_STATUS} — чи є світло, заряд АКБ, навантаження.\n"
+            f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
+            f"{BTN_HELP} — ця підказка.\n\n"
+            "<b>Змінити чергу ДТЕК</b> — просто надішліть дві цифри, наприклад: 3.1\n"
+            "<b>Вимкнути сповіщення</b> — /stop"
+            + (f"\n\n<b>Менеджер Solaris:</b> {esc(c)}" if c else ""))
+
+
+def client_status(st, chat):
+    out = []
+    for p in st["stations"].values():
+        if chat not in (p.get("clients") or []):
+            continue
+        title = esc(p.get("title") or p.get("name"))
+        last = p.get("last") or {}
+        if p.get("offline"):
+            out.append(f"🔴 <b>{title}</b>: станція не на зв'язку, свіжих даних немає."
+                       + (f"\nОстанні дані: АКБ {last['soc']:.0f}%, о {last['at'][11:16]}." if last.get("soc") is not None else ""))
+            continue
+        if p.get("no_grid"):
+            since = datetime.fromisoformat(p["off_since"])
+            line = f"🟠 <b>{title}</b>: світла немає з ~{hm(since)} ({dur((now() - since).total_seconds() / 60)}). Об'єкт працює від станції."
+        else:
+            line = f"🟢 <b>{title}</b>: світло є."
+        if last.get("soc") is not None:
+            line += f"\nАКБ {last['soc']:.0f}%"
+            if last.get("load") is not None:
+                line += f" · навантаження {last['load'] / 1000:.1f} кВт"
+            if p.get("no_grid") and p.get("off_soc") is not None and last["soc"] < p["off_soc"]:
+                hrs = (now() - datetime.fromisoformat(p["off_since"])).total_seconds() / 3600
+                if hrs > 0.5:
+                    rate = (p["off_soc"] - last["soc"]) / hrs
+                    left = (last["soc"] - 15) / rate if rate > 0 else 0
+                    if left > 0:
+                        line += f"\nЗа такого споживання заряду вистачить ще приблизно на {dur(left * 60)} (до залишку 15%)."
+            line += f"\nДані станом на {last.get('at', '')[11:16]}."
+        out.append(line)
+    return "\n\n".join(out)
+
+
+def client_schedule(st, chat, dtek):
+    out = []
+    t = now()
+    for p in st["stations"].values():
+        if chat not in (p.get("clients") or []):
+            continue
+        title = esc(p.get("title") or p.get("name"))
+        q = queue_key(p.get("queue"))
+        if not q:
+            out.append(f"🗓 <b>{title}</b>: черга ДТЕК ще не вказана. Надішліть дві цифри, наприклад: 3.1")
+            continue
+        if not dtek:
+            out.append(f"🗓 <b>{title}</b>: графік ДТЕК зараз недоступний, спробуйте за кілька хвилин.")
+            continue
+        lines = [f"🗓 <b>{title}</b>, черга {q.replace('GPV', '')}"]
+        for day, label in ((t, "Сьогодні"), (t + timedelta(days=1), "Завтра")):
+            sl = (dtek["days"].get(day.strftime("%Y-%m-%d")) or {}).get(q)
+            lines.append(f"<b>{label} ({day.strftime('%d.%m')}):</b> " + (fmt_intervals(sl) if sl is not None else "графік ще не опубліковано"))
+        if dtek.get("updated"):
+            lines.append(f"Оновлено ДТЕК: {esc(dtek['updated'])}")
+        out.append("\n".join(lines))
+    return "\n\n".join(out)
+
+
+def bot_setup(tg, st):
+    """Меню команд, описание и аватар бота. Запускается вручную режимом setup."""
+    res = {}
+    res["команды клиентов"] = tg.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in CLIENT_COMMANDS],
+                                      scope={"type": "all_private_chats"}).get("ok")
+    res["команды группы"] = tg.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in STAFF_COMMANDS],
+                                    scope={"type": "chat", "chat_id": int(tg.staff)}).get("ok")
+    res["описание"] = tg.call("setMyDescription", description="Solaris — сонячні електростанції.\n\nБот стежить за вашою станцією і пише, коли вимикають і вмикають світло, надсилає графік відключень ДТЕК і звіт за місяць.\n\nЩоб підключитися, відкрийте посилання від вашого менеджера.").get("ok")
+    res["короткое описание"] = tg.call("setMyShortDescription", short_description="Сповіщення про світло і стан вашої сонячної станції Solaris").get("ok")
+    res["кнопка меню"] = tg.call("setChatMenuButton", menu_button={"type": "commands"}).get("ok")
+    try:
+        with open(os.path.join(HERE, "assets", "avatar.jpg"), "rb") as f:
+            r = requests.post(f"https://api.telegram.org/bot{tg.token}/setMyProfilePhoto",
+                              data={"photo": json.dumps({"type": "static", "photo": "attach://ava"})}, files={"ava": f}, timeout=30)
+        res["аватар"] = r.json().get("ok")
+    except Exception:
+        res["аватар"] = False
+    tg.staff_msg("🎨 Оформление бота:\n" + "\n".join(f"{'✅' if v else '❌'} {k}" for k, v in res.items())
+                 + ("" if res.get("аватар") else "\n\nАватар через программу поставить не удалось — поставьте вручную: @BotFather → /setuserpic → выбрать бота → отправить картинку."))
+    print("setup:", {k: bool(v) for k, v in res.items()})
 
 
 INBOX = os.path.join(HERE, "inbox")
@@ -394,7 +537,7 @@ def read_inbox():
     return out
 
 
-def commands(tg, st):
+def commands(tg, st, dtek=None):
     """Читает сообщения боту: /start <код> от клиентов и команды из чата сотрудников."""
     if not tg.token:
         return
@@ -425,6 +568,9 @@ def commands(tg, st):
             continue
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
+        if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help"}.get(text, cmd)
+        is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
             staff_command(tg, st, cmd, arg)
@@ -439,12 +585,18 @@ def commands(tg, st):
             title = esc(p.get("title") or p.get("name"))
             ask = "" if queue_key(p.get("queue")) else ("\n\nЩоб надходив графік відключень, надішліть у відповідь вашу чергу ДТЕК — просто дві цифри, наприклад: 3.1"
                                                         "\nНе знаєте чергу? Напишіть «не знаю» — надішлю коротку інструкцію.")
-            tg.send(chat, f"✅ Підключено: <b>{title}</b>.\nСюди надходитимуть повідомлення, коли на об'єкті вимикають і вмикають світло, графіки ДТЕК і звіт за місяць.\nВимкнути сповіщення: /stop{ask}")
+            tg.photo(chat, os.path.join(HERE, "assets", "logo.jpg"),
+                     f"✅ Підключено: <b>{title}</b>.\nСюди надходитимуть повідомлення, коли на об'єкті вимикають і вмикають світло, графіки ДТЕК і звіт за місяць.{ask}", KEYBOARD)
+            if tg.send(chat, client_help(st), KEYBOARD) and tg.last_id:  # памятку закрепляем вверху чата
+                tg.call("pinChatMessage", chat_id=chat, message_id=tg.last_id, disable_notification=True)
             if queue_key(p.get("queue")):
                 tg.staff_msg(f"👤 {who} подключился к <b>{title}</b>. Очередь ДТЭК {p['queue'].replace('GPV', '')}.")
             else:  # ждём, пока пришлёт очередь, и напишем одним сообщением
                 p.setdefault("joins", {})[chat] = {"who": who, "at": now().isoformat()}
-        elif cmd == "/queue" or not text.startswith("/"):
+        elif cmd in ("/status", "/grafik", "/help") and is_client:
+            tg.send(chat, {"/status": lambda: client_status(st, chat), "/grafik": lambda: client_schedule(st, chat, dtek),
+                           "/help": lambda: client_help(st)}[cmd](), KEYBOARD)
+        elif cmd == "/queue" or not text.startswith("/") or not is_client:
             client_queue(tg, st, chat, arg if cmd == "/queue" else text, who)
         elif cmd == "/stop":
             n = 0
@@ -452,7 +604,7 @@ def commands(tg, st):
                 if chat in (p.get("clients") or []):
                     p["clients"].remove(chat)
                     n += 1
-            tg.send(chat, "Сповіщення вимкнено." if n else "Ви не були підключені.")
+            tg.send(chat, "Сповіщення вимкнено. Щоб увімкнути знову, відкрийте посилання від менеджера." if n else "Ви не були підключені.", {"remove_keyboard": True})
             for p in st["stations"].values():
                 (p.get("joins") or {}).pop(chat, None)
             if n:
@@ -489,7 +641,7 @@ def client_queue(tg, st, chat, text, who):
         return
     p = st["stations"][mine[0]]
     p["queue"] = "GPV" + q
-    tg.send(chat, f"✅ Чергу ДТЕК {q} записано. Графік відключень надійде протягом 10 хвилин.")
+    tg.send(chat, f"✅ Чергу ДТЕК {q} записано. Графік відключень надійде за кілька хвилин.")
     joined = (p.get("joins") or {}).pop(chat, None)
     verb = "подключился к" if joined else "изменил очередь для"
     tg.staff_msg(f"👤 {who} {verb} <b>{esc(p.get('title') or p.get('name'))}</b>. Очередь ДТЭК {q}.")
@@ -552,6 +704,12 @@ def staff_command(tg, st, cmd, arg):
         tg.clients(S[sid].get("clients"), "Сповіщення по об'єкту вимкнено менеджером.")
         S[sid]["clients"], S[sid]["code"] = [], secrets.token_urlsafe(9)
         tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b>: клиенты отключены. Новая ссылка:\nhttps://t.me/{bot}?start={S[sid]['code']}")
+    elif cmd == "/contact":
+        if not arg:
+            tg.staff_msg("Сейчас: " + (esc(st.get("contact")) or "не задан") + "\nПример: /contact Георгий, +380 00 000 00 00, @username")
+            return
+        st["contact"] = arg[:120]
+        tg.staff_msg(f"✅ Контакт менеджера для клиентов: {esc(st['contact'])}\nОн показывается клиенту в памятке (кнопка «Допомога»).")
     elif cmd in ("/help", "/start"):
         tg.staff_msg(HELP)
 
@@ -905,6 +1063,7 @@ def check(api, tg, st, dtek):
             continue  # пока нет связи, про сеть и АКБ ничего утверждать нельзя
         if soc is not None:
             p["last_soc"] = soc
+        p["last"] = {"soc": soc, "load": load, "at": t.isoformat()}
 
         no_grid, how = grid_state(lt, dev)
         p["how"] = how
@@ -1182,10 +1341,12 @@ def main():
             tg.staff_msg("⚠️ Графики ДТЭК не загружаются уже час. Отключения по станциям по-прежнему отслеживаются.")
     api = Deye()
     if mode == "cmd":
-        commands(tg, st)
+        commands(tg, st, dtek)
         print("Команды обработаны, сообщений:", tg.sent)
     elif mode == "help":
         tg.staff_msg(HELP)
+    elif mode == "setup":
+        bot_setup(tg, st)
     elif mode == "tokenwarn":
         day = now().strftime("%Y-%m-%d")
         if st.get("tokenwarn") != day:
@@ -1222,7 +1383,7 @@ def main():
             tg.staff_msg("⚠️ Отчёт за месяц не собрался: Deye Cloud не ответил. Запустите его вручную позже (Actions → monitor → report).")
             print("Отчёт: ошибка,", type(e).__name__)
     else:
-        commands(tg, st)
+        commands(tg, st, dtek)
         n = check(api, tg, st, dtek)
         dtek_alerts(tg, st, dtek)
         st["last_check"] = now().strftime("%Y-%m-%d %H:%M")
