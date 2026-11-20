@@ -1,0 +1,5 @@
+state.json
+state.json.changed
+__pycache__/
+*.ini
+.env
