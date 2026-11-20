@@ -27,11 +27,13 @@ module.exports = async (req, res) => {
     return res.status(403).send("forbidden");
 
   const upd = req.body || {};
+  const cq = upd.callback_query;
   const msg = upd.message || {};
   const text = (msg.text || "").trim();
   const isPrivate = (msg.chat || {}).type === "private";
-  // groups: commands only; private chats: also short plain replies (e.g. the outage queue "3.1")
-  if (!upd.update_id || !text || text.length > 300 || (!text.startsWith("/") && !isPrivate))
+  // groups: commands only; private chats: also short plain replies; button presses: always
+  if (!upd.update_id) return res.status(200).send("skip");
+  if (!cq && (!text || text.length > 300 || (!text.startsWith("/") && !isPrivate)))
     return res.status(200).send("skip");
 
   const iv = crypto.randomBytes(16);
@@ -46,5 +48,7 @@ module.exports = async (req, res) => {
   if (!put.ok && put.status !== 422) return res.status(502).send("store failed " + put.status);
   const run = await gh("/actions/workflows/monitor.yml/dispatches", "POST", { ref: "main", inputs: { mode: "cmd" } });
   if (!run.ok) return res.status(502).send("dispatch failed " + run.status);
-  return res.status(200).send("ok");
+  // Telegram lets a webhook answer with one API call: stop the button spinner / show "typing"
+  if (cq) return res.status(200).json({ method: "answerCallbackQuery", callback_query_id: cq.id, text: "⏳ Секунду…" });
+  return res.status(200).json({ method: "sendChatAction", chat_id: msg.chat.id, action: "typing" });
 };

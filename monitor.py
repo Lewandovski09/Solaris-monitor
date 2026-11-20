@@ -379,7 +379,7 @@ def find_station(st, text):
 
 
 HELP = ("📋 <b>Команды бота</b>\n"
-        "Пишутся в этой группе. Ответ приходит примерно за минуту. Название станции можно писать не полностью и маленькими буквами: <code>пбс</code>, <code>dyn</code>, <code>home</code>.\n\n"
+        "Пишутся в этой группе. Ответ приходит примерно за минуту. <b>Название станции можно не писать:</b> отправьте команду без него — бот покажет станции кнопками, нажмите нужную. Или напишите часть названия маленькими буквами: <code>пбс</code>, <code>dyn</code>, <code>home</code>.\n\n"
         "<b>Дать клиенту доступ</b>\n"
         "<code>/link пбс</code> — бот пришлёт ссылку. Отправьте её клиенту, он нажимает Start и начинает получать сообщения о свете.\n\n"
         "<b>Посмотреть станцию</b>\n"
@@ -401,11 +401,12 @@ HELP = ("📋 <b>Команды бота</b>\n"
 
 
 # ---------------------------------------------------------------- меню клиента
-BTN_STATUS, BTN_SCHED, BTN_HELP = "🔌 Стан станції", "🗓 Графік", "❓ Допомога"
-KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_HELP}]],
+BTN_STATUS, BTN_SCHED, BTN_HELP, BTN_QUEUE = "🔌 Стан станції", "🗓 Графік", "❓ Допомога", "🔁 Змінити чергу"
+KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
+                   ("cherga", "Змінити чергу ДТЕК"),
                    ("help", "Що вміє бот і як змінити чергу"),
                    ("stop", "Вимкнути сповіщення")]
 STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
@@ -416,6 +417,77 @@ STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
                   ("reset", "Отключить клиентов станции"),
                   ("links", "Все ссылки"),
                   ("help", "Памятка")]
+
+
+def queue_grid(prefix, extra=None):
+    """Кнопки очередей 1.1 … 6.2. prefix - что вернётся при нажатии."""
+    rows = [[{"text": f"{a}.{b}", "callback_data": f"{prefix}{a}.{b}"} for a in (x, x + 1) for b in (1, 2)] for x in (1, 3, 5)]
+    if extra:
+        rows.append([extra])
+    return {"inline_keyboard": rows}
+
+
+def ask_queue(tg, st, chat, change=False):
+    mine = [p for p in st["stations"].values() if chat in (p.get("clients") or [])]
+    cur = queue_key(mine[0].get("queue")) if len(mine) == 1 else None
+    head = (f"Зараз ваша черга ДТЕК: <b>{cur.replace('GPV', '')}</b>.\nОберіть нову:" if cur and change
+            else "Оберіть вашу чергу ДТЕК — так бот знатиме ваш графік відключень:")
+    tg.send(chat, head, queue_grid("cq:", {"text": "Не знаю свою чергу", "callback_data": "cq:?"}))
+
+
+def match_stations(st, text):
+    t = str(text or "").strip().lower()
+    return [sid for sid, p in st["stations"].items()
+            if not t or t == sid or t in str(p.get("name", "")).lower() or t in str(p.get("title", "")).lower()]
+
+
+def pick_station(tg, st, action, prompt, sids=None, all_button=None):
+    """Список станций кнопками: нажал - команда выполнилась. action - буква команды."""
+    sids = (sids if sids is not None else list(st["stations"]))[:60]
+    btns = [{"text": str(st["stations"][k].get("title") or st["stations"][k].get("name"))[:28], "callback_data": f"{action}:{k}"} for k in sids]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    if all_button:
+        rows.append([all_button])
+    more = "" if len(st["stations"]) <= 60 or len(sids) < 60 else "\nПоказаны первые 60. Чтобы сузить, допишите часть названия после команды."
+    tg.send(tg.staff, prompt + more, {"inline_keyboard": rows})
+
+
+PICK = {"/link": ("L", "Для какой станции нужна ссылка?"), "/stations": ("S", "Какую станцию показать?"),
+        "/queue": ("Q", "У какой станции задать очередь ДТЭК?"), "/reset": ("R", "У какой станции отключить клиентов?")}
+
+
+def callback(tg, st, chat, data, who, dtek):
+    """Нажатие кнопки под сообщением."""
+    kind, _, rest = (data or "").partition(":")
+    if kind == "cq":  # клиент выбрал очередь
+        if rest == "?":
+            tg.send(chat, HOWTO + "\n\nКоли дізнаєтесь — натисніть «" + BTN_QUEUE + "» і оберіть її.", KEYBOARD)
+        else:
+            client_queue(tg, st, chat, rest, who)
+        return
+    if chat != str(tg.staff):
+        return
+    sid, _, arg = rest.partition(":")
+    if kind == "S" and sid == "*":
+        staff_command(tg, st, "/stations", "*")
+    elif sid not in st["stations"]:
+        tg.staff_msg("Этой станции уже нет в списке. Наберите команду заново.")
+    elif kind == "L":
+        staff_command(tg, st, "/link", sid)
+    elif kind == "S":
+        staff_command(tg, st, "/stations", sid)
+    elif kind == "Q":
+        p = st["stations"][sid]
+        cur = (queue_key(p.get("queue")) or "не указана").replace("GPV", "")
+        tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>: сейчас очередь {cur}. Выберите новую:", queue_grid(f"q:{sid}:"))
+    elif kind == "q":
+        staff_command(tg, st, "/queue", f"{sid} {arg}")
+    elif kind == "R":
+        p = st["stations"][sid]
+        tg.send(tg.staff, f"Отключить всех клиентов станции <b>{esc(p.get('name'))}</b> ({len(p.get('clients') or [])}) и выдать новую ссылку? Старая ссылка перестанет работать.",
+                {"inline_keyboard": [[{"text": "Да, отключить", "callback_data": f"r:{sid}"}, {"text": "Отмена", "callback_data": "x:"}]]})
+    elif kind == "r":
+        staff_command(tg, st, "/reset", sid)
 
 
 def client_help(st):
@@ -429,8 +501,8 @@ def client_help(st):
             "<b>Кнопки внизу екрана:</b>\n"
             f"{BTN_STATUS} — чи є світло, заряд АКБ, навантаження.\n"
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
+            f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку.\n"
             f"{BTN_HELP} — ця підказка.\n\n"
-            "<b>Змінити чергу ДТЕК</b> — просто надішліть дві цифри, наприклад: 3.1\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Менеджер Solaris:</b> {esc(c)}" if c else ""))
 
@@ -548,7 +620,7 @@ def commands(tg, st, dtek=None):
     try:
         if not T.get("webhook"):
             ups += tg.api("getUpdates", offset=T.get("offset", 0), timeout=0,
-                          allowed_updates=json.dumps(["message"])) or []
+                          allowed_updates=json.dumps(["message", "callback_query"])) or []
         if "bot" not in T:
             T["bot"] = (tg.api("getMe") or {}).get("username", "")
     except Exception:
@@ -560,6 +632,13 @@ def commands(tg, st, dtek=None):
         done.add(u.get("update_id"))
         T["done"] = sorted(done)[-200:]
         T["offset"] = max(T.get("offset", 0), u["update_id"] + 1)
+        cq = u.get("callback_query")
+        if cq:
+            c_chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+            c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
+            if c_chat:
+                callback(tg, st, c_chat, cq.get("data"), c_who, dtek)
+            continue
         m = u.get("message") or {}
         chat = str((m.get("chat") or {}).get("id", ""))
         text = (m.get("text") or "").strip()
@@ -569,7 +648,7 @@ def commands(tg, st, dtek=None):
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
@@ -583,12 +662,13 @@ def commands(tg, st, dtek=None):
             if chat not in (p.get("clients") or []):
                 p.setdefault("clients", []).append(chat)
             title = esc(p.get("title") or p.get("name"))
-            ask = "" if queue_key(p.get("queue")) else ("\n\nЩоб надходив графік відключень, надішліть у відповідь вашу чергу ДТЕК — просто дві цифри, наприклад: 3.1"
-                                                        "\nНе знаєте чергу? Напишіть «не знаю» — надішлю коротку інструкцію.")
+            ask = ""
             tg.photo(chat, os.path.join(HERE, "assets", "logo.jpg"),
                      f"✅ Підключено: <b>{title}</b>.\nСюди надходитимуть повідомлення, коли на об'єкті вимикають і вмикають світло, графіки ДТЕК і звіт за місяць.{ask}", KEYBOARD)
             if tg.send(chat, client_help(st), KEYBOARD) and tg.last_id:  # памятку закрепляем вверху чата
                 tg.call("pinChatMessage", chat_id=chat, message_id=tg.last_id, disable_notification=True)
+            if not queue_key(p.get("queue")):
+                ask_queue(tg, st, chat)
             if queue_key(p.get("queue")):
                 tg.staff_msg(f"👤 {who} подключился к <b>{title}</b>. Очередь ДТЭК {p['queue'].replace('GPV', '')}.")
             else:  # ждём, пока пришлёт очередь, и напишем одним сообщением
@@ -596,6 +676,8 @@ def commands(tg, st, dtek=None):
         elif cmd in ("/status", "/grafik", "/help") and is_client:
             tg.send(chat, {"/status": lambda: client_status(st, chat), "/grafik": lambda: client_schedule(st, chat, dtek),
                            "/help": lambda: client_help(st)}[cmd](), KEYBOARD)
+        elif cmd == "/cherga" and is_client:
+            ask_queue(tg, st, chat, change=True)
         elif cmd == "/queue" or not text.startswith("/") or not is_client:
             client_queue(tg, st, chat, arg if cmd == "/queue" else text, who)
         elif cmd == "/stop":
@@ -615,7 +697,7 @@ HOWTO = ("Дізнатися чергу просто, це 1 хвилина:\n"
          "1. Відкрийте сторінку ДТЕК Одеські електромережі: https://www.dtek-oem.com.ua/ua/shutdowns\n"
          "2. Закрийте вікно з оголошенням і вгорі сторінки заповніть три поля: населений пункт, вулиця, номер будинку.\n"
          "3. Під адресою з'явиться графік і номер вашої черги, наприклад «3.1».\n"
-         "4. Надішліть сюди ці дві цифри, наприклад: 3.1\n\n"
+         "4. Оберіть цю чергу кнопкою в боті.\n\n"
          "Чергу також показує чат-бот ДТЕК у Viber: https://chats.viber.com/dtekodeskielektromerezhi\n"
          "Не виходить — напишіть менеджеру адресу об'єкта, він підкаже.")
 
@@ -630,9 +712,9 @@ def client_queue(tg, st, chat, text, who):
     if not m:
         if queue_key(st["stations"][mine[0]].get("queue")) and len(mine) == 1:
             q = st["stations"][mine[0]]["queue"].replace("GPV", "")
-            tg.send(chat, f"Ваша черга ДТЕК зараз: {q}. Щоб змінити, надішліть нову, наприклад: 3.1\nЗ інших питань напишіть, будь ласка, вашому менеджеру.")
+            tg.send(chat, f"Ваша черга ДТЕК зараз: {q}. Щоб змінити її, натисніть «{BTN_QUEUE}».\nЗ інших питань напишіть, будь ласка, вашому менеджеру.", KEYBOARD)
         else:
-            tg.send(chat, "Надішліть вашу чергу ДТЕК двома цифрами, наприклад: 3.1 (бувають від 1.1 до 6.2).\n\n" + HOWTO)
+            ask_queue(tg, st, chat)
         return
     q = f"{m.group(1)}.{m.group(2)}"
     if len(mine) > 1:
@@ -651,7 +733,30 @@ def staff_command(tg, st, cmd, arg):
     S, bot = st["stations"], st.get("tg", {}).get("bot", "")
     if not S and cmd != "/help":
         tg.staff_msg("Станции ещё не загружены, повторите команду через 10 минут.")
-    elif cmd == "/stations" and arg:
+        return
+    if cmd in PICK and arg != "*":
+        # название не дописали или подходит несколько станций - даём выбрать кнопкой
+        name = re.sub(r"\s+\d\s*[.,]\s*\d\s*$", "", arg) if cmd == "/queue" else arg
+        hits = match_stations(st, name)
+        letter, prompt = PICK[cmd]
+        if not hits:
+            tg.staff_msg(f"Станция «{esc(name)}» не найдена.")
+            pick_station(tg, st, letter, prompt)
+            return
+        if len(hits) > 1 or not name:
+            if len(S) == 1 and not name:
+                arg = hits[0]
+            else:
+                pick_station(tg, st, letter, prompt if not name else f"Подходит несколько станций. {prompt}", hits,
+                             {"text": "📋 Все станции", "callback_data": "S:*"} if cmd == "/stations" and not name else None)
+                return
+        elif cmd == "/queue" and name == arg:  # станция есть, очередь не написали
+            callback(tg, st, str(tg.staff), f"Q:{hits[0]}", "", None)
+            return
+        elif cmd == "/reset" and arg != hits[0]:  # набрано текстом - переспросим
+            callback(tg, st, str(tg.staff), f"R:{hits[0]}", "", None)
+            return
+    if cmd == "/stations" and arg and arg != "*":
         sid, err = find_station(st, arg)
         if err:
             tg.staff_msg(err)
@@ -672,8 +777,6 @@ def staff_command(tg, st, cmd, arg):
             return
         p = S[sid]
         tg.staff_msg(f"Ссылка для клиента, <b>{esc(p.get('title') or p.get('name'))}</b>:\nhttps://t.me/{bot}?start={p.get('code')}")
-    elif cmd == "/link":
-        tg.staff_msg("Напишите станцию, можно часть названия. Пример: /link пбс\nВсе ссылки сразу: /links")
     elif cmd == "/links":
         tg.staff_msg("Ссылки для клиентов (кто откроет и нажмёт Start — будет получать уведомления по станции):\n\n" + "\n\n".join(
             f"<b>{esc(p.get('title') or p.get('name'))}</b>\nhttps://t.me/{bot}?start={p.get('code')}" for p in S.values() if p.get("code")))
@@ -1334,10 +1437,14 @@ def main():
     try:
         dtek = fetch_dtek()
         st["dtek"]["fail"] = 0
+        st["dtek"].pop("fail_since", None)
+        st["dtek"].pop("fail_sent", None)
     except Exception:
         dtek = None
         st["dtek"]["fail"] = st["dtek"].get("fail", 0) + 1
-        if st["dtek"]["fail"] == 12:
+        st["dtek"].setdefault("fail_since", now().isoformat())
+        if not st["dtek"].get("fail_sent") and (now() - datetime.fromisoformat(st["dtek"]["fail_since"])).total_seconds() > 3600:
+            st["dtek"]["fail_sent"] = True
             tg.staff_msg("⚠️ Графики ДТЭК не загружаются уже час. Отключения по станциям по-прежнему отслеживаются.")
     api = Deye()
     if mode == "cmd":
@@ -1362,9 +1469,10 @@ def main():
             pass
         if mode == "webhook" and url and env("INBOX_KEY"):
             ok = tg.api("setWebhook", url=url, secret_token=hook_secret(),
-                        allowed_updates=json.dumps(["message"]))
+                        allowed_updates=json.dumps(["message", "callback_query"]))
             st.setdefault("tg", {})["webhook"] = bool(ok)
-            tg.staff_msg("⚡ Быстрые команды включены: бот отвечает примерно за минуту." if ok else "⚠️ Быстрые команды включить не получилось.")
+            if not ok:
+                tg.staff_msg("⚠️ Быстрые команды включить не получилось.")
         else:
             tg.api("deleteWebhook")
             st.setdefault("tg", {})["webhook"] = False
