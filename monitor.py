@@ -605,8 +605,14 @@ def check(api, tg, st, dtek):
             why = f"нет данных {age:.0f} мин" if age and age > stale else "логгер не отвечает"
             extra = " Перед этим на объекте не было сети — возможно, сел АКБ или выключился роутер." if p.get("no_grid") else ""
             tg.staff_msg(f"🔴 <b>{title}</b>: станция не на связи ({why}).{extra}\nПроверьте интернет / Wi-Fi логгер или позвоните клиенту.")
+            why_ua = f"немає даних {age:.0f} хв" if age and age > stale else "логер не відповідає"
+            extra_ua = " Перед цим на об'єкті не було мережі — можливо, розрядився АКБ або вимкнувся роутер." if p.get("no_grid") else ""
+            tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({why_ua}).{extra_ua}\n"
+                             "Сама станція при цьому може працювати нормально — зник лише зв'язок із нею.\n"
+                             "Перевірте, будь ласка, інтернет і Wi-Fi роутер на об'єкті. Якщо не допоможе — напишіть менеджеру.")
         if p.get("offline") and not offline:
             tg.staff_msg(f"🟢 <b>{title}</b>: снова на связи.")
+            tg.clients(chat, f"🟢 <b>{title}</b>: станція знову на зв'язку.")
         p["offline"] = offline
         if offline:
             continue  # пока нет связи, про сеть и АКБ ничего утверждать нельзя
