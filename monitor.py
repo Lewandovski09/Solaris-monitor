@@ -866,6 +866,28 @@ def diag(api, tg, st, dtek):
     tg.staff_msg("\n".join(lines))
     # в журнал - только технические названия полей, без станций и значений
     print("DIAG mode:", mode)
+    # разведка: какие оповещения об ошибках отдаёт Deye (только названия полей и коды)
+    end = int(time.time()); start = end - 30 * 86400
+    for s in stations[:5]:
+        sid = int(s.get("id") or s.get("stationId"))
+        sn = [str(d.get("deviceSn")) for d in s.get("deviceListItems") or [] if str(d.get("deviceType", "")).upper() == "INVERTER"]
+        for path, body in (("/station/alertList", {"stationId": sid, "startTimestamp": start, "endTimestamp": end, "page": 1, "size": 30}),
+                           ("/device/alertList", {"deviceSn": (sn or [""])[0], "startTimestamp": start, "endTimestamp": end, "page": 1, "size": 30})):
+            try:
+                d = api._post(path, body)
+                lst = next((v for v in d.values() if isinstance(v, list)), [])
+                print("DIAG alerts", path, "keys:", sorted(k for k in d if k not in ("requestId",)), "| n:", len(lst), "| item keys:", sorted(lst[0]) if lst else [])
+                for it in lst[:12]:
+                    print("DIAG alert item:", {k: v for k, v in it.items() if k not in ("deviceSn", "stationId", "deviceId", "stationName", "deviceName")})
+            except Exception as e:
+                print("DIAG alerts", path, "error:", str(e)[-60:])
+    for s in stations[:5]:
+        sn = [str(d.get("deviceSn")) for d in s.get("deviceListItems") or [] if str(d.get("deviceType", "")).upper() == "INVERTER"]
+        try:
+            for v in (api.device_latest(sn) if sn else {}).values():
+                print("DIAG fw/state:", {k: v.get(k) for k in ("HMI", "MAIN", "ProtocolVersion", "RatedPower", "GridStatus", "GridRelayStatus", "Battery2Status", "LithiumBattery2SOH", "Temperature- Battery", "BMSSOC", "SOC", "TotalGridPower", "GenVoltage") if k in v})
+        except Exception:
+            pass
     print("DIAG device types:", sorted(types))
     print("DIAG device item fields:", sorted({k for s in stations for d in s.get("deviceListItems") or [] for k in d}))
     print("DIAG device statuses:", sorted({str(d.get("connectStatus", d.get("connectionStatus"))) for s in stations for d in s.get("deviceListItems") or []}))
