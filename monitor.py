@@ -689,6 +689,8 @@ def read_inbox():
         except Exception:
             print("inbox: файл не прочитан")
         os.remove(path)
+        with open(STATE + ".inbox", "a", encoding="utf-8") as f:  # список обработанных - для шага сохранения
+            f.write(os.path.basename(path) + "\n")
     return out
 
 

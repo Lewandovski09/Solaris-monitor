@@ -92,11 +92,23 @@ jobs:
         if: always()
         run: |
           if [ -f "$STATE_FILE.commit" ] && [ -f /tmp/solaris-cache/state.enc ]; then
-            cp /tmp/solaris-cache/state.enc state.enc
             git config user.name "solaris-monitor"
             git config user.email "monitor@users.noreply.github.com"
-            git add state.enc
-            git add -A inbox 2>/dev/null || true
-            git commit -q -m "state" || exit 0
-            git push -q || (git pull -q --rebase && git push -q) || (sleep 3 && git pull -q --rebase && git push -q)
+            # Пока шла проверка, приёмник мог добавить новые команды. Поэтому каждый раз берём
+            # свежую версию репозитория и накладываем на неё только свои изменения.
+            for i in 1 2 3 4 5; do
+              git fetch -q origin main
+              git reset -q --hard origin/main
+              cp /tmp/solaris-cache/state.enc state.enc
+              git add state.enc
+              if [ -f "$STATE_FILE.inbox" ]; then
+                while read -r f; do
+                  if [ -n "$f" ] && [ -f "inbox/$f" ]; then git rm -q "inbox/$f"; fi
+                done < "$STATE_FILE.inbox"
+              fi
+              git commit -q -m "state" || exit 0
+              if git push -q origin HEAD:main; then exit 0; fi
+              sleep 2
+            done
+            echo "память не записалась в репозиторий, но она сохранена в кэше"
           fi
