@@ -747,9 +747,14 @@ def commands(tg, st, dtek=None):
                 tg.send(chat, "Вітаємо! Це бот сповіщень Solaris. Щоб підключитися, відкрийте посилання, яке вам надіслав менеджер.")
                 continue
             p = st["stations"][sid]
-            if chat not in (p.get("clients") or []):
-                p.setdefault("clients", []).append(chat)
             p.setdefault("names", {})[chat] = who
+            if chat in (p.get("clients") or []):
+                # уже подключён (ссылку открыли или Start нажали ещё раз) - в группу не пишем, заново не приветствуем
+                tg.send(chat, f"Ви вже підключені до <b>{esc(p.get('title') or p.get('name'))}</b>. Кнопки внизу екрана працюють.", KEYBOARD)
+                if not queue_key(p.get("queue")):
+                    ask_queue(tg, st, chat, sid=sid)
+                continue
+            p.setdefault("clients", []).append(chat)
             title = esc(p.get("title") or p.get("name"))
             ask = ""
             tg.photo(chat, os.path.join(HERE, "assets", "logo.jpg"),
