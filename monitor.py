@@ -720,6 +720,9 @@ def commands(tg, st, dtek=None):
             c_chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
             c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
             if c_chat:
+                mid = (cq.get("message") or {}).get("message_id")
+                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R") and cq.get("data") != "cq:?":
+                    tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
                 callback(tg, st, c_chat, cq.get("data"), c_who, dtek)
             continue
         m = u.get("message") or {}
@@ -807,9 +810,13 @@ def client_queue(tg, st, chat, text, who, sid=None):
         ask_queue(tg, st, chat)  # спросим объект, потом очередь
         return
     p = st["stations"][sid or mine[0]]
+    joined = (p.get("joins") or {}).pop(chat, None)
+    if queue_key(p.get("queue")) == "GPV" + q and not joined:
+        # та же очередь, что уже стоит (например, кнопку нажали несколько раз) - в группу не пишем
+        tg.send(chat, f"Черга ДТЕК {q} вже встановлена.", KEYBOARD)
+        return
     p["queue"] = "GPV" + q
     tg.send(chat, f"✅ Чергу ДТЕК {q} записано. Графік відключень надійде за кілька хвилин.")
-    joined = (p.get("joins") or {}).pop(chat, None)
     verb = "подключился к" if joined else "изменил очередь для"
     tg.staff_msg(f"👤 {who} {verb} <b>{esc(p.get('title') or p.get('name'))}</b>. Очередь ДТЭК {q}.")
 
