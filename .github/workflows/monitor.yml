@@ -10,7 +10,7 @@ on:
         description: "check - проверка, test - тест Telegram, diag - диагностика, report - отчёт"
         default: "check"
         type: choice
-        options: [check, cmd, help, setup, test, diag, report, tokenwarn, webhook, webhook-off]
+        options: [check, cmd, help, setup, probe, test, diag, report, tokenwarn, webhook, webhook-off]
 
 permissions:
   contents: write

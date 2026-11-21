@@ -1602,6 +1602,30 @@ def report(api, tg, st):
     return n
 
 
+def probe(api):
+    """Разведка: какие организации есть у аккаунта и сколько станций видно с каждым входом. В журнал - только числа."""
+    api.login()
+    print("PROBE personal stations:", len(api.stations()))
+    try:
+        info = api._post("/account/info", {})
+        orgs = info.get("orgInfoList") or []
+        print("PROBE info keys:", sorted(k for k in info if k not in ("requestId",)), "| orgs:", len(orgs))
+        for o in orgs:
+            print("PROBE org fields:", sorted(o))
+            try:
+                pw = hashlib.sha256(env("DEYE_PASSWORD").encode("utf-8")).hexdigest()
+                d = api._post("/account/token", {"appSecret": env("DEYE_APP_SECRET"), "email": env("DEYE_EMAIL"), "password": pw,
+                                                 "companyId": o.get("companyId")}, auth=False, query="?appId=" + env("DEYE_APP_ID"))
+                tok = d.get("accessToken") or (d.get("data") or {}).get("accessToken")
+                old, api.token = api.token, tok
+                print("PROBE org role:", o.get("roleName"), "| stations with org login:", len(api.stations()))
+                api.token = old
+            except Exception as e:
+                print("PROBE org login error:", str(e)[-80:])
+    except Exception as e:
+        print("PROBE account/info error:", str(e)[-80:])
+
+
 def diag(api, tg, st, dtek):
     cfgs = station_cfg()
     api.login()
@@ -1721,6 +1745,8 @@ def main():
             st.setdefault("tg", {})["webhook"] = False
             tg.staff_msg("Быстрые команды выключены: бот снова отвечает при очередной проверке.")
         print("webhook:", st["tg"]["webhook"])
+    elif mode == "probe":
+        probe(api)
     elif mode == "diag":
         try:
             diag(api, tg, st, dtek)
