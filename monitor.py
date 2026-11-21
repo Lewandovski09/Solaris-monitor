@@ -819,8 +819,8 @@ def client_queue(tg, st, chat, text, who, sid=None):
         return
     p["queue"] = "GPV" + q
     tg.send(chat, f"✅ Чергу ДТЕК {q} записано. Графік відключень надійде за кілька хвилин.")
-    verb = "подключился к" if joined else "изменил очередь для"
-    tg.staff_msg(f"👤 {who} {verb} <b>{esc(p.get('title') or p.get('name'))}</b>. Очередь ДТЭК {q}.")
+    if joined:  # в группу пишем один раз - при подключении; смену очереди потом клиент делает молча
+        tg.staff_msg(f"👤 {who} подключился к <b>{esc(p.get('title') or p.get('name'))}</b>. Очередь ДТЭК {q}.")
 
 
 def staff_command(tg, st, cmd, arg):
