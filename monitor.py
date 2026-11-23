@@ -1036,15 +1036,21 @@ def device_alerts(tg, p, title, items, t):
 
 def problems(tg, st, p, title, dev, soc, load, low_soc, t, no_grid):
     """Неисправности, которые видно по текущим данным: АКБ, прошивка."""
-    # 1. нет данных от АКБ
+    # 1. нет данных от АКБ. Около полуночи Deye Cloud на несколько минут перестаёт
+    # отдавать заряд (обнуляет суточные данные), поэтому тревога — только если
+    # данных нет 30+ минут подряд.
     if soc is None:
-        p["nosoc"] = p.get("nosoc", 0) + 1
-        if p["nosoc"] == 3:
-            tg.staff_msg(f"🛠 <b>{title}</b>: станция на связи, но не отдаёт заряд АКБ уже 3 проверки.\n<b>Возможные причины:</b> нет связи инвертора с BMS (кабель, протокол), батарея отключена автоматом или ушла в защиту.")
+        p.setdefault("nosoc_since", t.isoformat())
+        mins = (t - datetime.fromisoformat(p["nosoc_since"])).total_seconds() / 60
+        if mins >= 30 and not p.get("nosoc_sent"):
+            p["nosoc_sent"] = True
+            tg.staff_msg(f"🛠 <b>{title}</b>: станция на связи, но не отдаёт заряд АКБ с {since_hm(datetime.fromisoformat(p['nosoc_since']))} ({dur_ru(mins)}).\n<b>Возможные причины:</b> нет связи инвертора с BMS (кабель, протокол), батарея отключена автоматом или ушла в защиту."
+                         "\n\n<b>Как определено:</b> Deye Cloud присылает данные станции, но поле заряда АКБ пустое 30+ минут подряд. Короткие пропуски (например, около полуночи) не считаются.")
     else:
-        if p.get("nosoc", 0) >= 3:
+        if p.get("nosoc_sent"):
             tg.staff_msg(f"✅ <b>{title}</b>: данные АКБ снова приходят, заряд {soc:.0f}%.")
-        p["nosoc"] = 0
+        for k in ("nosoc", "nosoc_since", "nosoc_sent"):
+            p.pop(k, None)
     # 2. АКБ не заряжается при наличии сети
     if soc is not None and soc < low_soc and no_grid is False and not p.get("no_grid"):
         p.setdefault("lowgrid_since", t.isoformat())
