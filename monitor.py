@@ -47,6 +47,12 @@ def hm(dt):
     return dt.strftime("%H:%M")
 
 
+def since_hm(dt):
+    """Час початку; якщо не сьогодні — з датою: «22.11 ~09:14»."""
+    dt = dt.astimezone(KYIV)
+    return f"~{hm(dt)}" if dt.date() == now().date() else f"{dt.strftime('%d.%m')} ~{hm(dt)}"
+
+
 def dur(minutes):
     minutes = int(round(minutes))
     h, m = divmod(minutes, 60)
@@ -599,7 +605,7 @@ def client_status(st, chat):
             continue
         if p.get("no_grid"):
             since = datetime.fromisoformat(p["off_since"])
-            line = f"🟠 <b>{title}</b>: світла немає з ~{hm(since)} ({dur((now() - since).total_seconds() / 60)}). Об'єкт працює від станції."
+            line = f"🟠 <b>{title}</b>: світла немає з {since_hm(since)} ({dur((now() - since).total_seconds() / 60)}). Об'єкт працює від станції."
         else:
             line = f"🟢 <b>{title}</b>: світло є."
         if last.get("soc") is not None:
@@ -868,7 +874,7 @@ def staff_command(tg, st, cmd, arg):
         p = S[sid]
         tg.staff_msg(f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
                      f"\nочередь ДТЭК: {(queue_key(p.get('queue')) or 'не указана').replace('GPV', '')} · клиентов: {len(p.get('clients') or [])}"
-                     f"\nсеть: {'НЕТ с ' + p['off_since'][11:16] if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}")
+                     f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}")
     elif cmd == "/stations":
         def names(ps, n=15):
             lst = [esc(p.get("name")) for p in ps]
@@ -1181,14 +1187,14 @@ def morning(tg, st, dtek, t):
             title = esc(p.get("title") or p.get("name"))
             last = p.get("last") or {}
             if p.get("offline"):
-                head = f"🔴 <b>{title}</b>: станція не на зв'язку" + (f" з {p['offline_since'][11:16]}" if p.get("offline_since") else "") + "."
+                head = f"🔴 <b>{title}</b>: станція не на зв'язку" + (f" з {since_hm(datetime.fromisoformat(p['offline_since']))}" if p.get("offline_since") else "") + "."
                 cause = p.get("off_cause")
                 head += {"wifi": " Схоже, причина — інтернет або Wi-Fi: перевірте роутер і логер (маленький модуль з антеною знизу інвертора).",
                          "battery": " Схоже, розрядилась батарея: станція увімкнеться сама, коли з'явиться мережа.",
                          "inverter": " Логер на зв'язку, а інвертор не відповідає — перевірте його екран і напишіть у технічну підтримку."}.get(cause, "")
             elif p.get("no_grid"):
                 since = datetime.fromisoformat(p["off_since"])
-                head = f"🟠 <b>{title}</b>: світла немає з ~{hm(since)}, об'єкт працює від станції."
+                head = f"🟠 <b>{title}</b>: світла немає з {since_hm(since)} ({dur((now() - since).total_seconds() / 60)}), об'єкт працює від станції."
             else:
                 head = f"🟢 <b>{title}</b>: світло є."
             if last.get("soc") is not None and not p.get("offline"):
