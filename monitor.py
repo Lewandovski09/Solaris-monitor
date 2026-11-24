@@ -1002,6 +1002,8 @@ def callback(tg, st, chat, data, who, dtek, api=None):
             off.remove(str(chat)) if str(chat) in off else off.append(str(chat))
             if not off:
                 p.pop("nosched", None)
+            # короткое подтверждение с кнопками внизу - чтобы кнопка «Вимкнути/Увімкнути графіки» сразу поменялась
+            tg.send(chat, "🔔 Графіки ДТЕК увімкнено." if sched_on(p, chat) else "🔕 Графіки ДТЕК вимкнено.", KEYBOARD)
         elif kind == "zr":
             cur = pv_pref(p, chat)
             if arg == "none":
@@ -1390,6 +1392,9 @@ def save_calc(api, st, sid, per):
     return "\n".join(lines)
 
 
+st_ref = [None]  # ссылка на состояние для мест, куда его не передают (pv_detect)
+
+
 def pv_detect(api, tg, sid, p, lt, t):
     """Есть ли на объекте панели. Видели выработку (сейчас >50 Вт или за месяц в истории Deye) - есть.
     Историю спрашиваем не чаще раза в сутки и только пока панелей не видели. Появились - сообщаем клиентам, у них появится кнопка."""
@@ -1406,8 +1411,11 @@ def pv_detect(api, tg, sid, p, lt, t):
         first = p.get("has_pv") is None and not p.get("pv_checked_once")
         p["has_pv"] = True
         if not first:  # панели появились на объекте, где их не было - сказать клиентам
-            tg.clients(p.get("clients"), f"☀️ <b>{esc(p.get('title') or p.get('name'))}</b>: бот бачить сонячні панелі. "
-                       f"У меню з'явилась кнопка «{BTN_PV}» — виробіток за сьогодні, вчора, тиждень і місяць; раз на тиждень прийде підсумок.", markup=KEYBOARD)
+            for c in p.get("clients") or []:
+                where = "у меню об'єкта (кнопка 🏠)" if len(my_objects(st_ref[0], c)) > 1 else "внизу екрана"
+                tg.send(c, f"☀️ <b>{esc(p.get('title') or p.get('name'))}</b>: бот бачить сонячні панелі. "
+                           f"{where[0].upper() + where[1:]} з'явилась кнопка «{BTN_PV}» — виробіток за сьогодні, вчора, тиждень і місяць; "
+                           "раз на тиждень прийде підсумок.", KEYBOARD)
     p["pv_checked_once"] = True
 
 
@@ -3498,6 +3506,7 @@ def main():
         print("Память не расшифровалась - остановка без изменений")
         sys.exit(1)
     st = load_state()
+    st_ref[0] = st
     tg.kb_fn = lambda chat: kb_for(st, chat)
     tg.kb_seen = st.setdefault("kb_sent", {})
     before = json.dumps(st, sort_keys=True, ensure_ascii=False)
