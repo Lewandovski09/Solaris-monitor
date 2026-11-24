@@ -1710,7 +1710,7 @@ def client_status(st, chat, api=None):
 def client_schedule(st, chat, dtek):
     out = []
     t = now()
-    for p in st["stations"].values():
+    for sid, p in st["stations"].items():
         if chat not in (p.get("clients") or []):
             continue
         title = esc(p.get("title") or p.get("name"))
@@ -1727,6 +1727,14 @@ def client_schedule(st, chat, dtek):
             for day, label in ((t, "Сьогодні"), (t + timedelta(days=1), "Завтра")):
                 sl = (dtek["days"].get(day.strftime("%Y-%m-%d")) or {}).get(q)
                 lines.append(f"<b>{label} ({day.strftime('%d.%m')}):</b> " + (fmt_intervals(sl) if sl is not None else "графік ще не опубліковано"))
+        if len(qs) == 2 and p.get("lines_mode") == "ats":
+            ek = eff_key(dtek, sid, p, qs[0])
+            lines.append("<b>На об'єкті</b> (світла немає, лише коли немає обох ліній):")
+            for day, label in ((t, "Сьогодні"), (t + timedelta(days=1), "Завтра")):
+                sl = (dtek["days"].get(day.strftime("%Y-%m-%d")) or {}).get(ek)
+                lines.append(f"<b>{label}:</b> " + (fmt_intervals(sl) if sl is not None else "графік ще не опубліковано"))
+        elif len(qs) == 2 and p.get("lines_mode") in ("q1", "q2"):
+            lines.append(f"Об'єкт живиться від лінії {p['lines_mode'][1]} — для нього діє її графік.")
         if dtek.get("updated"):
             lines.append(f"Оновлено ДТЕК: {esc(dtek['updated'])}")
         out.append("\n".join(lines))
@@ -3066,16 +3074,18 @@ def dtek_alerts(tg, st, dtek):
     t = now()
     today, tomorrow = t.strftime("%Y-%m-%d"), (t + timedelta(days=1)).strftime("%Y-%m-%d")
     # кто на какой очереди
-    by_q, all_chats = {}, []
+    by_q, all_chats, two = {}, [], []  # two - объекты с двумя линиями: им одно общее сообщение на день
     for sid in st["stations"]:
         c = setup(st, cfgs, sid)
         p = st["stations"][sid]
         all_chats += c["chats"]  # экстренные - всем, даже кто отключил графики
         want = [ch for ch in c["chats"] if sched_on(p, ch)]
         q2 = queue_key(p.get("queue2"))
-        for q, n in ((c["queue"], c["title"]), (q2, f"{c['title']} (лінія 2)")):
-            if q and want:
-                by_q.setdefault(q, []).append((n, want))
+        if q2 and c["queue"] and q2 != c["queue"]:
+            if want:
+                two.append((sid, p, c["title"], c["queue"], q2, want))
+        elif c["queue"] and want:
+            by_q.setdefault(c["queue"], []).append((c["title"], want))
 
     # 1. общий текст ДТЭК: экстренные / аварийные
     att = dtek["attention"]
@@ -3114,6 +3124,35 @@ def dtek_alerts(tg, st, dtek):
             body = f"черга {qn}, {label} ({day[8:]}.{day[5:7]}):\n{fmt_intervals(sl)}"
             for n, chats in people:
                 tg.clients(chats, f"🗓 <b>{esc(n)}</b>: {head} відключень ДТЕК, {body}")
+    # 2б. объекты с двумя линиями: обе линии одним сообщением и (для АВР) когда реально не будет света
+    for sid, p, title, q1, q2, chats in two:
+        mode = p.get("lines_mode") or "auto"
+        ek = eff_key(dtek, sid, p, q1)
+        for day, label in ((today, "сьогодні"), (tomorrow, "завтра")):
+            dd = dtek["days"].get(day) or {}
+            s1, s2 = dd.get(q1), dd.get(q2)
+            if s1 is None and s2 is None:
+                continue
+            sig = "".join(map(str, s1 or [])) + "|" + "".join(map(str, s2 or [])) + "|" + mode
+            key = f"{day}|L{sid}"
+            if seen.get(key) == sig:
+                continue
+            changed = key in seen
+            if changed:
+                pend = D.setdefault("pend", {})
+                if pend.get(key) != sig:
+                    pend[key] = sig
+                    continue
+                pend.pop(key, None)
+            seen[key] = sig
+            fmt = lambda x: fmt_intervals(x) if x is not None else "графік ще не опубліковано"
+            txt = (f"🗓 <b>{esc(title)}</b>: {'змінився графік' if changed else 'графік'} відключень ДТЕК, {label} ({day[8:]}.{day[5:7]}), дві лінії:\n"
+                   f"Лінія 1, черга {q1.replace('GPV', '')}: {fmt(s1)}\nЛінія 2, черга {q2.replace('GPV', '')}: {fmt(s2)}")
+            if mode == "ats" and s1 is not None and s2 is not None:
+                txt += f"\n<b>На об'єкті</b> (світла немає, лише коли немає обох ліній): {fmt(dd.get(ek))}"
+            elif mode in ("q1", "q2"):
+                txt += f"\nОб'єкт живиться від лінії {mode[1]} — для нього діє її графік."
+            tg.clients(chats, txt)
     for k in [k for k in seen if k.split("|")[0] < today]:
         seen.pop(k)
     for k in [k for k in D.get("pend", {}) if k.split("|")[0] < today]:
@@ -3134,6 +3173,19 @@ def dtek_alerts(tg, st, dtek):
                 for n, chat in people:
                     txt = f"⏰ <b>{esc(n)}</b>: за графіком ДТЕК світло вимкнуть о {slot_time(a)} (через ~{left:.0f} хв), до {slot_time(b)}."
                     tg.clients(chat, txt)
+    # 3б. две линии: напоминаем по реальному графику объекта (АВР - когда нет обеих линий; линия 1/2 - по ней;
+    # схема ещё не определена - когда пропадает любая из линий)
+    for sid, p, title, q1, q2, chats in two:
+        mode = p.get("lines_mode") or "auto"
+        sl = (dtek["days"].get(today) or {}).get(eff_key(dtek, sid, p, q1))
+        for a, b in intervals(sl or [], 2):
+            start = t.replace(hour=a // 2, minute=30 if a % 2 else 0, second=0, microsecond=0)
+            left = (start - t).total_seconds() / 60
+            key = f"{today}|L{sid}|{a}"
+            if 0 < left <= 35 and key not in warned:
+                warned[key] = 1
+                note = {"ats": " (обидві лінії)", "auto": " (одна з ліній)"}.get(mode, "")
+                tg.clients(chats, f"⏰ <b>{esc(title)}</b>: за графіком ДТЕК світло вимкнуть{note} о {slot_time(a)} (через ~{left:.0f} хв), до {slot_time(b)}.")
     for k in [k for k in warned if k.split("|")[0] < today]:
         warned.pop(k)
     D["started"] = True
