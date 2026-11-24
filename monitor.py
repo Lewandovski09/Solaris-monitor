@@ -785,12 +785,14 @@ HELP = ("📋 <b>Команды бота</b>\n"
 # ---------------------------------------------------------------- меню клиента
 BTN_STATUS, BTN_SCHED, BTN_HELP, BTN_QUEUE = "🔌 Стан станції", "🗓 Графік", "❓ Допомога", "🔁 Змінити чергу"
 BTN_NOTIFY = "🔔 Графіки: увімк./вимк."
-KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
+BTN_PV = "☀️ Виробіток"
+KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_PV}, {"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
                    ("grafiky", "Увімкнути або вимкнути графіки ДТЕК"),
+                   ("vyrobitok", "Виробіток сонячних панелей: сьогодні, вчора, тиждень, місяць"),
                    ("help", "Що вміє бот і як змінити чергу"),
                    ("stop", "Вимкнути сповіщення")]
 STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
@@ -898,6 +900,17 @@ def callback(tg, st, chat, data, who, dtek):
             ask_queue(tg, st, chat, sid=rest)
         return
     mine = st["stations"].get(rest.split(":")[0], {}).get("clients") or []
+    if kind == "pw":  # еженедельный отчёт о выработке вкл/выкл
+        if chat in mine:
+            p = st["stations"][rest]
+            off = p.setdefault("nopvweek", [])
+            if chat in off:
+                off.remove(chat)
+                tg.send(chat, "🔔 Щотижневий підсумок виробітку знову увімкнено.", KEYBOARD)
+            else:
+                off.append(chat)
+                tg.send(chat, f"🔕 Щотижневий підсумок виробітку вимкнено. Подивитися будь-коли — кнопка «{BTN_PV}».", KEYBOARD)
+        return
     if kind == "gs":  # графики вкл/выкл по объекту
         if chat in mine:
             sched_toggle(tg, st, chat, rest)
@@ -976,6 +989,7 @@ def client_help(st):
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
             f"{BTN_NOTIFY} — вимкнути або знову увімкнути графіки й нагадування, окремо по кожному об'єкту.\n"
+            f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
             f"{BTN_HELP} — ця підказка.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
@@ -989,6 +1003,103 @@ def apply_latest(p, lt, t):
         return  # у нас уже есть данные новее
     p["last"] = {"soc": num(lt.get("batterySOC")), "load": num(lt.get("consumptionPower")) or 0,
                  "pv": num(lt.get("generationPower")), "dkw": discharge_kw(lt), "at": at.isoformat()}
+
+
+# ---------------------------------------------------------------- выработка панелей
+def kwh(v):
+    return f"{v:,.1f}".replace(",", " ").replace(".0", "") if v < 100 else f"{v:,.0f}".replace(",", " ")
+
+
+def pv_days(api, sid, days):
+    """Выработка, потребление и покупка из сети по дням за последние days дней, включая сегодня. {дата: {...}}"""
+    t = now()
+    start, end = (t - timedelta(days=days - 1)).strftime("%Y-%m-%d"), (t + timedelta(days=1)).strftime("%Y-%m-%d")
+    out = {}
+    for r in api.history(int(sid), 2, start, end):
+        try:
+            d = f"{int(r['year']):04d}-{int(r['month']):02d}-{int(r['day']):02d}"
+        except Exception:
+            continue
+        out[d] = {"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue"))}
+    return out
+
+
+def pv_month(api, sid):
+    ym = now().strftime("%Y-%m")
+    rows = api.history(int(sid), 3, ym, ym)
+    r = rows[0] if rows else {}
+    return {"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue"))}
+
+
+def pv_reply(st, chat, api):
+    """Кнопка «Виробіток»: сегодня, вчера, 7 дней, месяц - по каждому объекту клиента с панелями."""
+    out = []
+    t = now()
+    if api and not api.token:
+        try:
+            api.login()
+        except Exception:
+            return "Deye Cloud зараз не відповідає, спробуйте за кілька хвилин."
+    for sid, p in st["stations"].items():
+        if chat not in (p.get("clients") or []):
+            continue
+        title = esc(p.get("title") or p.get("name"))
+        try:
+            days, mon = pv_days(api, sid, 8), pv_month(api, sid)
+        except Exception:
+            out.append(f"☀️ <b>{title}</b>: Deye Cloud зараз не віддав дані, спробуйте за кілька хвилин.")
+            continue
+        if not mon["gen"] and not any(x["gen"] for x in days.values()):
+            p["has_pv"] = False
+            out.append(f"☀️ <b>{title}</b>: виробітку сонячних панелей за цей місяць немає — схоже, панелей на об'єкті немає.")
+            continue
+        p["has_pv"] = True
+        d = lambda k: days.get((t - timedelta(days=k)).strftime("%Y-%m-%d"), {}).get("gen", 0)
+        week = sum(d(k) for k in range(7))
+        lines = [f"☀️ <b>{title}</b> — виробіток панелей",
+                 f"Сьогодні (до {hm(t)}): <b>{kwh(d(0))} кВт·год</b>",
+                 f"Вчора: <b>{kwh(d(1))} кВт·год</b>",
+                 f"За 7 днів: <b>{kwh(week)} кВт·год</b> (у середньому {kwh(week / 7)} на день)",
+                 f"За {MONTHS[t.month]}: <b>{kwh(mon['gen'])} кВт·год</b>"]
+        if mon.get("use") and mon.get("buy") is not None:
+            lines.append(f"Власною енергією за місяць покрито {max(0, (1 - mon['buy'] / mon['use']) * 100):.0f}% споживання.")
+        out.append("\n".join(lines))
+    return "\n\n".join(out) or "Об'єктів не знайдено."
+
+
+def pv_weekly(api, tg, st, t):
+    """Щотижня в понеділок після 9:00: підсумок виробітку за минулий тиждень (пн-нд), порівняння з попереднім."""
+    wk = t.strftime("%G-%V")
+    if t.weekday() != 0 or t.hour < 9 or st.get("pv_week") == wk:
+        return
+    st["pv_week"] = wk
+    mon_this = (t - timedelta(days=t.weekday())).date()
+    for sid, p in st["stations"].items():
+        chats = [c for c in p.get("clients") or [] if c not in (p.get("nopvweek") or [])]
+        if not chats:
+            continue
+        try:
+            days = pv_days(api, sid, 15)
+        except Exception:
+            continue
+        gen = lambda a, b: [(dd, days.get(dd.isoformat(), {}).get("gen", 0)) for dd in (mon_this - timedelta(days=k) for k in range(b, a, -1))]
+        last, prev = gen(0, 7), gen(7, 14)
+        tot, ptot = sum(v for _, v in last), sum(v for _, v in prev)
+        if not tot and not ptot:
+            p["has_pv"] = False
+            continue
+        best = max(last, key=lambda x: x[1])
+        WD = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
+        txt = (f"📈 <b>{esc(p.get('title') or p.get('name'))}</b> — виробіток панелей за тиждень "
+               f"{last[0][0].strftime('%d.%m')}–{last[-1][0].strftime('%d.%m')}: <b>{kwh(tot)} кВт·год</b>\n"
+               f"У середньому {kwh(tot / 7)} на день, найкращий день — {WD[best[0].weekday()]} {best[0].strftime('%d.%m')}: {kwh(best[1])} кВт·год.")
+        if ptot:
+            ch = (tot - ptot) / ptot * 100
+            txt += f"\nПорівняно з попереднім тижнем ({kwh(ptot)}): {'+' if ch >= 0 else ''}{ch:.0f}%" + (" — було менше сонця." if ch <= -25 else ".")
+        txt += "\n" + " · ".join(f"{WD[dd.weekday()]} {kwh(v)}" for dd, v in last)
+        kb = {"inline_keyboard": [[{"text": "Не надсилати щотижня", "callback_data": f"pw:{sid}"}]]}
+        for c in chats:
+            tg.send(c, txt, kb)
 
 
 def client_status(st, chat, api=None):
@@ -1140,7 +1251,7 @@ def commands(tg, st, dtek=None, api=None):
             c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
             if c_chat:
                 mid = (cq.get("message") or {}).get("message_id")
-                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx") and cq.get("data") != "cq:?":
+                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw") and cq.get("data") != "cq:?":
                     tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
                 callback(tg, st, c_chat, cq.get("data"), c_who, dtek)
             continue
@@ -1153,7 +1264,7 @@ def commands(tg, st, dtek=None, api=None):
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_PV: "/vyrobitok"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
@@ -1191,6 +1302,8 @@ def commands(tg, st, dtek=None, api=None):
             ask_queue(tg, st, chat, change=True)
         elif cmd == "/grafiky" and is_client:
             sched_toggle(tg, st, chat)
+        elif cmd == "/vyrobitok" and is_client:
+            tg.send(chat, pv_reply(st, chat, api), KEYBOARD)
         elif cmd == "/queue" or not text.startswith("/") or not is_client:
             client_queue(tg, st, chat, arg if cmd == "/queue" else text, who)
         elif cmd == "/stop":
@@ -2351,6 +2464,7 @@ def check(api, tg, st, dtek):
                     tg.send(tg.staff, f"{head} Очередь ДТЭК не указана ни им, ни другими клиентами. Выберите:", queue_grid(f"q:{sid}:"))
                 p["joins"].pop(chat_id)
     morning(tg, st, dtek, t)
+    safe(tg, st, "недельный отчёт о выработке", pv_weekly, api, tg, st, t)
     return len(stations)
 
 
@@ -2503,7 +2617,7 @@ def peek(api, st):
             lt = {"error": str(e)[-80:]}
         p = st["stations"].get(sid, {})
         hist = {}
-        for gran, a_, b_ in ((2, (now() - timedelta(days=9)).strftime("%Y-%m-%d"), now().strftime("%Y-%m-%d")),
+        for gran, a_, b_ in ((2, (now() - timedelta(days=2)).strftime("%Y-%m-%d"), (now() + timedelta(days=1)).strftime("%Y-%m-%d")),
                              (3, now().strftime("%Y-%m"), now().strftime("%Y-%m"))):
             try:
                 hist[str(gran)] = api.history(int(sid), gran, a_, b_)
