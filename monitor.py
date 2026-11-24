@@ -111,6 +111,7 @@ class Telegram:
         self.last_id = None
         self.blocked = set()
         self.kb_fn = None  # клавиатура клиента своя: кнопка «Виробіток» только у тех, у кого есть панели
+        self.kb_seen = None  # какие кнопки у какого клиента уже стоят (st["kb_sent"])
 
     def photo(self, chat, path, caption, markup=None):
         """Картинка с подписью. Если не получилось - обычный текст."""
@@ -142,6 +143,8 @@ class Telegram:
         try:
             if markup is KEYBOARD and self.kb_fn:
                 markup = self.kb_fn(chat)
+                if self.kb_seen is not None:
+                    self.kb_seen[str(chat)] = hashlib.sha1(json.dumps(markup, sort_keys=True).encode()).hexdigest()[:10]
             body = {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
             if markup:
                 body["reply_markup"] = markup
@@ -1387,6 +1390,27 @@ def month_social(api, tg, st, t):
            f"Найдовше відключення — {longest:.0f} год." + (" Жоден об'єкт не залишився без електрики." if ok else "") +
            (f" Сонячні панелі наших клієнтів виробили {grn(gen)} кВт·год." if gen else ""))
     tg.staff_msg("📣 <b>Цифры месяца для соцсетей</b> (обезличенные, можно публиковать):\n\n" + txt)
+
+
+def kb_sync(tg, st, t):
+    """Кнопки внизу у клиента обновляются, только когда бот присылает сообщение. Если набор кнопок у клиента
+    поменялся (новая версия бота, появились панели) - днём один раз присылаем короткое сообщение с новыми кнопками."""
+    if tg.quiet():
+        return
+    sent = st.setdefault("kb_sent", {})
+    chats = {str(c) for p in st["stations"].values() for c in p.get("clients") or []}
+    for chat in sorted(chats):
+        kb = kb_for(st, chat)
+        h = hashlib.sha1(json.dumps(kb, sort_keys=True).encode()).hexdigest()[:10]
+        if sent.get(chat) == h:
+            continue
+        if True:  # у новичков кнопки отмечаются при /start (любое сообщение с кнопками), сюда попадают те, у кого кнопки старые
+            extra = (f"\n{BTN_PV} — скільки виробили панелі: сьогодні, вчора, тиждень, місяць."
+                     f"\n{BTN_SAVE} — скільки грошей заощадила станція за обраний період.") if has_pv_chat(st, chat) else ""
+            tg.send(chat, f"🔄 Бот оновився — нові кнопки внизу екрана:\n{BTN_NOTIFY} — вимкнути або увімкнути графіки ДТЕК окремо по кожному об'єкту.{extra}", kb)
+        sent[chat] = h
+    for c in [c for c in sent if c not in chats]:
+        sent.pop(c)
 
 
 def pv_weekly(api, tg, st, t):
@@ -2795,6 +2819,7 @@ def check(api, tg, st, dtek):
     morning(tg, st, dtek, t)
     safe(tg, st, "недельный отчёт о выработке", pv_weekly, api, tg, st, t)
     safe(tg, st, "аналитика дня", staff_daily, api, tg, st, t)
+    safe(tg, st, "обновление кнопок у клиентов", kb_sync, tg, st, t)
     safe(tg, st, "сводка недели", staff_weekly, api, tg, st, t)
     return len(stations)
 
@@ -3099,6 +3124,7 @@ def main():
         sys.exit(1)
     st = load_state()
     tg.kb_fn = lambda chat: kb_for(st, chat)
+    tg.kb_seen = st.setdefault("kb_sent", {})
     before = json.dumps(st, sort_keys=True, ensure_ascii=False)
     if mode == "test":
         ok = tg.staff_msg("✅ Монитор Solaris подключён. Сюда будут приходить уведомления о станциях и графиках ДТЭК.")
