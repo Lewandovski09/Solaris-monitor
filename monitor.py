@@ -1024,7 +1024,7 @@ def client_help(st, chat=None):
             f"{BTN_NOTIFY} — вимкнути або знову увімкнути графіки й нагадування, окремо по кожному об'єкту.\n"
             + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
                if chat is None or has_pv_chat(st, chat) else "") +
-            f"{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ під час відключень, і разом.\n" +
+            f"{BTN_SAVE} — економія (панелі, інвертор з АКБ під час відключень) і витрати (заряд АКБ з мережі, генератор), і підсумок.\n" +
             f"{BTN_HELP} — ця підказка.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
@@ -1049,6 +1049,13 @@ def kwh(v):
     return f"{v:,.1f}".replace(",", " ").replace(".0", "") if v < 100 else f"{v:,.0f}".replace(",", " ")
 
 
+def hrow(r):
+    """Строка истории Deye: выработка, потребление, покупка, отдано в сеть, заряд АКБ и доля выработки, ушедшая в АКБ."""
+    return {"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue")),
+            "feed": num(r.get("gridValue")) or 0, "charge": num(r.get("chargeValue")) or 0, "cr": num(r.get("chargeRatio")) or 0,
+            "dis": num(r.get("dischargeValue")) or 0}
+
+
 def pv_days(api, sid, days):
     """Выработка, потребление и покупка из сети по дням за последние days дней, включая сегодня. {дата: {...}}"""
     t = now()
@@ -1059,7 +1066,7 @@ def pv_days(api, sid, days):
             d = f"{int(r['year']):04d}-{int(r['month']):02d}-{int(r['day']):02d}"
         except Exception:
             continue
-        out[d] = {"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue"))}
+        out[d] = hrow(r)
     return out
 
 
@@ -1114,8 +1121,7 @@ GEN_PRICE = 35.0
 def save_periods(sid, p):
     b = lambda per: {"text": SAVE_PER[per][0].upper() + SAVE_PER[per][1:], "callback_data": f"sv:{sid}:{per}"}
     rows = [[b("w"), b("m")], [b("pm"), b("y")], [b("all")]]
-    if p.get("has_pv"):
-        rows.append([{"text": "✏️ Ціна світла з мережі", "callback_data": f"st:{sid}"}])
+    rows.append([{"text": "✏️ Ціна світла з мережі", "callback_data": f"st:{sid}"}])
     rows.append([{"text": "✏️ Ціна кВт·год від генератора", "callback_data": f"sg:{sid}"}])
     return rows
 
@@ -1133,10 +1139,10 @@ def save_start(tg, st, chat):
 
 def save_menu(tg, st, chat, sid):
     p = st["stations"][sid]
-    if p.get("has_pv") and not p.get("tariff"):
+    if not p.get("tariff"):  # нужна всем: панели экономят по ней, а заряд АКБ из сети по ней стоит денег
         save_ask(tg, st, chat, sid, "tariff")
         return
-    prices = (f"світло з мережі {p['tariff']:g} грн, " if p.get("has_pv") else "") + f"генератор {p.get('gen_price', GEN_PRICE):g} грн за кВт·год"
+    prices = f"світло з мережі {p['tariff']:g} грн, генератор {p.get('gen_price', GEN_PRICE):g} грн за кВт·год"
     tg.send(chat, f"💰 <b>{esc(p.get('title') or p.get('name'))}</b>: {prices}. За який період порахувати?",
             {"inline_keyboard": save_periods(sid, p)})
 
@@ -1211,57 +1217,96 @@ def backup_energy(st, sid, p, a, b):
     return hours, e, len(rows), first
 
 
+def gen_usage(p, a, b):
+    """Генератор за период по учёту бота: (часов, кВт·ч дал, кВт·ч из них ушло в заряд АКБ)."""
+    rows = [v for d, v in (p.get("gen_day") or {}).items() if a[:10] <= d <= b[:10]]
+    return sum(r.get("min", 0) for r in rows) / 60, sum(r.get("kwh", 0) for r in rows), sum(r.get("chg", 0) for r in rows)
+
+
 def save_calc(api, st, sid, per):
-    """Экономия по отдельности: панели (своя энергия × цена сети) и инвертор с АКБ (работа во время отключений
-    × цена того же от генератора), и вместе."""
+    """Экономия и расходы по отдельности.
+    Экономия: панели - энергия, использованная на объекте × цена сети; инвертор с АКБ - энергия во время отключений
+    × цена того же от генератора. Расходы: заряд АКБ из сети × цена сети; генератор - его кВт·ч × цена генераторного кВт·ч.
+    Заряд из сети = заряд АКБ − та часть выработки панелей, что ушла в АКБ (по данным Deye) − заряд от генератора через АВР.
+    В расходы идёт только заряд из сети, потраченный на работу без света (доля сети × энергия отключений), и потери АКБ
+    (заряд − разряд): заряд из сети в обычное время - это то же электричество, которое объект купил бы и так."""
     p = st["stations"][sid]
     t = now()
     title = esc(p.get("title") or p.get("name"))
-    lines = [f"💰 <b>{title}</b> — економія {SAVE_PER[per]}"]
-    total = 0.0
-    if p.get("has_pv"):
-        if not p.get("tariff"):
-            return "Спочатку вкажіть ціну світла з мережі."
-        try:
-            if api and not api.token:
-                api.login()
-            if per == "w":
-                rows = list(pv_days(api, sid, 7).values())
-            else:
-                if per in ("m", "pm"):
-                    d = t if per == "m" else t.replace(day=1) - timedelta(days=1)
-                    args = (3, d.strftime("%Y-%m"), d.strftime("%Y-%m"))
-                elif per == "y":
-                    args = (3, f"{t.year}-01", t.strftime("%Y-%m"))
-                else:
-                    args = (4, "2015", str(t.year))
-                rows = [{"gen": num(r.get("generationValue")) or 0, "feed": num(r.get("gridValue")) or 0}
-                        for r in api.history(int(sid), args[0], args[1], args[2])]
-            gen = sum(r.get("gen") or 0 for r in rows)
-            feed = sum(r.get("feed") or 0 for r in rows)
-            used = max(0.0, gen - feed)
-            pv_money = used * p["tariff"]
-            total += pv_money
-            lines.append(f"\n☀️ <b>Сонячні панелі</b>: виробили {kwh(gen)} кВт·год, на об'єкті використано {kwh(used)}"
-                         + (f", {kwh(feed)} віддано в мережу" if feed else "") + ".\n"
-                         f"Це світло не довелося купувати: <b>~{grn(pv_money)} грн</b> (за {p['tariff']:g} грн/кВт·год).")
-        except Exception:
-            lines.append("\n☀️ Панелі: Deye Cloud зараз не віддав дані, спробуйте за кілька хвилин.")
+    if not p.get("tariff"):
+        return "Спочатку вкажіть ціну світла з мережі."
+    tf, gp = p["tariff"], p.get("gen_price", GEN_PRICE)
+    lines = [f"💰 <b>{title}</b> — економія і витрати {SAVE_PER[per]}"]
     a, b = period_range(per, t)
+    rows = None
+    try:
+        if api and not api.token:
+            api.login()
+        if per == "w":
+            rows = list(pv_days(api, sid, 7).values())
+        else:
+            if per in ("m", "pm"):
+                d = t if per == "m" else t.replace(day=1) - timedelta(days=1)
+                args = (3, d.strftime("%Y-%m"), d.strftime("%Y-%m"))
+            elif per == "y":
+                args = (3, f"{t.year}-01", t.strftime("%Y-%m"))
+            else:
+                args = (4, "2015", str(t.year))
+            rows = [hrow(r) for r in api.history(int(sid), args[0], args[1], args[2])]
+    except Exception:
+        rows = None
+    save = cost = 0.0
+    # ---- экономия
+    lines.append("\n<b>ЕКОНОМІЯ</b>")
+    if p.get("has_pv"):
+        if rows is None:
+            lines.append("☀️ Панелі: Deye Cloud зараз не віддав дані, спробуйте за кілька хвилин.")
+        else:
+            gen = sum(r["gen"] for r in rows)
+            feed = sum(r["feed"] for r in rows)
+            used = max(0.0, gen - feed)
+            save += used * tf
+            lines.append(f"☀️ Сонячні панелі: виробили {kwh(gen)} кВт·год, на об'єкті використано {kwh(used)}"
+                         + (f", {kwh(feed)} віддано в мережу" if feed else "") + f".\nНе довелося купувати: <b>~{grn(used * tf)} грн</b>")
     hours, e, n, first = backup_energy(st, sid, p, a, b)
-    gp = p.get("gen_price", GEN_PRICE)
-    since = ""
-    if first and first > a:
-        since = f" (бот веде облік з {datetime.fromisoformat(first).strftime('%d.%m.%Y')})"
+    since = f" (облік з {datetime.fromisoformat(first).strftime('%d.%m.%Y')})" if first and first > a else ""
     if n:
-        inv_money = e * gp
-        total += inv_money
-        lines.append(f"\n🔋 <b>Інвертор з АКБ</b>{since}: {n} відключ., об'єкт працював без світла {dur(hours * 60)}, станція віддала ~{kwh(e)} кВт·год.\n"
-                     f"Те саме від генератора коштувало б <b>~{grn(inv_money)} грн</b> (за {gp:g} грн/кВт·год) — плюс шум, пальне і заправки.")
+        save += e * gp
+        lines.append(f"🔋 Інвертор з АКБ{since}: без світла {dur(hours * 60)} ({n} відключ.), станція віддала ~{kwh(e)} кВт·год.\n"
+                     f"Від генератора це коштувало б <b>~{grn(e * gp)} грн</b>")
     else:
-        lines.append(f"\n🔋 <b>Інвертор з АКБ</b>{since}: відключень світла за цей період не було.")
-    if p.get("has_pv") and n:
-        lines.append(f"\n<b>Разом: ~{grn(total)} грн</b>")
+        lines.append(f"🔋 Інвертор з АКБ{since}: відключень світла не було.")
+    # ---- расходы
+    lines.append("\n<b>ВИТРАТИ</b>")
+    gh, gk, gchg = gen_usage(p, a, b)
+    if rows is None:
+        lines.append("⚡ Заряд АКБ: Deye Cloud зараз не віддав дані.")
+    else:
+        charge = sum(r["charge"] for r in rows)
+        dis = sum(r["dis"] for r in rows)
+        grid_chg = sum(max(0.0, r["charge"] - r["gen"] * r["cr"] / 100) for r in rows)
+        grid_chg = max(0.0, grid_chg - (gchg if p.get("gen_how_last") != "port" else 0))
+        share = min(1.0, grid_chg / charge) if charge else 1.0  # какая доля заряда АКБ - из сети
+        if n and e:
+            og = e * share
+            cost += og * tf
+            lines.append(f"⚡ Заряд АКБ з мережі для роботи без світла: ~{kwh(og)} кВт·год → <b>~{grn(og * tf)} грн</b>")
+        loss = max(0.0, charge - dis)
+        if loss >= 0.1:
+            cost += loss * tf
+            lines.append(f"🔄 Втрати на заряд і розряд АКБ: ~{kwh(loss)} кВт·год (зарядили {kwh(charge)}, віддала {kwh(dis)}) → <b>~{grn(loss * tf)} грн</b>")
+    if gh or p.get("has_gen"):
+        cost += gk * gp
+        g_since = ""
+        if p.get("gen_day"):
+            g0 = min(p["gen_day"])
+            if g0 > a[:10]:
+                g_since = f" (облік з {datetime.fromisoformat(g0).strftime('%d.%m.%Y')})"
+        lines.append(f"⛽ Генератор{g_since}: працював {dur(gh * 60)}, дав ~{kwh(gk)} кВт·год"
+                     + (f" (з них ~{kwh(gchg)} на заряд АКБ)" if gchg >= 0.1 else "") + f" → <b>~{grn(gk * gp)} грн</b>")
+    lines.append(f"\n<b>Підсумок: економія ~{grn(save)} грн − витрати ~{grn(cost)} грн = {'+' if save - cost >= 0 else '−'}{grn(abs(save - cost))} грн</b>")
+    lines.append(f"Ціни: світло з мережі {tf:g} грн, генератор {gp:g} грн за кВт·год. "
+                 "Заряд АКБ з мережі у звичайний час окремо не рахується: це те саме світло, яке ви б і так купили.")
     return "\n".join(lines)
 
 
@@ -2783,6 +2828,21 @@ def check(api, tg, st, dtek):
             if (g_on and g_how != "port") or (p.get("gen_on") and p.get("gen_how") != "port" and no_grid is False and not g_on and p.get("gen_flip") is None):
                 no_grid, how = True, "generator"  # пока генератор на входе сети, отключение продолжается
             gen_track(tg, st, sid, p, title, chat, t, g_on, g_how, g_f, g_v, soc, dkw, no_grid is True or bool(p.get("no_grid")))
+            # Учёт генератора: сколько кВт·ч дал (мощность входа GEN или сети при АВР) и сколько из них ушло в заряд АКБ.
+            if p.get("gen_on"):
+                p["gen_how_last"] = p.get("gen_how")
+                prev_t, p["gen_t"] = p.get("gen_t"), t.isoformat()
+                gdt = (t - datetime.fromisoformat(prev_t)).total_seconds() / 3600 if prev_t else 0
+                if 0 < gdt < 0.5:
+                    gpw = dev_val(dev, GEN_P) if p.get("gen_how") == "port" else abs(num((dev or {}).get("TotalGridPower")) or num(lt.get("wirePower")) or 0)
+                    gd = p.setdefault("gen_day", {}).setdefault(t.strftime("%Y-%m-%d"), {"kwh": 0, "min": 0, "chg": 0})
+                    gd["kwh"] = round(gd["kwh"] + (gpw or 0) / 1000 * gdt, 2)
+                    gd["min"] = round(gd["min"] + gdt * 60, 1)
+                    gd["chg"] = round(gd["chg"] + (num(lt.get("chargePower")) or 0) / 1000 * gdt, 2)
+                    for k in sorted(p["gen_day"])[:-400]:
+                        p["gen_day"].pop(k)
+            else:
+                p.pop("gen_t", None)
             phase_check(tg, p, dev, t)
             p["how"] = how
             if no_grid is True:
@@ -3289,7 +3349,7 @@ def main():
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
             for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected",
-                      "dkw_h", "last_soc_t", "soc_sus", "miss_n", "gen_flip", "gen_bad", "gen_drain", "ph_over", "f_h", "gen_why"):
+                      "dkw_h", "last_soc_t", "soc_sus", "miss_n", "gen_flip", "gen_bad", "gen_drain", "ph_over", "f_h", "gen_why", "gen_t"):
                 q.pop(k, None)
         return x
 
