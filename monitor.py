@@ -791,6 +791,7 @@ HELP = ("📋 <b>Команды бота</b>\n"
 BTN_STATUS, BTN_SCHED, BTN_HELP, BTN_QUEUE = "🔌 Стан станції", "🗓 Графік", "❓ Допомога", "🔁 Змінити чергу"
 BTN_NOTIFY = "🔔 Графіки: увімк./вимк."
 BTN_PV = "☀️ Виробіток"
+BTN_SAVE = "💰 Економія"
 KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
 
@@ -804,7 +805,7 @@ def kb_for(st, chat):
     if not has_pv_chat(st, chat):
         return KEYBOARD
     return {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}],
-                         [{"text": BTN_PV}, {"text": BTN_HELP}]], "resize_keyboard": True, "is_persistent": True}
+                         [{"text": BTN_PV}, {"text": BTN_SAVE}], [{"text": BTN_HELP}]], "resize_keyboard": True, "is_persistent": True}
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
@@ -908,7 +909,7 @@ PICK = {"/link": ("L", "Для какой станции нужна ссылка
         "/queue": ("Q", "У какой станции задать очередь ДТЭК?"), "/reset": ("R", "У какой станции отключить клиентов?")}
 
 
-def callback(tg, st, chat, data, who, dtek):
+def callback(tg, st, chat, data, who, dtek, api=None):
     """Нажатие кнопки под сообщением."""
     kind, _, rest = (data or "").partition(":")
     if kind == "cs":  # клиент выбрал объект
@@ -916,6 +917,17 @@ def callback(tg, st, chat, data, who, dtek):
             ask_queue(tg, st, chat, sid=rest)
         return
     mine = st["stations"].get(rest.split(":")[0], {}).get("clients") or []
+    if kind in ("sv", "sp", "st"):  # экономия: выбор объекта / периода / смена цены
+        c_sid, _, per = rest.partition(":")
+        if chat not in (st["stations"].get(c_sid, {}).get("clients") or []):
+            return
+        if kind == "sp":
+            save_menu(tg, st, chat, c_sid)
+        elif kind == "st":
+            save_ask(tg, st, chat, c_sid)
+        else:
+            tg.send(chat, save_calc(api, st, c_sid, per), {"inline_keyboard": save_periods(c_sid)})
+        return
     if kind == "pw":  # еженедельный отчёт о выработке вкл/выкл
         if chat in mine:
             p = st["stations"][rest]
@@ -1006,6 +1018,7 @@ def client_help(st, chat=None):
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
             f"{BTN_NOTIFY} — вимкнути або знову увімкнути графіки й нагадування, окремо по кожному об'єкту.\n"
             + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
+               f"{BTN_SAVE} — скільки грошей заощадила станція: вкажіть свою ціну за кВт·год і оберіть період.\n"
                if chat is None or has_pv_chat(st, chat) else "") +
             f"{BTN_HELP} — ця підказка.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
@@ -1023,6 +1036,10 @@ def apply_latest(p, lt, t):
 
 
 # ---------------------------------------------------------------- выработка панелей
+def grn(v):
+    return f"{v:,.0f}".replace(",", " ")
+
+
 def kwh(v):
     return f"{v:,.1f}".replace(",", " ").replace(".0", "") if v < 100 else f"{v:,.0f}".replace(",", " ")
 
@@ -1082,6 +1099,101 @@ def pv_reply(st, chat, api):
     return "\n\n".join(out) or "На ваших об'єктах сонячних панелей немає — виробітку немає."
 
 
+# ---------------------------------------------------------------- экономия для клиента
+SAVE_PER = {"w": "за 7 днів", "m": "за цей місяць", "pm": "за минулий місяць", "y": "з початку року", "all": "за весь час"}
+
+
+def save_periods(sid):
+    b = lambda per: {"text": SAVE_PER[per][0].upper() + SAVE_PER[per][1:], "callback_data": f"sv:{sid}:{per}"}
+    return [[b("w"), b("m")], [b("pm"), b("y")], [b("all")], [{"text": "✏️ Змінити ціну за кВт·год", "callback_data": f"st:{sid}"}]]
+
+
+def save_start(tg, st, chat):
+    mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or []) and p.get("has_pv")]
+    if not mine:
+        tg.send(chat, "На ваших об'єктах сонячних панелей немає — економію рахувати нема з чого.", KEYBOARD)
+    elif len(mine) > 1:
+        tg.send(chat, "Для якого об'єкта порахувати економію?", {"inline_keyboard": [[
+            {"text": str(st["stations"][k].get("title") or st["stations"][k].get("name"))[:40], "callback_data": f"sp:{k}"}] for k in mine]})
+    else:
+        save_menu(tg, st, chat, mine[0])
+
+
+def save_menu(tg, st, chat, sid):
+    p = st["stations"][sid]
+    if not p.get("tariff"):
+        save_ask(tg, st, chat, sid)
+        return
+    tg.send(chat, f"💰 <b>{esc(p.get('title') or p.get('name'))}</b>: ціна {p['tariff']:g} грн за кВт·год. За який період порахувати?",
+            {"inline_keyboard": save_periods(sid)})
+
+
+def save_ask(tg, st, chat, sid):
+    st.setdefault("await", {})[str(chat)] = {"kind": "tariff", "sid": sid, "at": now().isoformat()}
+    p = st["stations"][sid]
+    cur = f"Зараз записано {p['tariff']:g} грн. " if p.get("tariff") else ""
+    tg.send(chat, f"💰 <b>{esc(p.get('title') or p.get('name'))}</b>: {cur}Скільки ви платите за 1 кВт·год світла?\n"
+                  "Напишіть число в гривнях, наприклад: <b>4.32</b> (для побуту) або <b>9.8</b> (для бізнесу). Ціну видно в рахунку за світло.", KEYBOARD)
+
+
+def save_input(tg, st, chat, text):
+    """Клиент прислал цену. True - сообщение обработано."""
+    w = (st.get("await") or {}).get(str(chat))
+    if not w or w.get("kind") != "tariff" or (now() - datetime.fromisoformat(w["at"])).total_seconds() > 1800:
+        return False
+    m = re.search(r"\d+(?:[.,]\d+)?", text or "")
+    val = float(m.group(0).replace(",", ".")) if m else None
+    if val is None or not 0.5 <= val <= 50:
+        tg.send(chat, "Не схоже на ціну за кВт·год. Напишіть число в гривнях, наприклад: 4.32", KEYBOARD)
+        return True
+    st["await"].pop(str(chat), None)
+    p = st["stations"][w["sid"]]
+    p["tariff"], p["tariff_at"] = val, now().isoformat()
+    tg.send(chat, f"✅ Записано: {val:g} грн за кВт·год. Змінити можна будь-коли кнопкою «{BTN_SAVE}». За який період порахувати?",
+            {"inline_keyboard": save_periods(w["sid"])})
+    return True
+
+
+def save_calc(api, st, sid, per):
+    """Экономия: энергия, которую не пришлось купить из сети (потребление − покупка) × цена клиента."""
+    p = st["stations"][sid]
+    t = now()
+    title = esc(p.get("title") or p.get("name"))
+    if not p.get("tariff"):
+        return "Спочатку вкажіть ціну за кВт·год."
+    try:
+        if api and not api.token:
+            api.login()
+        if per == "w":
+            rows = list(pv_days(api, sid, 7).values())
+        elif per in ("m", "pm"):
+            d = t if per == "m" else t.replace(day=1) - timedelta(days=1)
+            ym = d.strftime("%Y-%m")
+            rows = [{"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue")),
+                     "feed": num(r.get("gridValue"))} for r in api.history(int(sid), 3, ym, ym)]
+        elif per == "y":
+            rows = [{"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue")),
+                     "feed": num(r.get("gridValue"))} for r in api.history(int(sid), 3, f"{t.year}-01", t.strftime("%Y-%m"))]
+        else:
+            rows = [{"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue")),
+                     "feed": num(r.get("gridValue"))} for r in api.history(int(sid), 4, "2015", str(t.year))]
+    except Exception:
+        return f"💰 <b>{title}</b>: Deye Cloud зараз не віддав дані, спробуйте за кілька хвилин."
+    use = sum(r.get("use") or 0 for r in rows)
+    buy = sum(r.get("buy") or 0 for r in rows)
+    gen = sum(r.get("gen") or 0 for r in rows)
+    feed = sum(r.get("feed") or 0 for r in rows)
+    if not use and not gen:
+        return f"💰 <b>{title}</b>: даних {SAVE_PER[per]} у Deye немає."
+    own = max(0.0, use - buy)
+    money = own * p["tariff"]
+    lines = [f"💰 <b>{title}</b> — економія {SAVE_PER[per]}",
+             f"Сонце й АКБ покрили <b>{kwh(own)} кВт·год</b> із {kwh(use)} спожитих ({own / use * 100:.0f}%)." if use else "",
+             f"При вашій ціні {p['tariff']:g} грн/кВт·год це <b>~{grn(money)} грн</b>, які не довелося платити за світло.",
+             f"Панелі виробили {kwh(gen)} кВт·год" + (f", з них {kwh(feed)} віддано в мережу." if feed else ".")]
+    return "\n".join(x for x in lines if x)
+
+
 def pv_detect(api, tg, sid, p, lt, t):
     """Есть ли на объекте панели. Видели выработку (сейчас >50 Вт или за месяц в истории Deye) - есть.
     Историю спрашиваем не чаще раза в сутки и только пока панелей не видели. Появились - сообщаем клиентам, у них появится кнопка."""
@@ -1101,6 +1213,180 @@ def pv_detect(api, tg, sid, p, lt, t):
             tg.clients(p.get("clients"), f"☀️ <b>{esc(p.get('title') or p.get('name'))}</b>: бот бачить сонячні панелі. "
                        f"У меню з'явилась кнопка «{BTN_PV}» — виробіток за сьогодні, вчора, тиждень і місяць; раз на тиждень прийде підсумок.", markup=KEYBOARD)
     p["pv_checked_once"] = True
+
+
+# ---------------------------------------------------------------- аналитика для группы
+def staff_daily(api, tg, st, t):
+    """Раз в сутки утром: выработка вчера (панели хуже нормы), ёмкость АКБ по месяцам (старение), отчёт за месяц 1-го числа."""
+    today = t.strftime("%Y-%m-%d")
+    if t.hour < 8 or st.get("staff_day") == today:
+        return
+    st["staff_day"] = today
+    y = (t - timedelta(days=1)).strftime("%Y-%m-%d")
+    gens = {}
+    for sid, p in st["stations"].items():
+        if p.get("has_pv") and p.get("kwp"):
+            try:
+                g = pv_days(api, sid, 2).get(y, {}).get("gen")
+            except Exception:
+                g = None
+            if g is not None:
+                gens[sid] = g / p["kwp"]
+        c = learned_cap(st, sid)
+        if c:
+            p.setdefault("cap_hist", {})[t.strftime("%Y-%m")] = round(c, 1)
+            battery_health(tg, p, t)
+    pv_underperform(tg, st, gens, y, t)
+    if t.day == 1 and st.get("report_month") != t.strftime("%Y-%m"):
+        st["report_month"] = t.strftime("%Y-%m")
+        safe(tg, st, "отчёт за месяц", report, api, tg, st)
+        safe(tg, st, "цифры месяца для соцсетей", month_social, api, tg, st, t)
+
+
+def pv_underperform(tg, st, gens, day, t):
+    """Панели хуже нормы. Выработка на 1 кВт панелей сравнивается со средней по всем станциям за тот же день
+    (облака у всех одни), а потом - с обычным отношением этой станции (ориентация и тень у каждой свои).
+    3 дня подряд ниже 80% своего обычного - сообщение."""
+    if len(gens) < 3:
+        return
+    med = sorted(gens.values())[len(gens) // 2]
+    if med <= 0.2:  # совсем пасмурный день - ничего не сравниваем
+        return
+    for sid, y in gens.items():
+        p = st["stations"][sid]
+        r = p.setdefault("pv_ratio", {})
+        r[day] = round(y / med, 3)
+        for k in sorted(r)[:-40]:
+            r.pop(k)
+        hist = [v for k, v in sorted(r.items()) if k < day][-30:]
+        last3 = [v for k, v in sorted(r.items())][-3:]
+        if len(hist) < 10 or len(last3) < 3:
+            continue
+        base = sorted(hist)[len(hist) // 2]
+        if all(v < 0.8 * base for v in last3) and once_days(p, "pv_under", t, 14):
+            tg.staff_msg(f"🧽 <b>{esc(p.get('name'))}</b>: панели 3 дня подряд дают меньше обычного — "
+                         f"{sum(last3) / 3 / base * 100:.0f}% от своей нормы.\n"
+                         f"Как посчитано: выработка на 1 кВт панелей ({p['kwp']:g} кВт) в сравнении с остальными станциями в те же дни "
+                         f"(погода у всех одна), против обычного отношения этой станции за прошлые {len(hist)} дн.\n"
+                         "Возможные причины: грязь или снег на панелях, новая тень, отключился стринг или автомат DC. Что сделать: осмотр, мойка, проверка стрингов.")
+
+
+def battery_health(tg, p, t):
+    """Старение АКБ: фактическая ёмкость сейчас против лучшего месяца. Падение больше 10% - сообщение раз в 30 дней."""
+    h = p.get("cap_hist") or {}
+    if len(h) < 3:
+        return
+    cur = h[max(h)]
+    best_m = max(h, key=lambda k: h[k])
+    if cur < 0.9 * h[best_m] and once_days(p, "bat_age", t, 30):
+        tg.staff_msg(f"🔋 <b>{esc(p.get('name'))}</b>: фактическая ёмкость АКБ снизилась: {h[best_m]:.0f} кВт·ч в {best_m} → {cur:.0f} сейчас "
+                     f"(−{(1 - cur / h[best_m]) * 100:.0f}%).\n"
+                     "Как посчитано: кВт·ч, отданные за отключения ÷ падение заряда, медиана за 60 дней, по месяцам.\n"
+                     "Что сделать: проверить SOH и балансировку модулей; если батарея на гарантии — повод для обращения к производителю до того, как заметит клиент.")
+
+
+def once_days(p, key, t, days):
+    sent = p.setdefault("once", {})
+    if sent.get(key) and (t - datetime.fromisoformat(sent[key])).days < days:
+        return False
+    sent[key] = t.isoformat()
+    return True
+
+
+def staff_weekly(api, tg, st, t):
+    """Понедельник после 9:00: сводка недели по станциям и список, кому что предложить."""
+    wk = t.strftime("%G-%V")
+    if t.weekday() != 0 or t.hour < 9 or st.get("staff_week") == wk:
+        return
+    st["staff_week"] = wk
+    since = (t - timedelta(days=7)).isoformat()
+    since30 = (t - timedelta(days=30)).isoformat()
+    week, leads = [], []
+    for sid, p in sorted(st["stations"].items(), key=lambda x: str(x[1].get("name"))):
+        name = esc(p.get("name"))
+        log7 = [r for r in st["log"] if r.get("sid") == sid and r.get("start", "") >= since]
+        log30 = [r for r in st["log"] if r.get("sid") == sid and r.get("start", "") >= since30]
+        line = f"<b>{name}</b>: "
+        if log7:
+            mins = sum(r["min"] for r in log7)
+            unpl = len([r for r in log7 if r.get("planned") is False])
+            low = min((r.get("soc_min", r.get("soc_end")) for r in log7 if r.get("soc_end") is not None), default=None)
+            line += f"отключений {len(log7)}, без света {dur_ru(mins)}" + (f" (вне графика {unpl})" if unpl else "") + (f", АКБ до {low:.0f}%" if low is not None else "")
+        else:
+            line += "отключений не было"
+        if p.get("offline"):
+            line += " · ⚠️ сейчас не на связи"
+        gh = p.get("gen_hours", 0) - p.get("gen_hours_week", 0)
+        p["gen_hours_week"] = p.get("gen_hours", 0)
+        if gh > 0.05:
+            line += f" · генератор {gh:.1f} ч"
+        week.append(line)
+        # --- кому что предложить
+        offers = []
+        try:
+            d30 = pv_days(api, sid, 30)
+            use, buy = sum(x.get("use") or 0 for x in d30.values()), sum(x.get("buy") or 0 for x in d30.values())
+        except Exception:
+            use = buy = 0
+        if use and buy / use > 0.6:
+            money = f", ~{grn(buy * p['tariff'])} грн" if p.get("tariff") else ""
+            offers.append(("ещё панели" if p.get("has_pv") else "панели") + f": из сети куплено {kwh(buy)} кВт·ч за 30 дней ({buy / use * 100:.0f}% потребления{money})")
+        deep = [r for r in log30 if r.get("soc_end") is not None and min(r.get("soc_min", 100), r["soc_end"]) <= 20]
+        cap, ukw = capacity(st, sid, p)[0], usual_kw(st, sid)
+        longest = max((r["min"] for r in log30), default=0) / 60
+        full_h = 0.85 * cap / ukw if cap and ukw else None
+        if len(deep) >= 2:
+            offers.append(f"больше АКБ: за 30 дней {len(deep)} раз(а) разряжалась до ≤20%")
+        elif full_h and longest > full_h:
+            offers.append(f"больше АКБ: самое длинное отключение {longest:.0f} ч, полного заряда хватает на ~{full_h:.0f} ч")
+        if full_h and longest > full_h and not p.get("has_gen"):
+            offers.append("генератор: отключения длиннее, чем хватает АКБ, а генератора на объекте не видно")
+        ovl = [d for d in p.get("ovl") or [] if d >= (t - timedelta(days=7)).strftime("%Y-%m-%d")]
+        if len(ovl) >= 2 and p.get("rated"):
+            offers.append(f"инвертор мощнее: {len(ovl)} дн. за неделю нагрузка выше 90% номинала ({p['rated'] / 1000:.0f} кВт)")
+        if offers:
+            who = ", ".join(esc(n) for n in (p.get("names") or {}).values())[:120]
+            leads.append(f"<b>{name}</b>" + (f" ({who})" if who else "") + ":\n• " + "\n• ".join(offers))
+    if week:
+        tg.staff_msg("📋 <b>Неделя по станциям</b>\n" + "\n".join(week))
+    if leads:
+        tg.staff_msg("💼 <b>Кому что предложить</b> (по данным станций)\n\n" + "\n\n".join(leads) +
+                     "\n\nКак посчитано: покупка из сети и потребление за 30 дней из Deye; отключения и заряд — по журналу бота; нагрузка — по проверкам.")
+
+
+def good_moment(tg, p, mins, low, t):
+    """Объект без проблем пережил долгое отключение - хороший момент попросить рекомендацию. Сообщение в группу."""
+    if mins < 360 or low is None or low < 20 or not p.get("clients") or not once_days(p, "good_moment", t, 30):
+        return
+    who = ", ".join(esc(n) for n in (p.get("names") or {}).values())[:150]
+    tg.staff_msg(f"👍 <b>{esc(p.get('name'))}</b> отработала {dur_ru(mins)} без света, АКБ не опускалась ниже {low:.0f}%.\n"
+                 "Хороший момент позвонить клиенту" + (f" ({who})" if who else "") + ": спросить, всё ли устраивает, и попросить порекомендовать Solaris знакомым или оставить отзыв.")
+
+
+def month_social(api, tg, st, t):
+    """1-го числа: обезличенные цифры прошлого месяца по всем станциям - готовый текст для соцсетей."""
+    first = t.replace(day=1)
+    lm = (first - timedelta(days=1))
+    ym = lm.strftime("%Y-%m")
+    log = [r for r in st["log"] if r.get("start", "")[:7] == ym]
+    if not log:
+        return
+    hours = sum(r["min"] for r in log) / 60
+    longest = max(r["min"] for r in log) / 60
+    objs = len({r["sid"] for r in log})
+    ok = all((r.get("soc_end") or 100) > 10 for r in log)
+    gen = 0.0
+    for sid, p in st["stations"].items():
+        if p.get("has_pv"):
+            try:
+                rows = api.history(int(sid), 3, ym, ym)
+                gen += num((rows[0] if rows else {}).get("generationValue")) or 0
+            except Exception:
+                pass
+    txt = (f"За {MONTHS[lm.month]} станції Solaris пропрацювали без світла разом {hours:.0f} годин (об'єктів з відключеннями: {objs}). "
+           f"Найдовше відключення — {longest:.0f} год." + (" Жоден об'єкт не залишився без електрики." if ok else "") +
+           (f" Сонячні панелі наших клієнтів виробили {grn(gen)} кВт·год." if gen else ""))
+    tg.staff_msg("📣 <b>Цифры месяца для соцсетей</b> (обезличенные, можно публиковать):\n\n" + txt)
 
 
 def pv_weekly(api, tg, st, t):
@@ -1286,9 +1572,9 @@ def commands(tg, st, dtek=None, api=None):
             c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
             if c_chat:
                 mid = (cq.get("message") or {}).get("message_id")
-                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw") and cq.get("data") != "cq:?":
+                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st") and cq.get("data") != "cq:?":
                     tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
-                callback(tg, st, c_chat, cq.get("data"), c_who, dtek)
+                callback(tg, st, c_chat, cq.get("data"), c_who, dtek, api)
             continue
         m = u.get("message") or {}
         chat = str((m.get("chat") or {}).get("id", ""))
@@ -1299,7 +1585,7 @@ def commands(tg, st, dtek=None, api=None):
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_PV: "/vyrobitok"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
@@ -1337,6 +1623,10 @@ def commands(tg, st, dtek=None, api=None):
             ask_queue(tg, st, chat, change=True)
         elif cmd == "/grafiky" and is_client:
             sched_toggle(tg, st, chat)
+        elif cmd == "/ekonomiya" and is_client:
+            save_start(tg, st, chat)
+        elif not text.startswith("/") and is_client and save_input(tg, st, chat, text):
+            pass  # клиент прислал цену за кВт·ч
         elif cmd == "/vyrobitok" and is_client:
             tg.send(chat, pv_reply(st, chat, api), KEYBOARD)
         elif cmd == "/queue" or not text.startswith("/") or not is_client:
@@ -2242,6 +2532,7 @@ def check(api, tg, st, dtek):
             name = s.get("name") or s.get("stationName") or sid
             p = st["stations"].setdefault(sid, {})
             p["name"] = name
+            p["kwp"] = num(s.get("installedCapacity")) or p.get("kwp")  # мощность панелей, кВт
             p.setdefault("code", secrets.token_urlsafe(9))
             cfg = setup(st, cfgs, sid)
             title, chat, q = esc(cfg["title"]), cfg["chats"], cfg["queue"]
@@ -2440,7 +2731,7 @@ def check(api, tg, st, dtek):
                         mins = (back - start).total_seconds() / 60
                         st["log"].append({"sid": sid, "name": name, "start": p["off_since"], "end": p["on_since"],
                                           "min": round(mins), "planned": p.get("off_planned"), "flaps": p.get("flaps", 0),
-                                          "soc_start": p.get("off_soc"), "soc_end": p.get("on_soc", soc),
+                                          "soc_start": p.get("off_soc"), "soc_end": p.get("on_soc", soc), "soc_min": p.get("min_soc"),
                                           "kwh": round(p["off_kwh"], 1) if p.get("off_kwh") else None,
                                           "emerg": bool(p.get("off_emerg")),
                                           "m": sorted(k for k, ok in matches(p.get("off_snap"), start, back,
@@ -2451,6 +2742,7 @@ def check(api, tg, st, dtek):
                             bat = f"\nАКБ: було {p['off_soc']:.0f}%, найменше {min(p.get('min_soc', 100), p.get('on_soc', soc)):.0f}%, зараз {soc:.0f}%." if soc is not None else ""
                         fl = f"\nЗа цей час світло з'являлось і знову зникало: {p['flaps']} раз(и)." if p.get("flaps") else ""
                         tg.clients(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(back)}, мережа стабільна.\nБез мережі: {dur(mins)}.{fl}{bat}", urgent=True)
+                        good_moment(tg, p, mins, min(p.get("min_soc", 100), p.get("on_soc", soc) if p.get("on_soc", soc) is not None else 100), t)
                         for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until", "off_kwh", "off_t", "off_snap", "off_emerg"):
                             p.pop(k, None)
                     elif "on_soc" not in p and soc is not None:
@@ -2502,6 +2794,8 @@ def check(api, tg, st, dtek):
                 p["joins"].pop(chat_id)
     morning(tg, st, dtek, t)
     safe(tg, st, "недельный отчёт о выработке", pv_weekly, api, tg, st, t)
+    safe(tg, st, "аналитика дня", staff_daily, api, tg, st, t)
+    safe(tg, st, "сводка недели", staff_weekly, api, tg, st, t)
     return len(stations)
 
 
@@ -2655,9 +2949,10 @@ def peek(api, st):
         p = st["stations"].get(sid, {})
         hist = {}
         for gran, a_, b_ in ((2, (now() - timedelta(days=2)).strftime("%Y-%m-%d"), (now() + timedelta(days=1)).strftime("%Y-%m-%d")),
-                             (3, now().strftime("%Y-%m"), now().strftime("%Y-%m"))):
+                             (3, now().strftime("%Y-%m"), now().strftime("%Y-%m")),
+                             (31, f"{now().year}-01", now().strftime("%Y-%m")), (4, "2015", str(now().year))):
             try:
-                hist[str(gran)] = api.history(int(sid), gran, a_, b_)
+                hist[str(gran)] = api.history(int(sid), 3 if gran == 31 else gran, a_, b_)
             except Exception as e:
                 hist[str(gran)] = {"error": str(e)[-120:]}
         out["stations"].append({"sid": sid, "name": p.get("name"), "inverters": dev, "latest": lt, "history": hist,
