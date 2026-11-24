@@ -795,6 +795,7 @@ BTN_STATUS, BTN_SCHED, BTN_HELP, BTN_QUEUE = "🔌 Стан станції", "�
 BTN_NOTIFY = "🔔 Графіки: увімк./вимк."
 BTN_PV = "☀️ Виробіток"
 BTN_SET = "⚙️ Налаштування"
+BTN_SCHED_OFF, BTN_SCHED_ON = "🔕 Вимкнути графіки", "🔔 Увімкнути графіки"
 BTN_SAVE = "💰 Економія"
 KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
@@ -806,9 +807,12 @@ def has_pv_chat(st, chat):
 
 def kb_for(st, chat):
     """Клавиатура клиента: «💰 Економія» у всех (инвертор с АКБ есть у всех), «☀️ Виробіток» - только если есть панели."""
-    rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_SET}]]
+    mine = [p for p in st["stations"].values() if str(chat) in [str(c) for c in p.get("clients") or []]]
+    ons = {sched_on(p, chat) for p in mine}
+    notify = BTN_SCHED_OFF if ons == {True} else BTN_SCHED_ON if ons == {False} else BTN_NOTIFY  # кнопка сразу показывает, что сделает
+    rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": notify}]]
     rows.append([{"text": BTN_PV}, {"text": BTN_SAVE}] if has_pv_chat(st, chat) else [{"text": BTN_SAVE}])
-    rows.append([{"text": BTN_HELP}])
+    rows.append([{"text": BTN_SET}, {"text": BTN_HELP}])
     return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
 
 
@@ -883,7 +887,7 @@ def sched_toggle(tg, st, chat, sid=None):
     else:
         off.append(str(chat))
         tg.send(chat, f"🔕 <b>{title}</b>: графіки ДТЕК вимкнено. Повідомлення про світло, заряд, зв'язок і екстрені відключення приходять як і раніше.\n"
-                      f"Подивитися графік вручну — кнопка «{BTN_SCHED}». Увімкнути знову — «{BTN_NOTIFY}».", KEYBOARD)
+                      f"Подивитися графік вручну — кнопка «{BTN_SCHED}». Увімкнути знову — кнопка «{BTN_SCHED_ON}».", KEYBOARD)
     if not off:
         p.pop("nosched", None)
 
@@ -1040,7 +1044,8 @@ def client_help(st, chat=None):
             f"{BTN_STATUS} — чи є світло, заряд АКБ, навантаження.\n"
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
-            f"{BTN_SET} — що надсилати: графіки ДТЕК і нагадування, зведення виробітку панелей (щодня, щотижня, щомісяця), окремо по кожному об'єкту.\n"
+            f"{BTN_SCHED_OFF} / {BTN_SCHED_ON} — одним натиском вимкнути або увімкнути графіки ДТЕК і нагадування.\n"
+            f"{BTN_SET} — що надсилати: графіки ДТЕК, зведення виробітку панелей (щодня, щотижня, щомісяця), окремо по кожному об'єкту.\n"
             + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
                if chat is None or has_pv_chat(st, chat) else "") +
             f"{BTN_SAVE} — економія (панелі, інвертор з АКБ під час відключень) і витрати (заряд АКБ з мережі, генератор), і підсумок.\n" +
@@ -1818,7 +1823,7 @@ def commands(tg, st, dtek=None, api=None):
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_SCHED_OFF: "/grafiky", BTN_SCHED_ON: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
