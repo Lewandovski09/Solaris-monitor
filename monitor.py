@@ -547,20 +547,28 @@ def discharge_kw(lt):
 
 
 def deye_cap_kwh(dev, units):
-    """Ёмкость АКБ из данных инвертора в Deye: кВт·ч, или А·ч × напряжение АКБ."""
-    for k, v in (dev or {}).items():
+    """Ёмкость АКБ из данных инвертора в Deye, кВт·ч. У инверторов 50 кВт два входа АКБ
+    (BatteryRatedCapacity и Battery2RatingCapacity, в А·ч) - складываем оба: А·ч × напряжение своего входа."""
+    dev, units = dev or {}, units or {}
+    total = 0.0
+    for k, v in dev.items():
         val = num(v)
         if not k or not CAP_KEY.search(k) or not val or val <= 0:
             continue
-        u = str((units or {}).get(k) or "").lower().replace("·", "").replace(" ", "")
+        u = str(units.get(k) or "").lower().replace("·", "").replace(" ", "")
         if u == "kwh":
-            return val
-        if u == "wh":
-            return val / 1000
-        if u == "ah":
-            volt = next((num(x) for kk, x in dev.items() if kk and BVOLT_KEY.search(kk) and (num(x) or 0) > 10), None)
-            return val * (volt or 51.2) / 1000
-    return None
+            total += val
+        elif u == "wh":
+            total += val / 1000
+        elif u == "ah":
+            second = bool(re.search(r"batt?(ery)?2|2$", k, re.I))
+            names = ("BatteryVoltage2", "BMS2Voltage") if second else ("BatteryVoltage", "BMSVoltage")
+            volt = next((num(dev[n]) for n in names if (num(dev.get(n)) or 0) > 10), None)
+            if volt is None and not second:
+                volt = 51.2
+            if volt:  # второй вход без напряжения - батареи там нет
+                total += val * volt / 1000
+    return total or None
 
 
 def learned_cap(st, sid):
