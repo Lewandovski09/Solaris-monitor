@@ -804,11 +804,13 @@ def has_pv_chat(st, chat):
 
 
 def kb_for(st, chat):
-    """Клавиатура клиента: «☀️ Виробіток» появляется, только если хотя бы на одном его объекте есть панели."""
-    if not has_pv_chat(st, chat):
-        return KEYBOARD
-    return {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}],
-                         [{"text": BTN_PV}, {"text": BTN_SAVE}], [{"text": BTN_HELP}]], "resize_keyboard": True, "is_persistent": True}
+    """Клавиатура клиента: «💰 Економія» у всех (инвертор с АКБ есть у всех), «☀️ Виробіток» - только если есть панели."""
+    rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}]]
+    rows.append([{"text": BTN_PV}, {"text": BTN_SAVE}] if has_pv_chat(st, chat) else [{"text": BTN_SAVE}])
+    rows.append([{"text": BTN_HELP}])
+    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+
+
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
@@ -920,16 +922,16 @@ def callback(tg, st, chat, data, who, dtek, api=None):
             ask_queue(tg, st, chat, sid=rest)
         return
     mine = st["stations"].get(rest.split(":")[0], {}).get("clients") or []
-    if kind in ("sv", "sp", "st"):  # экономия: выбор объекта / периода / смена цены
+    if kind in ("sv", "sp", "st", "sg"):  # экономия: выбор объекта / периода / смена цены
         c_sid, _, per = rest.partition(":")
         if chat not in (st["stations"].get(c_sid, {}).get("clients") or []):
             return
         if kind == "sp":
             save_menu(tg, st, chat, c_sid)
-        elif kind == "st":
-            save_ask(tg, st, chat, c_sid)
+        elif kind in ("st", "sg"):
+            save_ask(tg, st, chat, c_sid, "tariff" if kind == "st" else "gen")
         else:
-            tg.send(chat, save_calc(api, st, c_sid, per), {"inline_keyboard": save_periods(c_sid)})
+            tg.send(chat, save_calc(api, st, c_sid, per), {"inline_keyboard": save_periods(c_sid, st["stations"][c_sid])})
         return
     if kind == "pw":  # еженедельный отчёт о выработке вкл/выкл
         if chat in mine:
@@ -1021,8 +1023,8 @@ def client_help(st, chat=None):
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
             f"{BTN_NOTIFY} — вимкнути або знову увімкнути графіки й нагадування, окремо по кожному об'єкту.\n"
             + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
-               f"{BTN_SAVE} — скільки грошей заощадила станція: вкажіть свою ціну за кВт·год і оберіть період.\n"
                if chat is None or has_pv_chat(st, chat) else "") +
+            f"{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ під час відключень, і разом.\n" +
             f"{BTN_HELP} — ця підказка.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
@@ -1104,18 +1106,25 @@ def pv_reply(st, chat, api):
 
 # ---------------------------------------------------------------- экономия для клиента
 SAVE_PER = {"w": "за 7 днів", "m": "за цей місяць", "pm": "за минулий місяць", "y": "з початку року", "all": "за весь час"}
+# Цена 1 кВт·ч от генератора по умолчанию: дизель ~101 грн/л (средняя по Украине, 17.11.2026, А-95),
+# расход ~0,35 л на кВт·ч у генератора под нормальной нагрузкой => ~35 грн. Клиент может вписать свою.
+GEN_PRICE = 35.0
 
 
-def save_periods(sid):
+def save_periods(sid, p):
     b = lambda per: {"text": SAVE_PER[per][0].upper() + SAVE_PER[per][1:], "callback_data": f"sv:{sid}:{per}"}
-    return [[b("w"), b("m")], [b("pm"), b("y")], [b("all")], [{"text": "✏️ Змінити ціну за кВт·год", "callback_data": f"st:{sid}"}]]
+    rows = [[b("w"), b("m")], [b("pm"), b("y")], [b("all")]]
+    if p.get("has_pv"):
+        rows.append([{"text": "✏️ Ціна світла з мережі", "callback_data": f"st:{sid}"}])
+    rows.append([{"text": "✏️ Ціна кВт·год від генератора", "callback_data": f"sg:{sid}"}])
+    return rows
 
 
 def save_start(tg, st, chat):
-    mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or []) and p.get("has_pv")]
+    mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
     if not mine:
-        tg.send(chat, "На ваших об'єктах сонячних панелей немає — економію рахувати нема з чого.", KEYBOARD)
-    elif len(mine) > 1:
+        return
+    if len(mine) > 1:
         tg.send(chat, "Для якого об'єкта порахувати економію?", {"inline_keyboard": [[
             {"text": str(st["stations"][k].get("title") or st["stations"][k].get("name"))[:40], "callback_data": f"sp:{k}"}] for k in mine]})
     else:
@@ -1124,77 +1133,136 @@ def save_start(tg, st, chat):
 
 def save_menu(tg, st, chat, sid):
     p = st["stations"][sid]
-    if not p.get("tariff"):
-        save_ask(tg, st, chat, sid)
+    if p.get("has_pv") and not p.get("tariff"):
+        save_ask(tg, st, chat, sid, "tariff")
         return
-    tg.send(chat, f"💰 <b>{esc(p.get('title') or p.get('name'))}</b>: ціна {p['tariff']:g} грн за кВт·год. За який період порахувати?",
-            {"inline_keyboard": save_periods(sid)})
+    prices = (f"світло з мережі {p['tariff']:g} грн, " if p.get("has_pv") else "") + f"генератор {p.get('gen_price', GEN_PRICE):g} грн за кВт·год"
+    tg.send(chat, f"💰 <b>{esc(p.get('title') or p.get('name'))}</b>: {prices}. За який період порахувати?",
+            {"inline_keyboard": save_periods(sid, p)})
 
 
-def save_ask(tg, st, chat, sid):
-    st.setdefault("await", {})[str(chat)] = {"kind": "tariff", "sid": sid, "at": now().isoformat()}
+def save_ask(tg, st, chat, sid, kind="tariff"):
+    st.setdefault("await", {})[str(chat)] = {"kind": kind, "sid": sid, "at": now().isoformat()}
     p = st["stations"][sid]
-    cur = f"Зараз записано {p['tariff']:g} грн. " if p.get("tariff") else ""
-    tg.send(chat, f"💰 <b>{esc(p.get('title') or p.get('name'))}</b>: {cur}Скільки ви платите за 1 кВт·год світла?\n"
-                  "Напишіть число в гривнях, наприклад: <b>4.32</b> (для побуту) або <b>9.8</b> (для бізнесу). Ціну видно в рахунку за світло.", KEYBOARD)
+    title = esc(p.get("title") or p.get("name"))
+    if kind == "tariff":
+        cur = f"Зараз записано {p['tariff']:g} грн. " if p.get("tariff") else ""
+        tg.send(chat, f"💰 <b>{title}</b>: {cur}Скільки ви платите за 1 кВт·год світла з мережі?\n"
+                      "Напишіть число в гривнях, наприклад: <b>4.32</b> (побут) або <b>9.8</b> (бізнес). Ціну видно в рахунку за світло.", KEYBOARD)
+    else:
+        tg.send(chat, f"💰 <b>{title}</b>: зараз рахую {p.get('gen_price', GEN_PRICE):g} грн за 1 кВт·год від генератора "
+                      "(дизель ~101 грн/л, генератор витрачає ~0,35 л на кВт·год).\n"
+                      "Якщо у вас інша ціна — напишіть число в гривнях, наприклад: <b>40</b>.", KEYBOARD)
 
 
 def save_input(tg, st, chat, text):
     """Клиент прислал цену. True - сообщение обработано."""
     w = (st.get("await") or {}).get(str(chat))
-    if not w or w.get("kind") != "tariff" or (now() - datetime.fromisoformat(w["at"])).total_seconds() > 1800:
+    if not w or w.get("kind") not in ("tariff", "gen") or (now() - datetime.fromisoformat(w["at"])).total_seconds() > 1800:
         return False
     m = re.search(r"\d+(?:[.,]\d+)?", text or "")
     val = float(m.group(0).replace(",", ".")) if m else None
-    if val is None or not 0.5 <= val <= 50:
-        tg.send(chat, "Не схоже на ціну за кВт·год. Напишіть число в гривнях, наприклад: 4.32", KEYBOARD)
+    lo, hi = (0.5, 50) if w["kind"] == "tariff" else (5, 200)
+    if val is None or not lo <= val <= hi:
+        tg.send(chat, "Не схоже на ціну за кВт·год. Напишіть число в гривнях, наприклад: " + ("4.32" if w["kind"] == "tariff" else "40"), KEYBOARD)
         return True
     st["await"].pop(str(chat), None)
     p = st["stations"][w["sid"]]
-    p["tariff"], p["tariff_at"] = val, now().isoformat()
-    tg.send(chat, f"✅ Записано: {val:g} грн за кВт·год. Змінити можна будь-коли кнопкою «{BTN_SAVE}». За який період порахувати?",
-            {"inline_keyboard": save_periods(w["sid"])})
+    if w["kind"] == "tariff":
+        p["tariff"], p["tariff_at"] = val, now().isoformat()
+        what = "світло з мережі"
+    else:
+        p["gen_price"] = val
+        what = "кВт·год від генератора"
+    tg.send(chat, f"✅ Записано: {what} — {val:g} грн. Змінити можна будь-коли кнопкою «{BTN_SAVE}». За який період порахувати?",
+            {"inline_keyboard": save_periods(w["sid"], p)})
     return True
 
 
+def period_range(per, t):
+    """Начало и конец периода (ISO-строки), для журнала отключений."""
+    if per == "w":
+        a = t - timedelta(days=7)
+    elif per == "m":
+        a = t.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif per == "pm":
+        end = t.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return (end - timedelta(days=1)).replace(day=1).isoformat(), end.isoformat()
+    elif per == "y":
+        a = t.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        a = t - timedelta(days=36500)
+    return a.isoformat(), t.isoformat()
+
+
+def backup_energy(st, sid, p, a, b):
+    """Сколько отработали от станции во время отключений: (часов, кВт·ч, отключений, с какой даты есть журнал).
+    кВт·ч - отданные АКБ за отключение (бот считает с 24.11); для более ранних - по падению заряда × ёмкость."""
+    rows = [r for r in st["log"] if r.get("sid") == sid and a <= r.get("start", "") < b]
+    cap = capacity(st, sid, p)[0]
+    hours = sum(r["min"] for r in rows) / 60
+    e = 0.0
+    for r in rows:
+        if r.get("kwh"):
+            e += r["kwh"]
+        elif cap and r.get("soc_start") is not None and r.get("soc_end") is not None:
+            e += max(0, r["soc_start"] - min(r.get("soc_min") or 100, r["soc_end"])) / 100 * cap
+    first = min((r["start"] for r in st["log"] if r.get("sid") == sid), default=None)
+    return hours, e, len(rows), first
+
+
 def save_calc(api, st, sid, per):
-    """Экономия: энергия, которую не пришлось купить из сети (потребление − покупка) × цена клиента."""
+    """Экономия по отдельности: панели (своя энергия × цена сети) и инвертор с АКБ (работа во время отключений
+    × цена того же от генератора), и вместе."""
     p = st["stations"][sid]
     t = now()
     title = esc(p.get("title") or p.get("name"))
-    if not p.get("tariff"):
-        return "Спочатку вкажіть ціну за кВт·год."
-    try:
-        if api and not api.token:
-            api.login()
-        if per == "w":
-            rows = list(pv_days(api, sid, 7).values())
-        elif per in ("m", "pm"):
-            d = t if per == "m" else t.replace(day=1) - timedelta(days=1)
-            ym = d.strftime("%Y-%m")
-            rows = [{"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue")),
-                     "feed": num(r.get("gridValue"))} for r in api.history(int(sid), 3, ym, ym)]
-        elif per == "y":
-            rows = [{"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue")),
-                     "feed": num(r.get("gridValue"))} for r in api.history(int(sid), 3, f"{t.year}-01", t.strftime("%Y-%m"))]
-        else:
-            rows = [{"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue")),
-                     "feed": num(r.get("gridValue"))} for r in api.history(int(sid), 4, "2015", str(t.year))]
-    except Exception:
-        return f"💰 <b>{title}</b>: Deye Cloud зараз не віддав дані, спробуйте за кілька хвилин."
-    use = sum(r.get("use") or 0 for r in rows)
-    buy = sum(r.get("buy") or 0 for r in rows)
-    gen = sum(r.get("gen") or 0 for r in rows)
-    feed = sum(r.get("feed") or 0 for r in rows)
-    if not use and not gen:
-        return f"💰 <b>{title}</b>: даних {SAVE_PER[per]} у Deye немає."
-    own = max(0.0, use - buy)
-    money = own * p["tariff"]
-    lines = [f"💰 <b>{title}</b> — економія {SAVE_PER[per]}",
-             f"Сонце й АКБ покрили <b>{kwh(own)} кВт·год</b> із {kwh(use)} спожитих ({own / use * 100:.0f}%)." if use else "",
-             f"При вашій ціні {p['tariff']:g} грн/кВт·год це <b>~{grn(money)} грн</b>, які не довелося платити за світло.",
-             f"Панелі виробили {kwh(gen)} кВт·год" + (f", з них {kwh(feed)} віддано в мережу." if feed else ".")]
-    return "\n".join(x for x in lines if x)
+    lines = [f"💰 <b>{title}</b> — економія {SAVE_PER[per]}"]
+    total = 0.0
+    if p.get("has_pv"):
+        if not p.get("tariff"):
+            return "Спочатку вкажіть ціну світла з мережі."
+        try:
+            if api and not api.token:
+                api.login()
+            if per == "w":
+                rows = list(pv_days(api, sid, 7).values())
+            else:
+                if per in ("m", "pm"):
+                    d = t if per == "m" else t.replace(day=1) - timedelta(days=1)
+                    args = (3, d.strftime("%Y-%m"), d.strftime("%Y-%m"))
+                elif per == "y":
+                    args = (3, f"{t.year}-01", t.strftime("%Y-%m"))
+                else:
+                    args = (4, "2015", str(t.year))
+                rows = [{"gen": num(r.get("generationValue")) or 0, "feed": num(r.get("gridValue")) or 0}
+                        for r in api.history(int(sid), args[0], args[1], args[2])]
+            gen = sum(r.get("gen") or 0 for r in rows)
+            feed = sum(r.get("feed") or 0 for r in rows)
+            used = max(0.0, gen - feed)
+            pv_money = used * p["tariff"]
+            total += pv_money
+            lines.append(f"\n☀️ <b>Сонячні панелі</b>: виробили {kwh(gen)} кВт·год, на об'єкті використано {kwh(used)}"
+                         + (f", {kwh(feed)} віддано в мережу" if feed else "") + ".\n"
+                         f"Це світло не довелося купувати: <b>~{grn(pv_money)} грн</b> (за {p['tariff']:g} грн/кВт·год).")
+        except Exception:
+            lines.append("\n☀️ Панелі: Deye Cloud зараз не віддав дані, спробуйте за кілька хвилин.")
+    a, b = period_range(per, t)
+    hours, e, n, first = backup_energy(st, sid, p, a, b)
+    gp = p.get("gen_price", GEN_PRICE)
+    since = ""
+    if first and first > a:
+        since = f" (бот веде облік з {datetime.fromisoformat(first).strftime('%d.%m.%Y')})"
+    if n:
+        inv_money = e * gp
+        total += inv_money
+        lines.append(f"\n🔋 <b>Інвертор з АКБ</b>{since}: {n} відключ., об'єкт працював без світла {dur(hours * 60)}, станція віддала ~{kwh(e)} кВт·год.\n"
+                     f"Те саме від генератора коштувало б <b>~{grn(inv_money)} грн</b> (за {gp:g} грн/кВт·год) — плюс шум, пальне і заправки.")
+    else:
+        lines.append(f"\n🔋 <b>Інвертор з АКБ</b>{since}: відключень світла за цей період не було.")
+    if p.get("has_pv") and n:
+        lines.append(f"\n<b>Разом: ~{grn(total)} грн</b>")
+    return "\n".join(lines)
 
 
 def pv_detect(api, tg, sid, p, lt, t):
@@ -1405,8 +1473,8 @@ def kb_sync(tg, st, t):
         if sent.get(chat) == h:
             continue
         if True:  # у новичков кнопки отмечаются при /start (любое сообщение с кнопками), сюда попадают те, у кого кнопки старые
-            extra = (f"\n{BTN_PV} — скільки виробили панелі: сьогодні, вчора, тиждень, місяць."
-                     f"\n{BTN_SAVE} — скільки грошей заощадила станція за обраний період.") if has_pv_chat(st, chat) else ""
+            extra = (f"\n{BTN_PV} — скільки виробили панелі: сьогодні, вчора, тиждень, місяць." if has_pv_chat(st, chat) else "") + \
+                (f"\n{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ (робота без світла), і разом.")
             tg.send(chat, f"🔄 Бот оновився — нові кнопки внизу екрана:\n{BTN_NOTIFY} — вимкнути або увімкнути графіки ДТЕК окремо по кожному об'єкту.{extra}", kb)
         sent[chat] = h
     for c in [c for c in sent if c not in chats]:
@@ -1596,7 +1664,7 @@ def commands(tg, st, dtek=None, api=None):
             c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
             if c_chat:
                 mid = (cq.get("message") or {}).get("message_id")
-                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st") and cq.get("data") != "cq:?":
+                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg") and cq.get("data") != "cq:?":
                     tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
                 callback(tg, st, c_chat, cq.get("data"), c_who, dtek, api)
             continue
