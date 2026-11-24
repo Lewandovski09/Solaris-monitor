@@ -56,7 +56,28 @@ async function fast(key, upd) {
 
 module.exports = async (req, res) => {
   const key = process.env.INBOX_KEY || "";
-  if (req.method !== "POST") return res.status(200).send("ok");
+  if (req.method !== "POST") {
+    // проверка быстрых ответов: ?probe=<первые 7 знаков последнего коммита main> - без данных клиентов, только возраст снимка
+    const q = (req.query && req.query.probe) || "";
+    if (q && process.env.GITHUB_TOKEN) {
+      const r = await gh("/commits/main", "GET");
+      const sha = r.ok ? String((await r.json()).sha).slice(0, 7) : "";
+      if (q === sha) {
+        const t0 = Date.now();
+        let info;
+        try {
+          const rr = await fetch("https://api.github.com/repos/" + REPO + "/contents/snapshot.enc?ref=snapshot", {
+            headers: { Authorization: "Bearer " + process.env.GITHUB_TOKEN, Accept: "application/vnd.github.raw", "User-Agent": "solaris-webhook" } });
+          const [iv, body] = (await rr.text()).split("\n");
+          const d = crypto.createDecipheriv("aes-256-cbc", crypto.createHash("sha256").update(key).digest(), Buffer.from(iv.trim(), "hex"));
+          const snap = JSON.parse(Buffer.concat([d.update(Buffer.from(body.trim(), "base64")), d.final()]).toString("utf8"));
+          info = "snapshot ok, age " + Math.round(Date.now() / 1000 - snap.at) + " s, chats " + Object.keys(snap.chats || {}).length;
+        } catch (e) { info = "snapshot error: " + String(e.message || e).slice(0, 80); }
+        return res.status(200).send(info + "; fetch+decrypt " + (Date.now() - t0) + " ms; telegram token " + (process.env.TELEGRAM_TOKEN ? "set" : "missing"));
+      }
+    }
+    return res.status(200).send("ok");
+  }
   if (!key || !process.env.GITHUB_TOKEN) return res.status(500).send("not configured");
   const want = crypto.createHash("sha256").update("tg:" + key).digest("hex");
   const got = String(req.headers["x-telegram-bot-api-secret-token"] || "");
