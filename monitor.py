@@ -835,7 +835,7 @@ def obj_menu(st, chat, sid):
     rows = [[b("🔌 Стан", "status"), b("🗓 Графік", "grafik")],
             [b("🔁 Черга", "queue"), b("🔕 Вимкнути графіки" if on else "🔔 Увімкнути графіки", "notify")]]
     rows.append([b("☀️ Виробіток", "pv"), b("💰 Економія", "save")] if p.get("has_pv") else [b("💰 Економія", "save")])
-    rows.append([b("⚙️ Налаштування", "set")])
+    rows.append([b("⚙️ Налаштування", "set"), b("❓ Допомога", "help")])
     return f"<b>{esc(p.get('title') or p.get('name'))}</b>: {head}. Що зробити?", {"inline_keyboard": rows}
 
 
@@ -1001,6 +1001,8 @@ def callback(tg, st, chat, data, who, dtek, api=None):
             settings_menu(tg, st, chat, c_sid)
         elif act == "menu":
             tg.send(chat, *obj_menu(st, chat, c_sid))
+        elif act == "help":
+            tg.send(chat, client_help(st, chat), KEYBOARD)
         return
     if kind in ("zs", "zg", "zr"):  # настройки клиента
         c_sid, _, arg = rest.partition(":")
