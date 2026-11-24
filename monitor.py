@@ -551,7 +551,7 @@ def deye_cap_kwh(dev, units):
     У инверторов 50 кВт два входа АКБ (BatteryRatedCapacity и Battery2RatingCapacity, в А·ч):
     А·ч × напряжение своего входа. Второй вход учитывается, только если на нём есть напряжение."""
     dev, units = dev or {}, units or {}
-    total, first, sig = 0.0, 0.0, []
+    total, first, sig, nominal = 0.0, 0.0, [], True
     for k, v in sorted(dev.items()):
         val = num(v)
         if not k or not CAP_KEY.search(k) or not val or val <= 0:
@@ -566,15 +566,38 @@ def deye_cap_kwh(dev, units):
         elif u == "ah":
             names = ("BatteryVoltage2", "BMS2Voltage") if second else ("BatteryVoltage", "BMSVoltage")
             volt = next((num(dev[n]) for n in names if (num(dev.get(n)) or 0) > 10), None)
-            if volt is None and not second:
-                volt = 51.2
             if volt:
-                kwh = val * volt / 1000
+                cv = next((num(dev[n]) for n in (("BMS2ChargeVoltag", "BMS2ChargeVoltage") if second else ("BMSChargeVoltage",))
+                           if (num(dev.get(n)) or 0) > 10), None)
+                nom = nominal_volt(cv, volt)
+                kwh = val * (nom or volt) / 1000
+                nominal = nominal and bool(nom)
+            elif not second:
+                kwh, nominal = val * 51.2 / 1000, False
         if kwh:
             total += kwh
             first += 0 if second else kwh
             sig.append(f"{k}={val:g}")
-    return (total, first or total, ",".join(sig)) if total else (None, None, "")
+    return (total, first or total, ",".join(sig), nominal) if total else (None, None, "", False)
+
+
+def nominal_volt(charge_v, now_v):
+    """Номинальное напряжение литий-железо-фосфатной АКБ: число ячеек × 3,2 В.
+    Число ячеек - кратное 15 или 16 (модули 48 В и 51,2 В), при котором напряжение заряда из BMS
+    ровно ложится на типовую настройку 3,45-3,65 В на ячейку, а текущее напряжение - 2,9-3,5 В на ячейку.
+    Пример: Dynamica 700,8 В заряда, 622 В сейчас -> 192 ячейки -> 614,4 В. Не нашлось - None."""
+    if not charge_v or not now_v:
+        return None
+    best = None
+    for n in range(15, 401):
+        if n % 15 and n % 16:
+            continue
+        if not 2.9 <= now_v / n <= 3.5:
+            continue
+        dev = min(abs(charge_v / n - x) for x in (3.45, 3.5, 3.55, 3.6, 3.65))
+        if dev <= 0.006 and (best is None or dev < best[0]):
+            best = (dev, n)
+    return best[1] * 3.2 if best else None
 
 
 def learned_cap(st, sid):
@@ -1784,11 +1807,11 @@ def check(api, tg, st, dtek):
         for sn in sns.get(sid, []):
             dev.update(devdata.get(sn) or {})
             units.update(api.units.get(sn) or {})
-        if p.get("cap_v") != 2:  # однократно: сбросить ёмкость, принятую до защиты от скачков (Dynamica: сбой 100 А·ч вместо 300)
+        if p.get("cap_v") != 3:  # однократно при смене способа расчёта  # однократно: сбросить ёмкость, принятую до защиты от скачков (Dynamica: сбой 100 А·ч вместо 300)
             for k in ("cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected"):
                 p.pop(k, None)
-            p["cap_v"] = 2
-        cap_d, cap_1, cap_sig = deye_cap_kwh(dev, units)
+            p["cap_v"] = 3
+        cap_d, cap_1, cap_sig, cap_nom = deye_cap_kwh(dev, units)
         soc_now = num(lt.get("batterySOC"))
         # кВт·ч = А·ч × напряжение, а напряжение гуляет с зарядом (у полной АКБ выше номинала, у пустой ниже).
         # Поэтому пересчитываем только при заряде 40-60% (напряжение около номинального)
@@ -1812,7 +1835,9 @@ def check(api, tg, st, dtek):
         else:
             for k in ("cap_sig_new", "cap_sig_n", "cap_rejected"):
                 p.pop(k, None)
-        if cap_d and (not p.get("cap_deye") or changed or (soc_now is not None and 40 <= soc_now <= 60 and p.get("cap_sig") == cap_sig)):
+        # По номинальному напряжению цифра от заряда не зависит - обновляем сразу; иначе только при заряде 40-60%.
+        steady = p.get("cap_sig") == cap_sig and (cap_nom or (soc_now is not None and 40 <= soc_now <= 60))
+        if cap_d and (not p.get("cap_deye") or changed or steady):
             if changed:
                 tg.staff_msg(f"ℹ️ <b>{esc(name)}</b>: в инверторе изменилась ёмкость АКБ: было ~{p['cap_deye']:.0f} кВт·ч, стало ~{cap_d:.0f} кВт·ч "
                              f"(<code>{esc(p['cap_sig'])}</code> → <code>{esc(cap_sig)}</code>). "
