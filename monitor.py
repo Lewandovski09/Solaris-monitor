@@ -141,6 +141,13 @@ class Telegram:
             if markup:
                 body["reply_markup"] = markup
             r = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json=body, timeout=20)
+            if r.status_code == 429 or r.status_code >= 500:  # Telegram просит подождать или сбоит - одна повторная попытка
+                try:
+                    wait = int(((r.json() or {}).get("parameters") or {}).get("retry_after", 2))
+                except Exception:
+                    wait = 2
+                time.sleep(min(max(wait, 1), 10))
+                r = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json=body, timeout=20)
             try:
                 self.last_id = r.json().get("result", {}).get("message_id")
             except Exception:
@@ -764,6 +771,8 @@ HELP = ("📋 <b>Команды бота</b>\n"
         "<b>Отключить клиента</b>\n"
         "<code>/reset пбс</code> — отключает всех клиентов станции и выдаёт новую ссылку. Старая перестаёт работать.\n\n"
 
+        "<b>Состояние самого бота</b>\n"
+        "<code>/health</code> — когда была последняя проверка, отвечают ли Deye и ДТЭК, были ли ошибки программы.\n\n"
         "<b>Эта памятка</b>\n"
         "<code>/help</code>\n\n"
         "В группу бот сам пишет только то, что требует действий: ошибки инвертора и АКБ, что стоит поменять в настройках или предложить клиенту, и кто из клиентов подключился. Про свет и графики он пишет клиентам.")
@@ -789,6 +798,7 @@ STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
                   ("contact", "Контакт техподдержки для клиентов"),
                   ("reset", "Отключить клиентов станции"),
                   ("links", "Все ссылки"),
+                  ("health", "Состояние монитора: проверки, Deye, ДТЭК, ошибки"),
                   ("help", "Памятка")]
 
 
@@ -1275,6 +1285,8 @@ def staff_command(tg, st, cmd, arg):
                      + (f"\nграфики отключили клиенты: {len(p['nosched'])}" if p.get("nosched") else "") +
                      f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}"
                      f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}")
+    elif cmd == "/health":
+        tg.staff_msg(health(st))
     elif cmd == "/akb":
         m = re.match(r"(.+?)\s+(\d+(?:[.,]\d+)?)\s*(квт.*|kwh)?\s*$", arg, re.I)
         sid, err = find_station(st, m.group(1) if m else arg)
@@ -1757,22 +1769,70 @@ def write_fields(st, fields):
         open(STATE + ".commit", "w").close()
 
 
+def err_report(tg, st, where, e):
+    """Ошибка в программе: в группу не чаще раза в 6 часов на одну и ту же ошибку, остальное продолжает работать.
+    В журнал GitHub (он открытый) - только тип ошибки и строка, без названий станций."""
+    import traceback
+    tb = [fr for fr in traceback.extract_tb(e.__traceback__) if fr.filename.endswith("monitor.py")]
+    line = tb[-1].lineno if tb else 0
+    key = f"{type(e).__name__}:{line}"
+    print("ОШИБКА:", key)
+    st["last_err"] = {"at": now().isoformat(), "key": key, "where": where}
+    sent = st.setdefault("err_sent", {})
+    if sent.get(key) and (now() - datetime.fromisoformat(sent[key])).total_seconds() < 6 * 3600:
+        return
+    sent[key] = now().isoformat()
+    tg.staff_msg(f"🐞 <b>Ошибка в программе</b> ({esc(where)}): {esc(type(e).__name__)}, monitor.py строка {line}.\n"
+                 "Остальное продолжает работать. Перешлите это сообщение Claude — исправит.")
+
+
+def health(st):
+    """Состояние самого монитора: для /health."""
+    t = now()
+    la = st.get("last_check_at")
+    ago = f"{(t - datetime.fromisoformat(la)).total_seconds() / 60:.0f} мин назад" if la else "ещё не было"
+    P = list(st["stations"].values())
+    err = st.get("last_err")
+    lines = ["🩺 <b>Состояние монитора</b>",
+             f"Последняя проверка: {ago} (должна быть каждые 2–5 мин)",
+             f"Deye Cloud: {'не отвечает ' + str(st.get('api_fail')) + ' проверок подряд' if st.get('api_fail') else 'отвечает'}"
+             + (f" · данные инверторов не приходят {st['dev_fail']} проверок" if st.get("dev_fail") else ""),
+             f"Графики ДТЭК: {'не загружаются с ' + since_hm(datetime.fromisoformat(st['dtek']['fail_since'])) if st['dtek'].get('fail_since') else 'загружаются'}",
+             f"Станций: {len(P)} · не на связи: {len([p for p in P if p.get('offline')])} · пропали из ответа Deye: {len([p for p in P if p.get('miss_n', 0) >= 3])}",
+             "Последняя ошибка программы: " + (f"{esc(err['key'])} ({esc(err['where'])}), {since_hm(datetime.fromisoformat(err['at']))}" if err else "не было")]
+    return "\n".join(lines)
+
+
 def check(api, tg, st, dtek):
     cfgs = station_cfg()
     low_soc = float(env("LOW_SOC", "40"))
     stale = float(env("STALE_MIN", "40"))
     stable_min = float(env("STABLE_MIN", "15"))
     t = now()
+    # Проверки не шли больше 15 минут (таймер, GitHub, токен) - сообщить: за это время могли пропустить отключения.
+    la = st.get("last_check_at")
+    if la and (t - datetime.fromisoformat(la)).total_seconds() > 15 * 60:
+        gap = (t - datetime.fromisoformat(la)).total_seconds() / 60
+        tg.staff_msg(f"⏸ <b>Проверки не шли {dur_ru(gap)}</b>: с {since_hm(datetime.fromisoformat(la))} до ~{hm(t)}. Сейчас снова идут.\n"
+                     "За это время сообщения о свете клиентам не уходили. Возможные причины: остановился таймер cron-job.org, "
+                     "сбой GitHub Actions, истёк токен GitHub. Если повторяется — проверьте историю задания на cron-job.org и GitHub → Actions.")
     last_al = st.get("alerts_at")
     do_alerts = not last_al or (t - datetime.fromisoformat(last_al)).total_seconds() > 540
     try:
         api.login()
         stations = api.stations_with_devices()
+        if st.get("api_fail", 0) >= 3:
+            tg.staff_msg(f"✅ <b>Deye Cloud снова отвечает</b> (не отвечал {st['api_fail']} проверок подряд"
+                         + (f", с {since_hm(datetime.fromisoformat(st['api_fail_since']))}" if st.get("api_fail_since") else "") + ").")
         st["api_fail"] = 0
+        st.pop("api_fail_since", None)
     except Exception as e:
         st["api_fail"] = st.get("api_fail", 0) + 1
+        st.setdefault("api_fail_since", t.isoformat())
         if st["api_fail"] == 3:
-            tg.staff_msg("⚠️ <b>Deye Cloud не отвечает</b> уже 3 проверки подряд. Станции временно не проверяются.")
+            tg.staff_msg("⚠️ <b>Deye Cloud не отвечает</b> уже 3 проверки подряд. Станции временно не проверяются: "
+                         "сообщения о свете клиентам сейчас не уходят.\nЧто проверить: сайт Deye Cloud открывается? Не меняли пароль аккаунта "
+                         "(тогда обновить секрет DEYE_PASSWORD в GitHub)? Когда Deye ответит, бот напишет сюда.")
         print("Deye Cloud: ошибка,", type(e).__name__)
         return 0
 
@@ -1788,227 +1848,269 @@ def check(api, tg, st, dtek):
             devdata = api.device_latest(flat)
     except Exception:
         devdata = {}
+    if sns and not devdata:
+        st["dev_fail"] = st.get("dev_fail", 0) + 1
+        if st["dev_fail"] == 5:
+            tg.staff_msg("⚠️ Deye 5 проверок подряд не отдаёт данные инверторов (напряжение сети, АКБ). Свет определяется по мощности из сети — "
+                         "это медленнее и менее точно. Обычно это сбой Deye и проходит сам; бот напишет, когда данные вернутся.")
+    else:
+        if st.get("dev_fail", 0) >= 5:
+            tg.staff_msg("✅ Данные инверторов из Deye снова приходят.")
+        st.pop("dev_fail", None)
+    # Станция пропала из ответа Deye (сбой API или её удалили/перенесли в другой аккаунт)
+    seen_ids = {str(s.get("id") or s.get("stationId")) for s in stations}
+    for k, pp in st["stations"].items():
+        if k in seen_ids:
+            if pp.get("miss_n", 0) >= 3:
+                tg.staff_msg(f"✅ <b>{esc(pp.get('name'))}</b> снова есть в Deye.")
+            pp.pop("miss_n", None)
+        elif pp.get("last") or pp.get("clients"):
+            pp["miss_n"] = pp.get("miss_n", 0) + 1
+            if pp["miss_n"] == 3:
+                tg.staff_msg(f"⚠️ <b>{esc(pp.get('name'))}</b> 3 проверки подряд нет в списке станций Deye. Клиенты этой станции сейчас ничего не получают.\n"
+                             "Что проверить: станция есть в аккаунте Deye Cloud? Её не удалили и не перенесли в другой аккаунт?")
 
     fields = []
     for s in stations:
-        sid = str(s.get("id") or s.get("stationId"))
-        name = s.get("name") or s.get("stationName") or sid
-        p = st["stations"].setdefault(sid, {})
-        p["name"] = name
-        p.setdefault("code", secrets.token_urlsafe(9))
-        cfg = setup(st, cfgs, sid)
-        title, chat, q = esc(cfg["title"]), cfg["chats"], cfg["queue"]
-        q = eff_key(dtek, sid, p, q)  # две линии: общий график по схеме подключения
         try:
-            lt = api.latest(int(sid))
-        except Exception:
-            lt = {}
-        dev, units = {}, {}
-        for sn in sns.get(sid, []):
-            dev.update(devdata.get(sn) or {})
-            units.update(api.units.get(sn) or {})
-        if p.get("cap_v") != 3:  # однократно при смене способа расчёта  # однократно: сбросить ёмкость, принятую до защиты от скачков (Dynamica: сбой 100 А·ч вместо 300)
-            for k in ("cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected"):
-                p.pop(k, None)
-            p["cap_v"] = 3
-        cap_d, cap_1, cap_sig, cap_nom = deye_cap_kwh(dev, units)
-        soc_now = num(lt.get("batterySOC"))
-        # кВт·ч = А·ч × напряжение, а напряжение гуляет с зарядом (у полной АКБ выше номинала, у пустой ниже).
-        # Поэтому пересчитываем только при заряде 40-60% (напряжение около номинального)
-        # или если в инверторе поменяли А·ч (добавили модули, поправили настройку).
-        # Смена А·ч в Deye: принимаем, только если новое значение держится 5 проверок подряд (~10 мин) -
-        # Deye иногда отдаёт неполные данные. Резкий скачок (меньше 70% или больше 150% прежней) сам не принимаем:
-        # пишем в группу и считаем по прежней, пока не подтвердит факт отключений или /akb.
-        changed = bool(cap_d and p.get("cap_sig") and p.get("cap_deye")) and p["cap_sig"] != cap_sig
-        if changed:
-            p["cap_sig_n"] = p.get("cap_sig_n", 0) + 1 if p.get("cap_sig_new") == cap_sig else 1
-            p["cap_sig_new"] = cap_sig
-            jump = not 0.7 <= cap_d / p["cap_deye"] <= 1.5
-            if p["cap_sig_n"] >= 5 and jump and p.get("cap_rejected") != cap_sig:
-                p["cap_rejected"] = cap_sig
-                tg.staff_msg(f"⚠️ <b>{esc(name)}</b>: Deye вдруг показывает ёмкость АКБ ~{cap_d:.0f} кВт·ч вместо ~{p['cap_deye']:.0f}.\n"
-                             f"Данные инвертора: было <code>{esc(p['cap_sig'])}</code>, стало <code>{esc(cap_sig)}</code> (А·ч).\n"
-                             f"Прогнозы клиенту считаю по прежней ~{p['cap_deye']:.0f} кВт·ч. Если ёмкость правда изменилась (сняли модули) — "
-                             f"<code>/akb {esc(name)} {cap_d:.0f}</code>. Если нет — ничего делать не нужно, бот сверит с фактом отключений.")
-            if p["cap_sig_n"] < 5 or jump:
-                cap_d = None
-        else:
-            for k in ("cap_sig_new", "cap_sig_n", "cap_rejected"):
-                p.pop(k, None)
-        # По номинальному напряжению цифра от заряда не зависит - обновляем сразу; иначе только при заряде 40-60%.
-        steady = p.get("cap_sig") == cap_sig and (cap_nom or (soc_now is not None and 40 <= soc_now <= 60))
-        if cap_d and (not p.get("cap_deye") or changed or steady):
-            if changed:
-                tg.staff_msg(f"ℹ️ <b>{esc(name)}</b>: в инверторе изменилась ёмкость АКБ: было ~{p['cap_deye']:.0f} кВт·ч, стало ~{cap_d:.0f} кВт·ч "
-                             f"(<code>{esc(p['cap_sig'])}</code> → <code>{esc(cap_sig)}</code>). "
-                             "Если добавляли или меняли модули — всё верно, прогнозы уже считаются по новой.")
-            p["cap_deye"], p["cap_deye1"], p["cap_sig"] = round(cap_d, 1), round(cap_1, 1), cap_sig
-        # Для настройки кода: какие поля отдаёт Deye. Только названия и единицы - без значений и названий станций.
-        fields.append({"inverters": len(sns.get(sid, [])),
-                       "device_types": sorted({str(d.get("deviceType")) for d in s.get("deviceListItems") or []}),
-                       "station_latest": sorted(k for k in lt if k not in ("requestId", "code", "msg", "success")),
-                       "inverter_fields": {k: (units.get(k) or "") for k in sorted(dev) if k},
-                       "capacity_found": bool(cap_d), "queues": len(queues(p))})
-        status = str(s.get("connectionStatus") or "").upper()
-        upd = num(lt.get("lastUpdateTime") or s.get("lastUpdateTime"))
-        age = None
-        if upd:
-            age = (time.time() - (upd / 1000 if upd > 1e11 else upd)) / 60
-        soc = num(lt.get("batterySOC"))
-        load = num(lt.get("consumptionPower")) or 0
-
-        offline = bool((status and status not in OK_STATUS) or (age is not None and age > stale))
-        if offline:
-            # Почему пропала связь: смотрим, что было перед этим, и отвечает ли логгер.
-            devs = s.get("deviceListItems") or []
-            st_of = lambda kind: [str(d.get("connectStatus", d.get("connectionStatus", ""))).upper() for d in devs
-                                  if str(d.get("deviceType", "")).upper() == kind]
-            on = ("1", "NORMAL", "ONLINE")
-            logger_ok = any(x in on for x in st_of("COLLECTOR"))
-            inv_bad = any(x and x not in on for x in st_of("INVERTER"))
-            last = p.get("last_soc")
-            if logger_ok and inv_bad:
-                cause = "inverter"
-            elif p.get("no_grid") and last is not None and last < max(low_soc, 30):
-                cause = "battery"
-            else:
-                cause = "wifi"
-            gone = f"немає даних {age:.0f} хв" if age and age > stale else "логер не відповідає"
-            gone_ru = f"нет данных {age:.0f} мин" if age and age > stale else "логгер не отвечает"
-            if not p.get("offline"):
-                p["off_cause"], p["offline_since"] = cause, t.isoformat()
-                if cause == "wifi":
-                    was = ("перед цим на об'єкті не було світла, але заряд АКБ був достатній"
-                           + (f" ({last:.0f}%)" if last is not None else "") if p.get("no_grid")
-                           else "перед цим станція працювала нормально, мережа була")
-                    tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({gone}).\n"
-                                     f"Схоже, причина — <b>інтернет або Wi-Fi</b>: {was}.\n"
-                                     "Сама станція, найімовірніше, працює — ми просто перестали її бачити.\n\n"
-                                     "Що перевірити:\n"
-                                     "1. Чи працює інтернет на об'єкті.\n"
-                                     "2. Чи увімкнений роутер. Коли вимикають світло, роутер має живитися від станції.\n"
-                                     "3. Чи не змінювали пароль або назву Wi-Fi, чи не міняли роутер.\n"
-                                     "4. Логер — маленький модуль з антеною знизу інвертора. Вийміть його на 10 секунд і вставте назад.\n\n"
-                                     "Якщо світло в приміщенні є — хвилюватися не варто. Не допомогло — напишіть у технічну підтримку." + support(st))
-                elif cause == "battery":
-                    tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({gone}).\n"
-                                     f"Схоже, причина <b>не у Wi-Fi</b>: перед цим на об'єкті не було світла, а заряд АКБ був лише {last:.0f}%.\n"
-                                     "Імовірно, батарея розрядилася і станція вимкнулась. Вона увімкнеться сама, коли з'явиться мережа.\n"
-                                     "Якщо світло вже дали, а станція не запрацювала — напишіть у технічну підтримку." + support(st))
-                else:
-                    tg.clients(chat, f"🔴 <b>{title}</b>: інвертор не відповідає ({gone}).\n"
-                                     "Причина <b>не у Wi-Fi</b>: логер на зв'язку, інтернет працює, а даних від інвертора немає.\n"
-                                     "Перевірте, чи увімкнений інвертор і чи немає помилки на його екрані, та напишіть у технічну підтримку." + support(st))
-                    tg.staff_msg(f"🔴 <b>{title}</b>: инвертор не отвечает ({gone_ru}), при этом логгер на связи — это не Wi-Fi. Свяжитесь с клиентом."
-                                 "\n\n<b>Как определено:</b> Deye Cloud показывает логгер «на связи», а инвертор «не на связи». Значит интернет на объекте есть, а данные не отдаёт сам инвертор: выключен, в аварии или потеряна связь логгера с ним.")
-                p["off_staff"] = cause == "inverter"  # Wi-Fi и севший АКБ - только клиенту
-                if tg.quiet():
-                    p["night_off"] = True  # ночью не будим: если к 7:00 связь не вернётся, скажем в утренней сводке
-            elif not p.get("off_staff") and p.get("offline_since") and \
-                    (t - datetime.fromisoformat(p["offline_since"])).total_seconds() > 24 * 3600:
-                p["off_staff"] = True
-                tg.staff_msg(f"🔴 <b>{title}</b>: станция не на связи уже больше суток. " + ("Перед этим сел АКБ, и станция сама не включилась." if p.get("off_cause") == "battery" else "Сначала это было похоже на интернет / Wi-Fi, но клиент, видимо, не починил.") + " Стоит позвонить."
-                              f"\n\n<b>Как определено:</b> последние данные от станции были {datetime.fromisoformat(p['offline_since']).strftime('%d.%m около %H:%M')}"
-                              + (f", последний известный заряд АКБ {p['last_soc']:.0f}%" if p.get("last_soc") is not None else "")
-                              + (", сети в тот момент не было." if p.get("no_grid") else ", сеть в тот момент была."))
-        if p.get("offline") and not offline:
-            if not p.pop("night_off", None):
-                tg.clients(chat, f"🟢 <b>{title}</b>: станція знову на зв'язку.")
-            if p.get("off_staff"):
-                tg.staff_msg(f"🟢 <b>{title}</b>: снова на связи.")
-            for k in ("off_cause", "offline_since", "off_staff"):
-                p.pop(k, None)
-        p["offline"] = offline
-        if offline:
-            continue  # пока нет связи, про сеть и АКБ ничего утверждать нельзя
-        if soc is not None:
-            p["last_soc"] = soc
-        p.pop("last", None)
-        apply_latest(p, lt, t)
-        dkw = p["last"].get("dkw")
-
-        no_grid, how = grid_state(lt, dev)
-        p["how"] = how
-        if no_grid is True:
-            p["off_n"] = p.get("off_n", 0) + 1
-            need = 1 if how == "voltage" else 2  # по мощности - только после 2 проверок подряд
-            if p.get("no_grid") and p.get("on_since"):
-                # свет дали и снова забрали - это то же отключение, отдельно не пишем
-                p.pop("on_since", None)
-                p["flaps"] = p.get("flaps", 0) + 1
-            if not p.get("no_grid") and p["off_n"] >= need:
-                p["no_grid"] = True
-                p["off_since"] = t.isoformat()
-                p["off_soc"] = soc
-                p["off_kwh"], p["off_t"] = 0.0, t.isoformat()
-                p["off_snap"] = snapshot(dtek, t)  # график всех очередей на момент отключения
-                p["off_emerg"] = bool(st["dtek"].get("emerg"))
-                plan = planned_now(dtek, q, t)
-                p["off_planned"] = plan
-                if plan is True:
-                    kind = "за графіком ДТЕК"
-                elif plan is False:
-                    kind = "⚡ <b>поза графіком</b> — схоже на екстрене або аварійне відключення"
-                else:
-                    kind = "чергу ДТЕК для об'єкта не вказано" if not q else "графік ДТЕК зараз недоступний"
-                bat = f"\nАКБ {soc:.0f}%, навантаження {load / 1000:.1f} кВт." if soc is not None else f"\nНавантаження {load / 1000:.1f} кВт."
-                until = planned_end(dtek, q, t) if plan is True else None
-                p["off_until"] = until.isoformat() if until else None
-                fore = forecast_line(st, sid, soc, t, until, p, dkw)
-                tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{fore}\nОб'єкт працює від станції.", urgent=True)
-        elif no_grid is False:
-            p["off_n"] = 0
-            if p.get("no_grid"):
-                # Пишем «увімкнули» один раз, когда сеть держится стабильно, а не на каждое моргание.
-                p.setdefault("on_since", t.isoformat())
-                back = datetime.fromisoformat(p["on_since"])
-                if (t - back).total_seconds() / 60 >= stable_min:
-                    start = datetime.fromisoformat(p["off_since"])
-                    mins = (back - start).total_seconds() / 60
-                    st["log"].append({"sid": sid, "name": name, "start": p["off_since"], "end": p["on_since"],
-                                      "min": round(mins), "planned": p.get("off_planned"), "flaps": p.get("flaps", 0),
-                                      "soc_start": p.get("off_soc"), "soc_end": p.get("on_soc", soc),
-                                      "kwh": round(p["off_kwh"], 1) if p.get("off_kwh") else None,
-                                      "emerg": bool(p.get("off_emerg")),
-                                      "m": sorted(k for k, ok in matches(p.get("off_snap"), start, back,
-                                                  pairs=[tuple(queues(p))] if len(queues(p)) == 2 else ()).items() if ok)
-                                           if p.get("off_snap") else None})
-                    bat = ""
-                    if p.get("on_soc", soc) is not None and p.get("off_soc") is not None:
-                        bat = f"\nАКБ: було {p['off_soc']:.0f}%, найменше {min(p.get('min_soc', 100), p.get('on_soc', soc)):.0f}%, зараз {soc:.0f}%." if soc is not None else ""
-                    fl = f"\nЗа цей час світло з'являлось і знову зникало: {p['flaps']} раз(и)." if p.get("flaps") else ""
-                    tg.clients(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(back)}, мережа стабільна.\nБез мережі: {dur(mins)}.{fl}{bat}", urgent=True)
-                    for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until", "off_kwh", "off_t", "off_snap", "off_emerg"):
-                        p.pop(k, None)
-                elif "on_soc" not in p and soc is not None:
-                    p["on_soc"] = soc
-        if p.get("no_grid") and soc is not None:
-            p["min_soc"] = min(p.get("min_soc", 100), soc)
-        # Сколько кВт·ч отдала АКБ за отключение: по ним бот сам узнаёт фактическую ёмкость.
-        if no_grid is True and p.get("no_grid") and p.get("off_t") and dkw is not None:
-            dt = (t - datetime.fromisoformat(p["off_t"])).total_seconds() / 3600
-            if 0 < dt < 0.5:  # большой разрыв (не было связи) не считаем
-                p["off_kwh"] = p.get("off_kwh", 0) + dkw * dt
-            p["off_t"] = t.isoformat()
-        if p.get("no_grid") and st["dtek"].get("emerg"):
-            p["off_emerg"] = True  # во время отключения ДТЭК объявил экстренные - для проверки очереди не считаем
-        cap_warn(tg, st, sid, p, t)
-        queue_review(tg, st, sid, p, t)
-
-        low = soc is not None and soc < low_soc
-        if low and not p.get("low_soc") and p.get("no_grid") and not p.get("on_since"):
-            tg.clients(chat, f"🔋 <b>{title}</b>: заряд АКБ {soc:.0f}%, світла досі немає.\nВарто вимкнути потужні прилади (бойлер, кондиціонер, плиту), щоб вистачило довше.")
-        p["low_soc"] = bool(low)
-
-        # ---- дальше только то, что нужно сотрудникам: неисправности и рекомендации
-        problems(tg, st, p, title, dev, soc, load, low_soc, t, no_grid)
-        if do_alerts:
+            sid = str(s.get("id") or s.get("stationId"))
+            name = s.get("name") or s.get("stationName") or sid
+            p = st["stations"].setdefault(sid, {})
+            p["name"] = name
+            p.setdefault("code", secrets.token_urlsafe(9))
+            cfg = setup(st, cfgs, sid)
+            title, chat, q = esc(cfg["title"]), cfg["chats"], cfg["queue"]
+            q = eff_key(dtek, sid, p, q)  # две линии: общий график по схеме подключения
             try:
-                device_alerts(tg, p, title, api.alerts(int(sid), time.time() - 86400, time.time() + 600), t)
+                lt = api.latest(int(sid))
             except Exception:
-                pass
-        advice(tg, st, sid, p, title, dev, load, t)
-        pv_strings(tg, p, title, dev, t)
+                lt = {}
+            dev, units = {}, {}
+            for sn in sns.get(sid, []):
+                dev.update(devdata.get(sn) or {})
+                units.update(api.units.get(sn) or {})
+            if p.get("cap_v") != 3:  # однократно при смене способа расчёта  # однократно: сбросить ёмкость, принятую до защиты от скачков (Dynamica: сбой 100 А·ч вместо 300)
+                for k in ("cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected"):
+                    p.pop(k, None)
+                p["cap_v"] = 3
+            cap_d, cap_1, cap_sig, cap_nom = deye_cap_kwh(dev, units)
+            soc_now = num(lt.get("batterySOC"))
+            # кВт·ч = А·ч × напряжение, а напряжение гуляет с зарядом (у полной АКБ выше номинала, у пустой ниже).
+            # Поэтому пересчитываем только при заряде 40-60% (напряжение около номинального)
+            # или если в инверторе поменяли А·ч (добавили модули, поправили настройку).
+            # Смена А·ч в Deye: принимаем, только если новое значение держится 5 проверок подряд (~10 мин) -
+            # Deye иногда отдаёт неполные данные. Резкий скачок (меньше 70% или больше 150% прежней) сам не принимаем:
+            # пишем в группу и считаем по прежней, пока не подтвердит факт отключений или /akb.
+            changed = bool(cap_d and p.get("cap_sig") and p.get("cap_deye")) and p["cap_sig"] != cap_sig
+            if changed:
+                p["cap_sig_n"] = p.get("cap_sig_n", 0) + 1 if p.get("cap_sig_new") == cap_sig else 1
+                p["cap_sig_new"] = cap_sig
+                jump = not 0.7 <= cap_d / p["cap_deye"] <= 1.5
+                if p["cap_sig_n"] >= 5 and jump and p.get("cap_rejected") != cap_sig:
+                    p["cap_rejected"] = cap_sig
+                    tg.staff_msg(f"⚠️ <b>{esc(name)}</b>: Deye вдруг показывает ёмкость АКБ ~{cap_d:.0f} кВт·ч вместо ~{p['cap_deye']:.0f}.\n"
+                                 f"Данные инвертора: было <code>{esc(p['cap_sig'])}</code>, стало <code>{esc(cap_sig)}</code> (А·ч).\n"
+                                 f"Прогнозы клиенту считаю по прежней ~{p['cap_deye']:.0f} кВт·ч. Если ёмкость правда изменилась (сняли модули) — "
+                                 f"<code>/akb {esc(name)} {cap_d:.0f}</code>. Если нет — ничего делать не нужно, бот сверит с фактом отключений.")
+                if p["cap_sig_n"] < 5 or jump:
+                    cap_d = None
+            else:
+                for k in ("cap_sig_new", "cap_sig_n", "cap_rejected"):
+                    p.pop(k, None)
+            # По номинальному напряжению цифра от заряда не зависит - обновляем сразу; иначе только при заряде 40-60%.
+            steady = p.get("cap_sig") == cap_sig and (cap_nom or (soc_now is not None and 40 <= soc_now <= 60))
+            if cap_d and (not p.get("cap_deye") or changed or steady):
+                if changed:
+                    tg.staff_msg(f"ℹ️ <b>{esc(name)}</b>: в инверторе изменилась ёмкость АКБ: было ~{p['cap_deye']:.0f} кВт·ч, стало ~{cap_d:.0f} кВт·ч "
+                                 f"(<code>{esc(p['cap_sig'])}</code> → <code>{esc(cap_sig)}</code>). "
+                                 "Если добавляли или меняли модули — всё верно, прогнозы уже считаются по новой.")
+                p["cap_deye"], p["cap_deye1"], p["cap_sig"] = round(cap_d, 1), round(cap_1, 1), cap_sig
+            # Для настройки кода: какие поля отдаёт Deye. Только названия и единицы - без значений и названий станций.
+            fields.append({"inverters": len(sns.get(sid, [])),
+                           "device_types": sorted({str(d.get("deviceType")) for d in s.get("deviceListItems") or []}),
+                           "station_latest": sorted(k for k in lt if k not in ("requestId", "code", "msg", "success")),
+                           "inverter_fields": {k: (units.get(k) or "") for k in sorted(dev) if k},
+                           "capacity_found": bool(cap_d), "queues": len(queues(p))})
+            status = str(s.get("connectionStatus") or "").upper()
+            upd = num(lt.get("lastUpdateTime") or s.get("lastUpdateTime"))
+            age = None
+            if upd:
+                age = (time.time() - (upd / 1000 if upd > 1e11 else upd)) / 60
+            soc = num(lt.get("batterySOC"))
+            # Скачок заряда больше чем на 25% за полчаса - похоже на сбой данных. Держим прежний,
+            # пока следующая проверка не покажет то же самое (тогда это правда).
+            prev, prev_t = p.get("last_soc"), p.get("last_soc_t")
+            if (soc is not None and prev is not None and prev_t and abs(soc - prev) > 25
+                    and (t - datetime.fromisoformat(prev_t)).total_seconds() < 1800):
+                if p.get("soc_sus") is not None and abs(p["soc_sus"] - soc) <= 5:
+                    p.pop("soc_sus", None)  # подтвердилось
+                else:
+                    p["soc_sus"] = soc
+                    soc = prev
+                    lt = dict(lt, batterySOC=prev)
+            else:
+                p.pop("soc_sus", None)
+            load = num(lt.get("consumptionPower")) or 0
+
+            offline = bool((status and status not in OK_STATUS) or (age is not None and age > stale))
+            if offline:
+                # Почему пропала связь: смотрим, что было перед этим, и отвечает ли логгер.
+                devs = s.get("deviceListItems") or []
+                st_of = lambda kind: [str(d.get("connectStatus", d.get("connectionStatus", ""))).upper() for d in devs
+                                      if str(d.get("deviceType", "")).upper() == kind]
+                on = ("1", "NORMAL", "ONLINE")
+                logger_ok = any(x in on for x in st_of("COLLECTOR"))
+                inv_bad = any(x and x not in on for x in st_of("INVERTER"))
+                last = p.get("last_soc")
+                if logger_ok and inv_bad:
+                    cause = "inverter"
+                elif p.get("no_grid") and last is not None and last < max(low_soc, 30):
+                    cause = "battery"
+                else:
+                    cause = "wifi"
+                gone = f"немає даних {age:.0f} хв" if age and age > stale else "логер не відповідає"
+                gone_ru = f"нет данных {age:.0f} мин" if age and age > stale else "логгер не отвечает"
+                if not p.get("offline"):
+                    p["off_cause"], p["offline_since"] = cause, t.isoformat()
+                    if cause == "wifi":
+                        was = ("перед цим на об'єкті не було світла, але заряд АКБ був достатній"
+                               + (f" ({last:.0f}%)" if last is not None else "") if p.get("no_grid")
+                               else "перед цим станція працювала нормально, мережа була")
+                        tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({gone}).\n"
+                                         f"Схоже, причина — <b>інтернет або Wi-Fi</b>: {was}.\n"
+                                         "Сама станція, найімовірніше, працює — ми просто перестали її бачити.\n\n"
+                                         "Що перевірити:\n"
+                                         "1. Чи працює інтернет на об'єкті.\n"
+                                         "2. Чи увімкнений роутер. Коли вимикають світло, роутер має живитися від станції.\n"
+                                         "3. Чи не змінювали пароль або назву Wi-Fi, чи не міняли роутер.\n"
+                                         "4. Логер — маленький модуль з антеною знизу інвертора. Вийміть його на 10 секунд і вставте назад.\n\n"
+                                         "Якщо світло в приміщенні є — хвилюватися не варто. Не допомогло — напишіть у технічну підтримку." + support(st))
+                    elif cause == "battery":
+                        tg.clients(chat, f"🔴 <b>{title}</b>: станція не на зв'язку ({gone}).\n"
+                                         f"Схоже, причина <b>не у Wi-Fi</b>: перед цим на об'єкті не було світла, а заряд АКБ був лише {last:.0f}%.\n"
+                                         "Імовірно, батарея розрядилася і станція вимкнулась. Вона увімкнеться сама, коли з'явиться мережа.\n"
+                                         "Якщо світло вже дали, а станція не запрацювала — напишіть у технічну підтримку." + support(st))
+                    else:
+                        tg.clients(chat, f"🔴 <b>{title}</b>: інвертор не відповідає ({gone}).\n"
+                                         "Причина <b>не у Wi-Fi</b>: логер на зв'язку, інтернет працює, а даних від інвертора немає.\n"
+                                         "Перевірте, чи увімкнений інвертор і чи немає помилки на його екрані, та напишіть у технічну підтримку." + support(st))
+                        tg.staff_msg(f"🔴 <b>{title}</b>: инвертор не отвечает ({gone_ru}), при этом логгер на связи — это не Wi-Fi. Свяжитесь с клиентом."
+                                     "\n\n<b>Как определено:</b> Deye Cloud показывает логгер «на связи», а инвертор «не на связи». Значит интернет на объекте есть, а данные не отдаёт сам инвертор: выключен, в аварии или потеряна связь логгера с ним.")
+                    p["off_staff"] = cause == "inverter"  # Wi-Fi и севший АКБ - только клиенту
+                    if tg.quiet():
+                        p["night_off"] = True  # ночью не будим: если к 7:00 связь не вернётся, скажем в утренней сводке
+                elif not p.get("off_staff") and p.get("offline_since") and \
+                        (t - datetime.fromisoformat(p["offline_since"])).total_seconds() > 24 * 3600:
+                    p["off_staff"] = True
+                    tg.staff_msg(f"🔴 <b>{title}</b>: станция не на связи уже больше суток. " + ("Перед этим сел АКБ, и станция сама не включилась." if p.get("off_cause") == "battery" else "Сначала это было похоже на интернет / Wi-Fi, но клиент, видимо, не починил.") + " Стоит позвонить."
+                                  f"\n\n<b>Как определено:</b> последние данные от станции были {datetime.fromisoformat(p['offline_since']).strftime('%d.%m около %H:%M')}"
+                                  + (f", последний известный заряд АКБ {p['last_soc']:.0f}%" if p.get("last_soc") is not None else "")
+                                  + (", сети в тот момент не было." if p.get("no_grid") else ", сеть в тот момент была."))
+            if p.get("offline") and not offline:
+                if not p.pop("night_off", None):
+                    tg.clients(chat, f"🟢 <b>{title}</b>: станція знову на зв'язку.")
+                if p.get("off_staff"):
+                    tg.staff_msg(f"🟢 <b>{title}</b>: снова на связи.")
+                for k in ("off_cause", "offline_since", "off_staff"):
+                    p.pop(k, None)
+            p["offline"] = offline
+            if offline:
+                continue  # пока нет связи, про сеть и АКБ ничего утверждать нельзя
+            if soc is not None:
+                p["last_soc"], p["last_soc_t"] = soc, t.isoformat()
+            p.pop("last", None)
+            apply_latest(p, lt, t)
+            dkw = p["last"].get("dkw")
+            if dkw is not None:  # мощность разряда - медиана последних 3 проверок: один скачок прогноз не дёргает
+                h = (p.get("dkw_h") or [])[-2:] + [dkw]
+                p["dkw_h"] = h
+                dkw = p["last"]["dkw"] = sorted(h)[len(h) // 2]
+
+            no_grid, how = grid_state(lt, dev)
+            p["how"] = how
+            if no_grid is True:
+                p["off_n"] = p.get("off_n", 0) + 1
+                need = 2  # «світло вимкнули» - только после 2 проверок подряд: один сбойный ноль напряжения клиентов не будит
+                if p.get("no_grid") and p.get("on_since"):
+                    # свет дали и снова забрали - это то же отключение, отдельно не пишем
+                    p.pop("on_since", None)
+                    p["flaps"] = p.get("flaps", 0) + 1
+                if not p.get("no_grid") and p["off_n"] >= need:
+                    p["no_grid"] = True
+                    p["off_since"] = t.isoformat()
+                    p["off_soc"] = soc
+                    p["off_kwh"], p["off_t"] = 0.0, t.isoformat()
+                    p["off_snap"] = snapshot(dtek, t)  # график всех очередей на момент отключения
+                    p["off_emerg"] = bool(st["dtek"].get("emerg"))
+                    plan = planned_now(dtek, q, t)
+                    p["off_planned"] = plan
+                    if plan is True:
+                        kind = "за графіком ДТЕК"
+                    elif plan is False:
+                        kind = "⚡ <b>поза графіком</b> — схоже на екстрене або аварійне відключення"
+                    else:
+                        kind = "чергу ДТЕК для об'єкта не вказано" if not q else "графік ДТЕК зараз недоступний"
+                    bat = f"\nАКБ {soc:.0f}%, навантаження {load / 1000:.1f} кВт." if soc is not None else f"\nНавантаження {load / 1000:.1f} кВт."
+                    until = planned_end(dtek, q, t) if plan is True else None
+                    p["off_until"] = until.isoformat() if until else None
+                    fore = forecast_line(st, sid, soc, t, until, p, dkw)
+                    tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{fore}\nОб'єкт працює від станції.", urgent=True)
+            elif no_grid is False:
+                p["off_n"] = 0
+                if p.get("no_grid"):
+                    # Пишем «увімкнули» один раз, когда сеть держится стабильно, а не на каждое моргание.
+                    p.setdefault("on_since", t.isoformat())
+                    back = datetime.fromisoformat(p["on_since"])
+                    if (t - back).total_seconds() / 60 >= stable_min:
+                        start = datetime.fromisoformat(p["off_since"])
+                        mins = (back - start).total_seconds() / 60
+                        st["log"].append({"sid": sid, "name": name, "start": p["off_since"], "end": p["on_since"],
+                                          "min": round(mins), "planned": p.get("off_planned"), "flaps": p.get("flaps", 0),
+                                          "soc_start": p.get("off_soc"), "soc_end": p.get("on_soc", soc),
+                                          "kwh": round(p["off_kwh"], 1) if p.get("off_kwh") else None,
+                                          "emerg": bool(p.get("off_emerg")),
+                                          "m": sorted(k for k, ok in matches(p.get("off_snap"), start, back,
+                                                      pairs=[tuple(queues(p))] if len(queues(p)) == 2 else ()).items() if ok)
+                                               if p.get("off_snap") else None})
+                        bat = ""
+                        if p.get("on_soc", soc) is not None and p.get("off_soc") is not None:
+                            bat = f"\nАКБ: було {p['off_soc']:.0f}%, найменше {min(p.get('min_soc', 100), p.get('on_soc', soc)):.0f}%, зараз {soc:.0f}%." if soc is not None else ""
+                        fl = f"\nЗа цей час світло з'являлось і знову зникало: {p['flaps']} раз(и)." if p.get("flaps") else ""
+                        tg.clients(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(back)}, мережа стабільна.\nБез мережі: {dur(mins)}.{fl}{bat}", urgent=True)
+                        for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until", "off_kwh", "off_t", "off_snap", "off_emerg"):
+                            p.pop(k, None)
+                    elif "on_soc" not in p and soc is not None:
+                        p["on_soc"] = soc
+            if p.get("no_grid") and soc is not None:
+                p["min_soc"] = min(p.get("min_soc", 100), soc)
+            # Сколько кВт·ч отдала АКБ за отключение: по ним бот сам узнаёт фактическую ёмкость.
+            if no_grid is True and p.get("no_grid") and p.get("off_t") and dkw is not None:
+                dt = (t - datetime.fromisoformat(p["off_t"])).total_seconds() / 3600
+                if 0 < dt < 0.5:  # большой разрыв (не было связи) не считаем
+                    p["off_kwh"] = p.get("off_kwh", 0) + dkw * dt
+                p["off_t"] = t.isoformat()
+            if p.get("no_grid") and st["dtek"].get("emerg"):
+                p["off_emerg"] = True  # во время отключения ДТЭК объявил экстренные - для проверки очереди не считаем
+            cap_warn(tg, st, sid, p, t)
+            queue_review(tg, st, sid, p, t)
+
+            low = soc is not None and soc < low_soc
+            if low and not p.get("low_soc") and p.get("no_grid") and not p.get("on_since"):
+                tg.clients(chat, f"🔋 <b>{title}</b>: заряд АКБ {soc:.0f}%, світла досі немає.\nВарто вимкнути потужні прилади (бойлер, кондиціонер, плиту), щоб вистачило довше.")
+            p["low_soc"] = bool(low)
+
+            # ---- дальше только то, что нужно сотрудникам: неисправности и рекомендации
+            problems(tg, st, p, title, dev, soc, load, low_soc, t, no_grid)
+            if do_alerts:
+                try:
+                    device_alerts(tg, p, title, api.alerts(int(sid), time.time() - 86400, time.time() + 600), t)
+                except Exception:
+                    pass
+            advice(tg, st, sid, p, title, dev, load, t)
+            pv_strings(tg, p, title, dev, t)
+        except Exception as e:  # сбой на одной станции не останавливает остальные
+            err_report(tg, st, "проверка станции " + str(s.get("name") or s.get("stationName") or ""), e)
+
 
     if do_alerts:
         st["alerts_at"] = t.isoformat()
@@ -2073,6 +2175,12 @@ def dtek_alerts(tg, st, dtek):
             if seen.get(key) == sig:
                 continue
             changed = key in seen
+            if changed:  # изменение графика отправляем, только если оно держится 2 загрузки подряд: источник иногда «мигает»
+                pend = D.setdefault("pend", {})
+                if pend.get(key) != sig:
+                    pend[key] = sig
+                    continue
+                pend.pop(key, None)
             seen[key] = sig
             head = "змінився графік" if changed else "графік"
             qn = q.replace("GPV", "")
@@ -2081,6 +2189,8 @@ def dtek_alerts(tg, st, dtek):
                 tg.clients(chats, f"🗓 <b>{esc(n)}</b>: {head} відключень ДТЕК, {body}")
     for k in [k for k in seen if k.split("|")[0] < today]:
         seen.pop(k)
+    for k in [k for k in D.get("pend", {}) if k.split("|")[0] < today]:
+        D["pend"].pop(k)
 
     # 3. напоминание за ~30 минут до отключения
     warned = D.setdefault("warned", {})
@@ -2288,9 +2398,28 @@ def diag(api, tg, st, dtek):
     print("DIAG device keys:", sorted(keys))
 
 
+def safe(tg, st, where, fn, *args):
+    """Вызвать часть программы так, чтобы её сбой не остановил остальное и память сохранилась."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        err_report(tg, st, where, e)
+        return 0
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "check"
     tg = Telegram()
+    # Память в репозитории есть, а расшифровать её не вышло (сменили STATE_KEY, повредился файл):
+    # не начинаем с чистого листа - иначе потеряются клиенты, очереди и журнал. Останавливаемся и пишем в группу.
+    if mode != "test" and not os.path.exists(STATE) and os.path.exists(os.path.join(HERE, "state.enc")) and env("STATE_FILE"):
+        if now().minute % 30 < 2:  # не чаще раза в ~30 минут
+            tg.staff_msg("🆘 <b>Бот остановлен: память не расшифровалась.</b> Клиенты, очереди и журнал целы в файле state.enc, "
+                         "бот их не трогает. Сообщения клиентам сейчас не уходят.\n"
+                         "Причина почти всегда — изменён секрет STATE_KEY в GitHub. Верните прежнее значение. "
+                         "Если не помните — напишите Claude.")
+        print("Память не расшифровалась - остановка без изменений")
+        sys.exit(1)
     st = load_state()
     before = json.dumps(st, sort_keys=True, ensure_ascii=False)
     if mode == "test":
@@ -2299,6 +2428,8 @@ def main():
         sys.exit(0 if ok else 1)
     try:
         dtek = fetch_dtek()
+        if st["dtek"].get("fail_sent"):
+            tg.staff_msg("✅ Графики ДТЭК снова загружаются.")
         st["dtek"]["fail"] = 0
         st["dtek"].pop("fail_since", None)
         st["dtek"].pop("fail_sent", None)
@@ -2308,17 +2439,19 @@ def main():
         st["dtek"].setdefault("fail_since", now().isoformat())
         if not st["dtek"].get("fail_sent") and (now() - datetime.fromisoformat(st["dtek"]["fail_since"])).total_seconds() > 3600:
             st["dtek"]["fail_sent"] = True
-            tg.staff_msg("⚠️ Графики ДТЭК не загружаются уже час. Отключения по станциям по-прежнему отслеживаются.")
+            tg.staff_msg("⚠️ Графики ДТЭК не загружаются уже час. Отключения по станциям по-прежнему отслеживаются, "
+                         "но «по графику / вне графика» и напоминания сейчас не работают. Источник графиков — сторонний проект "
+                         "Baskerville42/outage-data-ua; бот напишет, когда графики вернутся.")
     api = Deye()
     if mode == "cmd":
-        commands(tg, st, dtek, api)
+        safe(tg, st, "команды", commands, tg, st, dtek, api)
         print("Команды обработаны, сообщений:", tg.sent)
         # Пока клиенты нажимают кнопки, таймер пропускает плановые проверки (запуск уже идёт).
         # Поэтому запуск для команд сам делает проверку, если прошлая была больше 100 секунд назад.
         la = st.get("last_check_at")
         if not la or (now() - datetime.fromisoformat(la)).total_seconds() > 100:
-            n = check(api, tg, st, dtek)
-            dtek_alerts(tg, st, dtek)
+            n = safe(tg, st, "проверка", check, api, tg, st, dtek)
+            safe(tg, st, "графики ДТЭК", dtek_alerts, tg, st, dtek)
             st["last_check"], st["last_check_at"] = now().strftime("%Y-%m-%d %H:%M"), now().isoformat()
             print(f"Заодно проверено станций: {n}")
     elif mode == "help":
@@ -2366,9 +2499,9 @@ def main():
             tg.staff_msg("⚠️ Отчёт за месяц не собрался: Deye Cloud не ответил. Запустите его вручную позже (Actions → monitor → report).")
             print("Отчёт: ошибка,", type(e).__name__)
     else:
-        commands(tg, st, dtek, api)
-        n = check(api, tg, st, dtek)
-        dtek_alerts(tg, st, dtek)
+        safe(tg, st, "команды", commands, tg, st, dtek, api)
+        n = safe(tg, st, "проверка", check, api, tg, st, dtek)
+        safe(tg, st, "графики ДТЭК", dtek_alerts, tg, st, dtek)
         st["last_check"], st["last_check_at"] = now().strftime("%Y-%m-%d %H:%M"), now().isoformat()
         print(f"Проверено станций: {n}, сообщений: {tg.sent}, ДТЭК: {'ок' if dtek else 'нет'}")
     blocked_clients(tg, st)
@@ -2376,14 +2509,15 @@ def main():
     # (клиенты, очереди, отключения, отправленные сообщения) или раз в 6 часов как резервная копия.
     def durable(x):
         x = json.loads(json.dumps(x, sort_keys=True, ensure_ascii=False))
-        for k in ("last_check", "last_check_at", "alerts_at", "committed_at"):
+        for k in ("last_check", "last_check_at", "alerts_at", "committed_at", "dev_fail", "api_fail", "api_fail_since", "last_err", "err_sent"):
             x.pop(k, None)
         x.get("tg", {}).pop("done", None)
         x.get("tg", {}).pop("offset", None)
         for k in ("fail", "fail_since"):
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
-            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected"):
+            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected",
+                      "dkw_h", "last_soc_t", "soc_sus", "miss_n"):
                 q.pop(k, None)
         return x
 
