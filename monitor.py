@@ -163,13 +163,13 @@ class Telegram:
         h = now().hour
         return h >= 23 or h < 7
 
-    def clients(self, chats, text, urgent=False):
+    def clients(self, chats, text, urgent=False, markup=None):
         """Клиентам. Ночью уходит только срочное (свет отключили / включили), остальное - в утренней сводке."""
         if not urgent and self.quiet():
             return False
         for chat in dict.fromkeys(str(c) for c in (chats or []) if c):
             if chat != str(self.staff):
-                self.send(chat, text)
+                self.send(chat, text, markup)
         return True
 
     def both(self, chats, text):
@@ -187,6 +187,7 @@ class Deye:
     def __init__(self):
         self.base = BASE.get(env("DEYE_DATA_CENTER", "EU").upper(), BASE["EU"])
         self.token = None
+        self.units = {}  # единицы измерения полей device/latest: {sn: {поле: единица}}
 
     def _post(self, path, body, auth=True, query=""):
         headers = {"Content-Type": "application/json"}
@@ -262,6 +263,7 @@ class Deye:
             d = self._post("/device/latest", {"deviceList": sns[i:i + 10]})
             for it in d.get("deviceDataList") or []:
                 out[str(it.get("deviceSn"))] = {x.get("key"): x.get("value") for x in it.get("dataList") or []}
+                self.units[str(it.get("deviceSn"))] = {x.get("key"): x.get("unit") for x in it.get("dataList") or []}
         return out
 
     def alerts(self, sid, start, end):
@@ -365,6 +367,148 @@ def planned_end(dtek, q, t):
     return None
 
 
+# ---------------------------------------------------------------- две линии и проверка очереди
+ALL_Q = [f"GPV{a}.{b}" for a in range(1, 7) for b in (1, 2)]
+MODE_RU = {"q1": "станция на линии 1", "q2": "станция на линии 2", "ats": "АВР: света нет, только когда отключены обе линии"}
+
+
+def queues(p):
+    """Очереди объекта: основная и, если есть, вторая линия."""
+    return [q for q in (queue_key(p.get("queue")), queue_key(p.get("queue2"))) if q]
+
+
+def sched_on(p, chat):
+    """Клиент не отключал графики по этому объекту."""
+    return str(chat) not in (p.get("nosched") or [])
+
+
+def eff_key(dtek, sid, p, q):
+    """Очередь, по которой судить «по графику или нет». Для двух линий строим общий график:
+    АВР - света нет, только когда нет обеих линий; пока схема не определена - когда нет хотя бы одной."""
+    q2 = queue_key(p.get("queue2"))
+    if not dtek or not q or not q2 or q2 == q:
+        return q
+    mode = p.get("lines_mode") or "auto"
+    if mode == "q2":
+        return q2
+    if mode == "q1":
+        return q
+    key = f"EFF{sid}"
+    for day in dtek["days"].values():
+        a, b = day.get(q), day.get(q2)
+        if a is not None and b is not None:
+            day[key] = [min(x, y) if mode == "ats" else max(x, y) for x, y in zip(a, b)]
+    return key
+
+
+def snapshot(dtek, t):
+    """График всех очередей на сегодня и завтра в момент отключения: ДТЭК потом может его поменять."""
+    if not dtek:
+        return None
+    out = {}
+    for d in (t, t + timedelta(days=1)):
+        day = dtek["days"].get(d.strftime("%Y-%m-%d"))
+        if day:
+            out[d.strftime("%Y-%m-%d")] = {q: "".join(map(str, day[q])) for q in ALL_Q if day.get(q) is not None}
+    return out or None
+
+
+def matches(snap, start, end, tol=40, pairs=()):
+    """С какими очередями совпало отключение: и начало, и конец в пределах ±tol минут от интервала графика.
+    Возвращает словарь {вариант: True/False}, где вариант - очередь или пара очередей «A+B» (АВР)."""
+    d0 = start.strftime("%Y-%m-%d")
+    d1 = (start + timedelta(days=1)).strftime("%Y-%m-%d")
+    if not snap or d0 not in snap:
+        return {}
+    base = start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def line(q):
+        a = snap[d0].get(q)
+        if a is None:
+            return None
+        b = (snap.get(d1) or {}).get(q) or "0" * 48
+        return [int(c) for c in a + b]
+
+    def fits(sl):
+        for a, b in intervals(sl, 2):
+            s, e = base + timedelta(minutes=30 * a), base + timedelta(minutes=30 * b)
+            if abs((start - s).total_seconds()) <= tol * 60 and abs((end - e).total_seconds()) <= tol * 60:
+                return True
+        return False
+
+    res = {}
+    for q in ALL_Q:
+        sl = line(q)
+        if sl is not None:
+            res[q] = fits(sl)
+    for qa, qb in pairs:
+        a, b = line(qa), line(qb)
+        if a is not None and b is not None:
+            res[f"{qa}+{qb}"] = fits([min(x, y) for x, y in zip(a, b)])
+    return res
+
+
+def overlaps(a, b):
+    return a.get("start", "") < b.get("end", "") and b.get("start", "") < a.get("end", "")
+
+
+def queue_review(tg, st, sid, p, t):
+    """После отключений: определить схему двух линий и заметить, что очередь, похоже, сменилась.
+    Считаются только отключения, которые точно совпали с графиком какой-то очереди (начало и конец ±40 мин)
+    и прошли не в день экстренных/аварийных отключений."""
+    q1, q2 = queue_key(p.get("queue")), queue_key(p.get("queue2"))
+    if not q1 or tg.quiet():
+        return
+    title = esc(p.get("title") or p.get("name"))
+    recent = [x for x in st["log"] if x.get("sid") == sid and x.get("start", "") >= (t - timedelta(days=7)).isoformat()
+              and x.get("m") and not x.get("emerg")]
+    qn = lambda q: q.replace("GPV", "")
+
+    # 1. две линии: какая схема
+    if q2 and (p.get("lines_mode") or "auto") == "auto":
+        votes = []
+        for x in recent[-3:]:
+            m = set(x["m"])
+            opts = [k for k, ok in (("q1", q1 in m), ("q2", q2 in m), ("ats", f"{q1}+{q2}" in m or f"{q2}+{q1}" in m)) if ok]
+            if len(opts) == 1:  # совпало ровно с одной схемой - это голос; если с несколькими, графики похожи и это ничего не говорит
+                votes.append(opts[0])
+        if len(votes) >= 2 and len(set(votes[-2:])) == 1:
+            p["lines_mode"] = votes[-1]
+            tg.staff_msg(f"🔌 <b>{esc(p.get('name'))}</b>: две линии, очереди {qn(q1)} и {qn(q2)}. Определено: {MODE_RU[votes[-1]]}.\n"
+                         f"Как определено: последние отключения совпали по началу и концу (±40 мин) только с этой схемой: {len(votes)} из {len(recent[-3:])}. "
+                         f"Экстренные дни не учитывались.\nЕсли неверно: <code>/lines {esc(p.get('name'))} ats</code> (или 1, 2, auto).")
+
+    # 2. очередь, похоже, сменилась
+    last3 = recent[-3:]
+    if len(last3) < 3 or len({x["start"][:10] for x in last3}) < 3:
+        return
+    own = set(queues(p)) | ({f"{q1}+{q2}", f"{q2}+{q1}"} if q2 else set())
+    if any(set(x["m"]) & own for x in last3):
+        return  # хоть одно отключение по своей очереди - всё в порядке
+    common = {c for c in set.intersection(*[set(x["m"]) for x in last3]) if "+" not in c}
+    if not common:
+        return
+    # Подтверждение: если у нас есть другие станции на той очереди, хотя бы у одной в эти дни тоже было отключение.
+    others = [k for k, pp in st["stations"].items() if k != sid and common & set(queues(pp))]
+    if others and not any(o.get("sid") in others and overlaps(o, x) for x in last3 for o in st["log"]):
+        return
+    if p.get("qok_until", "") > t.isoformat() or (p.get("qsug_at") and (t - datetime.fromisoformat(p["qsug_at"])).days < 14):
+        return
+    p["qsug_at"] = t.isoformat()
+    alt = sorted(common)[:3]
+    alt_txt = " або ".join(qn(q) for q in alt)
+    days = ", ".join(datetime.fromisoformat(x["start"]).strftime("%d.%m") for x in last3)
+    kb = {"inline_keyboard": [[{"text": "Перевірити на сайті ДТЕК", "url": "https://www.dtek-oem.com.ua/ua/shutdowns"}]]
+          + [[{"text": f"Змінити на {qn(q)}", "callback_data": f"cq:{sid}:{qn(q)}"}] for q in alt]
+          + [[{"text": "Моя черга правильна", "callback_data": f"qk:{sid}"}]]}
+    tg.clients([c for c in p.get("clients") or []], f"🔁 <b>{title}</b>: схоже, черга ДТЕК змінилась.\n"
+               f"Останні 3 відключення ({days}) збіглися з графіком черги {alt_txt}, а не {qn(q1)}.\n"
+               f"Перевірте свою чергу на сайті ДТЕК: введіть адресу, і під нею буде номер черги.", markup=kb)
+    tg.staff_msg(f"🔁 <b>{esc(p.get('name'))}</b>: отключения 3 раза подряд ({days}) совпали с очередью {alt_txt}, а записана {qn(q1)}. Клиенту предложено проверить.\n"
+                 f"Как посчитано: начало и конец каждого отключения совпали с графиком {alt_txt} (±40 мин, график на момент отключения) и не совпали с {qn(q1)}; "
+                 f"дни экстренных отключений не учитывались" + ("; у другой станции на этой очереди в те же дни тоже не было света." if others else "."))
+
+
 def usual_rate(st, sid):
     """Обычная скорость разряда без сети, % в час: медиана по отключениям за 30 дней."""
     cut = (now() - timedelta(days=30)).isoformat()
@@ -374,21 +518,135 @@ def usual_rate(st, sid):
     return r[len(r) // 2] if len(r) >= 2 else None
 
 
-def forecast_line(st, sid, soc, t, until, rate=None):
+# ---------------------------------------------------------------- запас заряда АКБ
+CAP_KEY = re.compile(r"batt?(ery)?.*capacit|capacit.*batt?|bms.*capacit", re.I)
+BVOLT_KEY = re.compile(r"^(batt?(ery)?|bms)[_ ]?.*volt", re.I)
+
+
+def deye_time(lt):
+    """Время данных по часам Deye (а не время проверки бота)."""
+    upd = num((lt or {}).get("lastUpdateTime"))
+    if not upd:
+        return None
+    return datetime.fromtimestamp(upd / 1000 if upd > 1e11 else upd, KYIV)
+
+
+def discharge_kw(lt):
+    """Сколько кВт сейчас отдаёт АКБ. Берём мощность разряда из Deye, а если её нет —
+    нагрузку минус солнце (+5% на потери инвертора). 0 — АКБ не разряжается (заряжается от солнца)."""
+    lt = lt or {}
+    d, c = num(lt.get("dischargePower")), num(lt.get("chargePower"))
+    if d is not None and d > 0:
+        return d / 1000
+    if c is not None and c > 0:
+        return 0.0
+    load, pv = num(lt.get("consumptionPower")), num(lt.get("generationPower")) or 0
+    if load is None:
+        return None
+    return max(0.0, (load - pv) / 1000 * 1.05)
+
+
+def deye_cap_kwh(dev, units):
+    """Ёмкость АКБ из данных инвертора в Deye: кВт·ч, или А·ч × напряжение АКБ."""
+    for k, v in (dev or {}).items():
+        val = num(v)
+        if not k or not CAP_KEY.search(k) or not val or val <= 0:
+            continue
+        u = str((units or {}).get(k) or "").lower().replace("·", "").replace(" ", "")
+        if u == "kwh":
+            return val
+        if u == "wh":
+            return val / 1000
+        if u == "ah":
+            volt = next((num(x) for kk, x in dev.items() if kk and BVOLT_KEY.search(kk) and (num(x) or 0) > 10), None)
+            return val * (volt or 51.2) / 1000
+    return None
+
+
+def learned_cap(st, sid):
+    """Фактическая ёмкость по прошлым отключениям: сколько кВт·ч отдала АКБ ÷ на сколько % упал заряд."""
+    cut = (now() - timedelta(days=60)).isoformat()
+    r = sorted(x["kwh"] / ((x["soc_start"] - x["soc_end"]) / 100) for x in st["log"]
+               if x.get("sid") == sid and x.get("start", "") >= cut and x.get("kwh")
+               and x.get("soc_start") is not None and x.get("soc_end") is not None and x["soc_start"] - x["soc_end"] >= 10)
+    return r[len(r) // 2] if len(r) >= 2 else None
+
+
+def capacity(st, sid, p):
+    """Ёмкость АКБ, кВт·ч, и откуда она: вписана командой /akb, из Deye, или вычислена по отключениям."""
+    if p.get("cap_kwh"):
+        return p["cap_kwh"], "вписана вручную"
+    if p.get("cap_deye"):
+        return p["cap_deye"], "из Deye"
+    c = learned_cap(st, sid)
+    return (c, "по прошлым отключениям") if c else (None, "")
+
+
+def cap_warn(tg, st, sid, p, t):
+    """Ёмкость в настройках не совпадает с фактом больше чем на 20% - сообщить сотрудникам (раз в 14 дней)."""
+    set_cap = p.get("cap_kwh") or p.get("cap_deye")
+    fact = learned_cap(st, sid)
+    if not set_cap or not fact or abs(fact - set_cap) / set_cap <= 0.2:
+        return
+    if p.get("capwarn") and (t - datetime.fromisoformat(p["capwarn"])).days < 14:
+        return
+    p["capwarn"] = t.isoformat()
+    src = "вписана командой /akb" if p.get("cap_kwh") else "в настройках инвертора (Deye)"
+    tg.staff_msg(f"⚙️ <b>{esc(p.get('name'))}</b>: ёмкость АКБ {src} — {set_cap:.0f} кВт·ч, а по факту отключений ~{fact:.0f} кВт·ч.\n"
+                 f"Как посчитано: сколько кВт·ч отдала АКБ за отключение ÷ на сколько % упал заряд, медиана за 60 дней (отключения с падением от 10%).\n"
+                 f"Что сделать: проверить Battery Capacity в настройках инвертора и количество модулей АКБ. Если в Deye неверно — поправить там; "
+                 f"если верно, а батарея отдаёт меньше — проверить состояние АКБ (SOH, баланс модулей).")
+
+
+def usual_kw(st, sid):
+    """Обычная мощность разряда АКБ при отключениях, кВт: медиана за 30 дней."""
+    cut = (now() - timedelta(days=30)).isoformat()
+    r = sorted(x["kwh"] / (x["min"] / 60) for x in st["log"]
+               if x.get("sid") == sid and x.get("start", "") >= cut and x.get("kwh") and x.get("min", 0) >= 45)
+    return r[len(r) // 2] if len(r) >= 2 else None
+
+
+def runtime(st, sid, p, soc, dkw):
+    """На сколько часов хватит заряда до 15%. Возвращает (часы, способ).
+    Способы: energy - по ёмкости и текущей мощности разряда; trend - по падению % в этом отключении
+    (только после часа и падения на 5%+); usual - по обычной скорости разряда этой станции.
+    Если доступно несколько, берём самый осторожный (меньший). (None, "pv") - АКБ сейчас не разряжается."""
+    if soc is None:
+        return None, ""
+    usable = max(0.0, soc - 15)
+    est = []
+    cap, _ = capacity(st, sid, p)
+    if cap and dkw is not None:
+        if dkw < 0.05:
+            return None, "pv"
+        est.append((usable / 100 * cap / dkw, "energy"))
+    if p.get("no_grid") and p.get("off_soc") is not None and p.get("off_since"):
+        hrs = (now() - datetime.fromisoformat(p["off_since"])).total_seconds() / 3600
+        drop = p["off_soc"] - soc
+        if hrs >= 1 and drop >= 5:
+            est.append((usable / (drop / hrs), "trend"))
+    if not est:
+        rate = usual_rate(st, sid)
+        if rate and rate > 0:
+            est.append((usable / rate, "usual"))
+    return min(est) if est else (None, "")
+
+
+def forecast_line(st, sid, soc, t, until, p=None, dkw=None):
     """Строка «хватит ли заряда до конца отключения»."""
     out = f"\nЗа графіком світло мають дати о {hm(until)}." if until else ""
-    rate = rate or usual_rate(st, sid)
-    if soc is None or not rate or rate <= 0:
+    left_h, how = runtime(st, sid, p or {}, soc, dkw)
+    if left_h is None:
         return out
-    left_h = max(0, (soc - 15) / rate)
+    word = "за поточного споживання" if how == "energy" else "за звичного споживання"
     empty = t + timedelta(hours=left_h)
     if until:
         if empty >= until + timedelta(minutes=30):
-            out += f" Заряду має вистачити: за звичного споживання його стане до ~{hm(empty)}."
+            out += f" Заряду має вистачити: {word} його стане до ~{hm(empty)}."
         else:
-            out += f"\n⚠️ Заряду може не вистачити: за звичного споживання АКБ опуститься до 15% близько {hm(empty)}. Вимкніть потужні прилади."
+            out += f"\n⚠️ Заряду може не вистачити: {word} АКБ опуститься до 15% близько {hm(empty)}. Вимкніть потужні прилади."
     else:
-        out += f"\nЗа звичного споживання заряду вистачить приблизно на {dur(left_h * 60)}."
+        out += f"\n{word[0].upper() + word[1:]} заряду вистачить приблизно на {dur(left_h * 60)}."
     return out
 
 
@@ -446,7 +704,12 @@ HELP = ("📋 <b>Команды бота</b>\n"
         "<code>/stations пбс</code> — очередь ДТЭК, сколько клиентов подключено, есть ли сейчас свет и связь.\n"
         "<code>/stations</code> — сводка: где сейчас нет света, кто не на связи, у кого низкий заряд.\n\n"
         "<b>Указать очередь ДТЭК</b>\n"
-        "<code>/queue пбс 3.1</code> — после этого клиенту идут графики и напоминания. Обычно клиент присылает очередь сам.\n\n"
+        "<code>/queue пбс 3.1</code> — после этого клиенту идут графики и напоминания. Обычно клиент присылает очередь сам.\n"
+        "<code>/queue пбс 3.1 5.2</code> — на объекте две линии. Схему (АВР или станция на одной линии) бот определит сам по отключениям; "
+        "задать вручную: <code>/lines пбс ats</code> (или 1, 2, auto). Убрать вторую линию: <code>/queue пбс 3.1 0</code>.\n\n"
+        "<b>Ёмкость АКБ</b>\n"
+        "<code>/akb пбс 180</code> — ёмкость в кВт·ч. По ней бот считает клиенту, на сколько хватит заряда. "
+        "<code>/akb пбс</code> — показать, что вписано, что передаёт Deye и что получилось по факту отключений.\n\n"
         "<b>Назвать объект по-человечески</b>\n"
         "<code>/title пбс = Офис на Хуторской</code> — так объект будет называться в сообщениях клиенту.\n\n"
         "<b>Контакт техподдержки для клиентов</b>\n"
@@ -461,16 +724,20 @@ HELP = ("📋 <b>Команды бота</b>\n"
 
 # ---------------------------------------------------------------- меню клиента
 BTN_STATUS, BTN_SCHED, BTN_HELP, BTN_QUEUE = "🔌 Стан станції", "🗓 Графік", "❓ Допомога", "🔁 Змінити чергу"
-KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_HELP}]],
+BTN_NOTIFY = "🔔 Графіки: увімк./вимк."
+KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
+                   ("grafiky", "Увімкнути або вимкнути графіки ДТЕК"),
                    ("help", "Що вміє бот і як змінити чергу"),
                    ("stop", "Вимкнути сповіщення")]
 STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
                   ("stations", "Станции: очередь, клиенты, свет"),
                   ("queue", "Очередь ДТЭК: /queue пбс 3.1"),
+                  ("lines", "Схема двух линий: /lines пбс ats"),
+                  ("akb", "Ёмкость АКБ, кВт·ч: /akb пбс 180"),
                   ("title", "Название для клиента: /title пбс = Офис"),
                   ("contact", "Контакт техподдержки для клиентов"),
                   ("reset", "Отключить клиентов станции"),
@@ -500,7 +767,38 @@ def ask_queue(tg, st, chat, change=False, sid=None):
     name = f"<b>{esc(p.get('title') or p.get('name'))}</b>. " if len(mine) > 1 else ""
     head = (f"{name}Зараз черга ДТЕК: <b>{cur.replace('GPV', '')}</b>.\nОберіть нову:" if cur
             else f"{name}Оберіть вашу чергу ДТЕК — так бот знатиме ваш графік відключень:")
-    tg.send(chat, head, queue_grid(f"cq:{sid}:", {"text": "Не знаю свою чергу", "callback_data": "cq:?"}))
+    kb = queue_grid(f"cq:{sid}:", {"text": "Не знаю свою чергу", "callback_data": "cq:?"})
+    if cur:  # друга лінія - тільки коли основна черга вже є
+        q2 = queue_key(p.get("queue2"))
+        kb["inline_keyboard"].append([{"text": f"Друга лінія: {q2.replace('GPV', '')} — змінити", "callback_data": f"c2:{sid}"},
+                                      {"text": "Прибрати другу лінію", "callback_data": f"cx:{sid}"}] if q2 else
+                                     [{"text": "➕ На об'єкті дві лінії (дві черги)", "callback_data": f"c2:{sid}"}])
+    tg.send(chat, head, kb)
+
+
+def sched_toggle(tg, st, chat, sid=None):
+    """Клиент включает/выключает графики ДТЭК. Отдельно по каждому объекту."""
+    mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
+    if not mine:
+        return
+    if sid is None and len(mine) > 1:
+        rows = [[{"text": f"{'🔔' if sched_on(st['stations'][k], chat) else '🔕'} {str(st['stations'][k].get('title') or st['stations'][k].get('name'))[:34]}",
+                  "callback_data": f"gs:{k}"}] for k in mine]
+        tg.send(chat, "Графіки ДТЕК по об'єктах (🔔 увімкнено, 🔕 вимкнено). Натисніть на об'єкт, щоб змінити:", {"inline_keyboard": rows})
+        return
+    sid = sid if sid in mine else mine[0]
+    p = st["stations"][sid]
+    off = p.setdefault("nosched", [])
+    title = esc(p.get("title") or p.get("name"))
+    if str(chat) in off:
+        off.remove(str(chat))
+        tg.send(chat, f"🔔 <b>{title}</b>: графіки ДТЕК увімкнено — графік на сьогодні й завтра, зміни і нагадування за 30 хвилин.", KEYBOARD)
+    else:
+        off.append(str(chat))
+        tg.send(chat, f"🔕 <b>{title}</b>: графіки ДТЕК вимкнено. Повідомлення про світло, заряд, зв'язок і екстрені відключення приходять як і раніше.\n"
+                      f"Подивитися графік вручну — кнопка «{BTN_SCHED}». Увімкнути знову — «{BTN_NOTIFY}».", KEYBOARD)
+    if not off:
+        p.pop("nosched", None)
 
 
 def match_stations(st, text):
@@ -536,6 +834,34 @@ def callback(tg, st, chat, data, who, dtek):
     if kind == "cs":  # клиент выбрал объект
         if chat in (st["stations"].get(rest, {}).get("clients") or []):
             ask_queue(tg, st, chat, sid=rest)
+        return
+    mine = st["stations"].get(rest.split(":")[0], {}).get("clients") or []
+    if kind == "gs":  # графики вкл/выкл по объекту
+        if chat in mine:
+            sched_toggle(tg, st, chat, rest)
+        return
+    if kind == "qk":  # «моя черга правильна» - 14 дней не спрашиваем
+        if chat in mine:
+            st["stations"][rest]["qok_until"] = (now() + timedelta(days=14)).isoformat()
+            tg.send(chat, "Добре, чергу залишено без змін.", KEYBOARD)
+        return
+    if kind in ("c2", "cr", "cx"):  # вторая линия
+        c_sid, _, q = rest.partition(":")
+        if chat not in mine:
+            return
+        p = st["stations"][c_sid]
+        if kind == "c2":
+            tg.send(chat, "Оберіть чергу ДТЕК другої лінії:", queue_grid(f"cr:{c_sid}:"))
+        elif kind == "cx":
+            p.pop("queue2", None)
+            p.pop("lines_mode", None)
+            tg.send(chat, "Другу лінію прибрано.", KEYBOARD)
+            tg.staff_msg(f"👤 {who}: <b>{esc(p.get('name'))}</b> — вторая линия убрана, очередь {queue_key(p.get('queue')).replace('GPV', '')}.")
+        elif re.fullmatch(r"[1-6]\.[12]", q) and queue_key(q) != queue_key(p.get("queue")):
+            p["queue2"], p["lines_mode"] = queue_key(q), "auto"
+            tg.send(chat, f"✅ Записано: дві лінії, черги {queue_key(p.get('queue')).replace('GPV', '')} і {q}. Графіки приходитимуть по обох.", KEYBOARD)
+            tg.staff_msg(f"👤 {who}: <b>{esc(p.get('name'))}</b> — две линии, очереди {queue_key(p.get('queue')).replace('GPV', '')} и {q}. "
+                         "Схему (АВР или станция на одной линии) бот определит сам по 2–3 отключениям.")
         return
     if kind == "cq":  # клиент выбрал очередь
         if rest == "?":
@@ -586,17 +912,36 @@ def client_help(st):
             "<b>Кнопки внизу екрана:</b>\n"
             f"{BTN_STATUS} — чи є світло, заряд АКБ, навантаження.\n"
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
-            f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку.\n"
+            f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
+            f"{BTN_NOTIFY} — вимкнути або знову увімкнути графіки й нагадування, окремо по кожному об'єкту.\n"
             f"{BTN_HELP} — ця підказка.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
 
 
-def client_status(st, chat):
+def apply_latest(p, lt, t):
+    """Сохранить свежие данные станции. Время - по Deye, если оно есть."""
+    at = deye_time(lt) or t
+    old = (p.get("last") or {}).get("at")
+    if old and at.isoformat() < old and deye_time(lt):
+        return  # у нас уже есть данные новее
+    p["last"] = {"soc": num(lt.get("batterySOC")), "load": num(lt.get("consumptionPower")) or 0,
+                 "pv": num(lt.get("generationPower")), "dkw": discharge_kw(lt), "at": at.isoformat()}
+
+
+def client_status(st, chat, api=None):
     out = []
-    for p in st["stations"].values():
+    for sid, p in st["stations"].items():
         if chat not in (p.get("clients") or []):
             continue
+        if api and not p.get("offline"):
+            # Кнопка показывает свежие данные из Deye, а не то, что сохранила последняя проверка.
+            try:
+                if not api.token:
+                    api.login()
+                apply_latest(p, api.latest(int(sid)), now())
+            except Exception:
+                pass
         title = esc(p.get("title") or p.get("name"))
         last = p.get("last") or {}
         if p.get("offline"):
@@ -612,17 +957,17 @@ def client_status(st, chat):
             line += f"\nАКБ {last['soc']:.0f}%"
             if last.get("load") is not None:
                 line += f" · навантаження {last['load'] / 1000:.1f} кВт"
-            if p.get("no_grid") and p.get("off_soc") is not None and last["soc"] < p["off_soc"]:
-                hrs = (now() - datetime.fromisoformat(p["off_since"])).total_seconds() / 3600
-                if hrs > 0.5:
-                    rate = (p["off_soc"] - last["soc"]) / hrs
-                    left = (last["soc"] - 15) / rate if rate > 0 else 0
-                    if left > 0:
-                        line += f"\nЗа такого споживання заряду вистачить ще приблизно на {dur(left * 60)} (до залишку 15%)."
-                        until = datetime.fromisoformat(p["off_until"]) if p.get("off_until") else None
-                        if until and until > now():
-                            ok = now() + timedelta(hours=left) >= until + timedelta(minutes=30)
-                            line += f"\nЗа графіком світло мають дати о {hm(until)} — " + ("заряду має вистачити." if ok else "⚠️ заряду може не вистачити, вимкніть потужні прилади.")
+            if p.get("no_grid"):
+                left, how = runtime(st, sid, p, last["soc"], last.get("dkw"))
+                if how == "pv":
+                    line += "\nЗараз АКБ не розряджається: навантаження покривають сонячні панелі."
+                elif left is not None and left > 0:
+                    word = "За такого споживання" if how == "energy" else "За звичного споживання"
+                    line += f"\n{word} заряду вистачить ще приблизно на {dur(left * 60)} (до залишку 15%)."
+                    until = datetime.fromisoformat(p["off_until"]) if p.get("off_until") else None
+                    if until and until > now():
+                        ok = now() + timedelta(hours=left) >= until + timedelta(minutes=30)
+                        line += f"\nЗа графіком світло мають дати о {hm(until)} — " + ("заряду має вистачити." if ok else "⚠️ заряду може не вистачити, вимкніть потужні прилади.")
             line += f"\nДані станом на {last.get('at', '')[11:16]}."
         out.append(line)
     return "\n\n".join(out)
@@ -635,17 +980,19 @@ def client_schedule(st, chat, dtek):
         if chat not in (p.get("clients") or []):
             continue
         title = esc(p.get("title") or p.get("name"))
-        q = queue_key(p.get("queue"))
-        if not q:
+        qs = queues(p)
+        if not qs:
             out.append(f"🗓 <b>{title}</b>: черга ДТЕК ще не вказана. Надішліть дві цифри, наприклад: 3.1")
             continue
         if not dtek:
             out.append(f"🗓 <b>{title}</b>: графік ДТЕК зараз недоступний, спробуйте за кілька хвилин.")
             continue
-        lines = [f"🗓 <b>{title}</b>, черга {q.replace('GPV', '')}"]
-        for day, label in ((t, "Сьогодні"), (t + timedelta(days=1), "Завтра")):
-            sl = (dtek["days"].get(day.strftime("%Y-%m-%d")) or {}).get(q)
-            lines.append(f"<b>{label} ({day.strftime('%d.%m')}):</b> " + (fmt_intervals(sl) if sl is not None else "графік ще не опубліковано"))
+        lines = [f"🗓 <b>{title}</b>" + ("" if sched_on(p, chat) else " (сповіщення про графіки вимкнено)")]
+        for n, q in enumerate(qs, 1):
+            lines.append((f"<b>Лінія {n}</b>, " if len(qs) > 1 else "") + f"черга {q.replace('GPV', '')}")
+            for day, label in ((t, "Сьогодні"), (t + timedelta(days=1), "Завтра")):
+                sl = (dtek["days"].get(day.strftime("%Y-%m-%d")) or {}).get(q)
+                lines.append(f"<b>{label} ({day.strftime('%d.%m')}):</b> " + (fmt_intervals(sl) if sl is not None else "графік ще не опубліковано"))
         if dtek.get("updated"):
             lines.append(f"Оновлено ДТЕК: {esc(dtek['updated'])}")
         out.append("\n".join(lines))
@@ -700,7 +1047,7 @@ def read_inbox():
     return out
 
 
-def commands(tg, st, dtek=None):
+def commands(tg, st, dtek=None, api=None):
     """Читает сообщения боту: /start <код> от клиентов и команды из чата сотрудников."""
     if not tg.token:
         return
@@ -729,7 +1076,7 @@ def commands(tg, st, dtek=None):
             c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
             if c_chat:
                 mid = (cq.get("message") or {}).get("message_id")
-                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R") and cq.get("data") != "cq:?":
+                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx") and cq.get("data") != "cq:?":
                     tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
                 callback(tg, st, c_chat, cq.get("data"), c_who, dtek)
             continue
@@ -742,7 +1089,7 @@ def commands(tg, st, dtek=None):
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
@@ -774,10 +1121,12 @@ def commands(tg, st, dtek=None):
             else:  # ждём, пока пришлёт очередь, и напишем одним сообщением
                 p.setdefault("joins", {})[chat] = {"who": who, "at": now().isoformat()}
         elif cmd in ("/status", "/grafik", "/help") and is_client:
-            tg.send(chat, {"/status": lambda: client_status(st, chat), "/grafik": lambda: client_schedule(st, chat, dtek),
+            tg.send(chat, {"/status": lambda: client_status(st, chat, api), "/grafik": lambda: client_schedule(st, chat, dtek),
                            "/help": lambda: client_help(st)}[cmd](), KEYBOARD)
         elif cmd == "/cherga" and is_client:
             ask_queue(tg, st, chat, change=True)
+        elif cmd == "/grafiky" and is_client:
+            sched_toggle(tg, st, chat)
         elif cmd == "/queue" or not text.startswith("/") or not is_client:
             client_queue(tg, st, chat, arg if cmd == "/queue" else text, who)
         elif cmd == "/stop":
@@ -843,7 +1192,7 @@ def staff_command(tg, st, cmd, arg):
         arg = "*"
     if cmd in PICK and arg != "*":
         # Станций много, поэтому списком их не показываем: нужно название как в Deye Cloud.
-        name = re.sub(r"\s+\d\s*[.,]\s*\d\s*$", "", arg) if cmd == "/queue" else arg
+        name = re.sub(r"(\s+(\d\s*[.,]\s*\d|0|-))+\s*$", "", arg) if cmd == "/queue" else arg
         letter, prompt = PICK[cmd]
         example = {"/link": "/link ПБС", "/stations": "/stations ПБС", "/queue": "/queue ПБС 3.1", "/reset": "/reset ПБС"}[cmd]
         if not name:
@@ -872,9 +1221,31 @@ def staff_command(tg, st, cmd, arg):
             tg.staff_msg(err)
             return
         p = S[sid]
+        cap, src = capacity(st, sid, p)
         tg.staff_msg(f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
-                     f"\nочередь ДТЭК: {(queue_key(p.get('queue')) or 'не указана').replace('GPV', '')} · клиентов: {len(p.get('clients') or [])}"
-                     f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}")
+                     f"\nочередь ДТЭК: {' и '.join(q.replace('GPV', '') for q in queues(p)) or 'не указана'} · клиентов: {len(p.get('clients') or [])}"
+                     + (f"\nдве линии: {MODE_RU.get(p.get('lines_mode'), 'схема ещё не определена')}" if p.get("queue2") else "")
+                     + (f"\nграфики отключили клиенты: {len(p['nosched'])}" if p.get("nosched") else "") +
+                     f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}"
+                     f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}")
+    elif cmd == "/akb":
+        m = re.match(r"(.+?)\s+(\d+(?:[.,]\d+)?)\s*(квт.*|kwh)?\s*$", arg, re.I)
+        sid, err = find_station(st, m.group(1) if m else arg)
+        if err:
+            tg.staff_msg(err if arg else "Пример: /akb ПБС 180 — ёмкость АКБ в кВт·ч. Без числа — показать, что сейчас.")
+            return
+        p = S[sid]
+        if m:
+            val = float(m.group(2).replace(",", "."))
+            if not 1 <= val <= 5000:
+                tg.staff_msg("Ёмкость пишется в кВт·ч, например /akb ПБС 180.")
+                return
+            p["cap_kwh"] = val
+        fact = learned_cap(st, sid)
+        tg.staff_msg((f"✅ <b>{esc(p.get('name'))}</b>: ёмкость АКБ {p['cap_kwh']:g} кВт·ч. По ней считается, на сколько хватит заряда.\n" if m else f"<b>{esc(p.get('name'))}</b>, ёмкость АКБ:\n")
+                     + f"вписана: {str(p['cap_kwh']) + ' кВт·ч' if p.get('cap_kwh') else 'нет'}\n"
+                     f"из Deye: {str(p['cap_deye']) + ' кВт·ч' if p.get('cap_deye') else 'Deye не передаёт'}\n"
+                     f"по факту отключений: {f'~{fact:.0f} кВт·ч' if fact else 'пока мало данных (нужно 2 отключения с падением заряда от 10%)'}")
     elif cmd == "/stations":
         def names(ps, n=15):
             lst = [esc(p.get("name")) for p in ps]
@@ -903,16 +1274,34 @@ def staff_command(tg, st, cmd, arg):
         tg.staff_msg("Ссылки для клиентов (кто откроет и нажмёт Start — будет получать уведомления по станции):\n\n" + "\n\n".join(
             f"<b>{esc(p.get('title') or p.get('name'))}</b>\nhttps://t.me/{bot}?start={p.get('code')}" for p in S.values() if p.get("code")))
     elif cmd == "/queue":
-        m = re.match(r"(.+?)\s+(\d\s*[.,]\s*\d)\s*$", arg)
+        m = re.match(r"(.+?)\s+(\d\s*[.,]\s*\d)(?:\s+(\d\s*[.,]\s*\d|0|-))?\s*$", arg)
         if not m:
-            tg.staff_msg("Пример: /queue ПБС 3.1")
+            tg.staff_msg("Пример: /queue ПБС 3.1\nДве линии: /queue ПБС 3.1 5.2 · убрать вторую: /queue ПБС 3.1 0")
             return
         sid, err = find_station(st, m.group(1))
         if err:
             tg.staff_msg(err)
             return
-        S[sid]["queue"] = queue_key(m.group(2))
-        tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b>: очередь ДТЭК {S[sid]['queue'].replace('GPV', '')}. График придёт при следующей проверке.")
+        p = S[sid]
+        p["queue"] = queue_key(m.group(2))
+        if m.group(3) in ("0", "-"):
+            p.pop("queue2", None)
+        elif m.group(3) and queue_key(m.group(3)) != p["queue"]:
+            if queue_key(m.group(3)) != p.get("queue2"):
+                p["queue2"], p["lines_mode"] = queue_key(m.group(3)), "auto"
+        txt = " и ".join(q.replace("GPV", "") for q in queues(p))
+        extra = ("\nДве линии. Схему (АВР или станция на одной линии) бот определит сам по 2–3 отключениям и напишет сюда. "
+                 f"Задать вручную: <code>/lines {esc(p.get('name'))} ats</code> (или 1, 2)." if p.get("queue2") and p.get("lines_mode", "auto") == "auto" else "")
+        tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: очередь ДТЭК {txt}. График придёт при следующей проверке.{extra}")
+    elif cmd == "/lines":
+        m = re.match(r"(.+?)\s+(ats|авр|1|2|auto|авто)\s*$", arg, re.I)
+        sid, err = find_station(st, m.group(1) if m else arg)
+        if err or not m:
+            tg.staff_msg(err or "Пример: /lines ПБС ats — схема двух линий: ats (АВР), 1 или 2 (станция на этой линии), auto (бот определит сам).")
+            return
+        mode = {"ats": "ats", "авр": "ats", "1": "q1", "2": "q2", "auto": "auto", "авто": "auto"}[m.group(2).lower()]
+        S[sid]["lines_mode"] = mode
+        tg.staff_msg(f"✅ <b>{esc(S[sid].get('name'))}</b>: " + (MODE_RU[mode] if mode != "auto" else "схему двух линий бот определит сам") + ".")
     elif cmd == "/title":
         name, _, title = arg.partition("=")
         sid, err = find_station(st, name)
@@ -1207,13 +1596,18 @@ def morning(tg, st, dtek, t):
                 head += f" АКБ {last['soc']:.0f}%."
             q = queue_key(p.get("queue"))
             sl = (dtek["days"].get(day) or {}).get(q) if dtek and q else None
-            if sl is not None:
-                head += f"\nСьогодні, черга {q.replace('GPV', '')}: {fmt_intervals(sl)}"
-                offs = intervals(sl, 2)
+            if not sched_on(p, chat):
+                pass  # клиент отключил графики по этому объекту
+            elif sl is not None:
+                for n, qq in enumerate(queues(p), 1):
+                    s2 = (dtek["days"].get(day) or {}).get(qq)
+                    head += (f"\nСьогодні, лінія {n}, черга " if p.get("queue2") else "\nСьогодні, черга ") + f"{qq.replace('GPV', '')}: {fmt_intervals(s2) if s2 is not None else 'графік ще не опубліковано'}"
+                offs = intervals((dtek["days"].get(day) or {}).get(eff_key(dtek, sid, p, q)) or sl, 2)
                 rate = usual_rate(st, sid)
-                if offs and rate and last.get("soc") is not None:
+                cap, ukw = capacity(st, sid, p)[0], usual_kw(st, sid)
+                can = 0.85 * cap / ukw if cap and ukw else ((100 - 15) / rate if rate else None)
+                if offs and can and last.get("soc") is not None:
                     longest = max(b - a for a, b in offs) / 2
-                    can = max(0, (100 - 15) / rate)
                     head += (f"\nНайдовше відключення — {longest:g} год. Повного заряду за звичного споживання вистачає приблизно на {can:.0f} год"
                              + (" — має вистачити." if can >= longest + 0.5 else " — ⚠️ може не вистачити, заощаджуйте заряд."))
             elif not q:
@@ -1295,6 +1689,23 @@ def pv_strings(tg, p, title, dev, t):
         pv["n"] += 1
 
 
+def write_fields(st, fields):
+    """Список полей Deye -> файл deye_fields.json в репозитории (его кладёт туда шаг GitHub Actions).
+    Станции идут под номерами в случайном порядке. Значений, названий, адресов, серийных номеров нет."""
+    if not fields:
+        return
+    fields = sorted(fields, key=lambda x: json.dumps(x, sort_keys=True))
+    out = {"updated": now().strftime("%Y-%m-%d"), "stations": len(fields),
+           "note": "Только названия полей Deye и единицы измерения. Значений и данных станций здесь нет.",
+           "per_station": [dict(x, station=i + 1) for i, x in enumerate(fields)]}
+    h = hashlib.sha1(json.dumps(out["per_station"], sort_keys=True).encode()).hexdigest()
+    with open(STATE + ".fields", "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1, sort_keys=True)
+    if st.get("fields_hash") != h:  # поля изменились - записать файл в репозиторий
+        st["fields_hash"] = h
+        open(STATE + ".commit", "w").close()
+
+
 def check(api, tg, st, dtek):
     cfgs = station_cfg()
     low_soc = float(env("LOW_SOC", "40"))
@@ -1327,6 +1738,7 @@ def check(api, tg, st, dtek):
     except Exception:
         devdata = {}
 
+    fields = []
     for s in stations:
         sid = str(s.get("id") or s.get("stationId"))
         name = s.get("name") or s.get("stationName") or sid
@@ -1335,13 +1747,24 @@ def check(api, tg, st, dtek):
         p.setdefault("code", secrets.token_urlsafe(9))
         cfg = setup(st, cfgs, sid)
         title, chat, q = esc(cfg["title"]), cfg["chats"], cfg["queue"]
+        q = eff_key(dtek, sid, p, q)  # две линии: общий график по схеме подключения
         try:
             lt = api.latest(int(sid))
         except Exception:
             lt = {}
-        dev = {}
+        dev, units = {}, {}
         for sn in sns.get(sid, []):
             dev.update(devdata.get(sn) or {})
+            units.update(api.units.get(sn) or {})
+        cap_d = deye_cap_kwh(dev, units)
+        if cap_d:
+            p["cap_deye"] = round(cap_d, 1)
+        # Для настройки кода: какие поля отдаёт Deye. Только названия и единицы - без значений и названий станций.
+        fields.append({"inverters": len(sns.get(sid, [])),
+                       "device_types": sorted({str(d.get("deviceType")) for d in s.get("deviceListItems") or []}),
+                       "station_latest": sorted(k for k in lt if k not in ("requestId", "code", "msg", "success")),
+                       "inverter_fields": {k: (units.get(k) or "") for k in sorted(dev) if k},
+                       "capacity_found": bool(cap_d), "queues": len(queues(p))})
         status = str(s.get("connectionStatus") or "").upper()
         upd = num(lt.get("lastUpdateTime") or s.get("lastUpdateTime"))
         age = None
@@ -1416,7 +1839,9 @@ def check(api, tg, st, dtek):
             continue  # пока нет связи, про сеть и АКБ ничего утверждать нельзя
         if soc is not None:
             p["last_soc"] = soc
-        p["last"] = {"soc": soc, "load": load, "at": t.isoformat()}
+        p.pop("last", None)
+        apply_latest(p, lt, t)
+        dkw = p["last"].get("dkw")
 
         no_grid, how = grid_state(lt, dev)
         p["how"] = how
@@ -1431,6 +1856,9 @@ def check(api, tg, st, dtek):
                 p["no_grid"] = True
                 p["off_since"] = t.isoformat()
                 p["off_soc"] = soc
+                p["off_kwh"], p["off_t"] = 0.0, t.isoformat()
+                p["off_snap"] = snapshot(dtek, t)  # график всех очередей на момент отключения
+                p["off_emerg"] = bool(st["dtek"].get("emerg"))
                 plan = planned_now(dtek, q, t)
                 p["off_planned"] = plan
                 if plan is True:
@@ -1442,7 +1870,7 @@ def check(api, tg, st, dtek):
                 bat = f"\nАКБ {soc:.0f}%, навантаження {load / 1000:.1f} кВт." if soc is not None else f"\nНавантаження {load / 1000:.1f} кВт."
                 until = planned_end(dtek, q, t) if plan is True else None
                 p["off_until"] = until.isoformat() if until else None
-                fore = forecast_line(st, sid, soc, t, until)
+                fore = forecast_line(st, sid, soc, t, until, p, dkw)
                 tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{fore}\nОб'єкт працює від станції.", urgent=True)
         elif no_grid is False:
             p["off_n"] = 0
@@ -1455,18 +1883,33 @@ def check(api, tg, st, dtek):
                     mins = (back - start).total_seconds() / 60
                     st["log"].append({"sid": sid, "name": name, "start": p["off_since"], "end": p["on_since"],
                                       "min": round(mins), "planned": p.get("off_planned"), "flaps": p.get("flaps", 0),
-                                      "soc_start": p.get("off_soc"), "soc_end": p.get("on_soc", soc)})
+                                      "soc_start": p.get("off_soc"), "soc_end": p.get("on_soc", soc),
+                                      "kwh": round(p["off_kwh"], 1) if p.get("off_kwh") else None,
+                                      "emerg": bool(p.get("off_emerg")),
+                                      "m": sorted(k for k, ok in matches(p.get("off_snap"), start, back,
+                                                  pairs=[tuple(queues(p))] if len(queues(p)) == 2 else ()).items() if ok)
+                                           if p.get("off_snap") else None})
                     bat = ""
                     if p.get("on_soc", soc) is not None and p.get("off_soc") is not None:
                         bat = f"\nАКБ: було {p['off_soc']:.0f}%, найменше {min(p.get('min_soc', 100), p.get('on_soc', soc)):.0f}%, зараз {soc:.0f}%." if soc is not None else ""
                     fl = f"\nЗа цей час світло з'являлось і знову зникало: {p['flaps']} раз(и)." if p.get("flaps") else ""
                     tg.clients(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(back)}, мережа стабільна.\nБез мережі: {dur(mins)}.{fl}{bat}", urgent=True)
-                    for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until"):
+                    for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until", "off_kwh", "off_t", "off_snap", "off_emerg"):
                         p.pop(k, None)
                 elif "on_soc" not in p and soc is not None:
                     p["on_soc"] = soc
         if p.get("no_grid") and soc is not None:
             p["min_soc"] = min(p.get("min_soc", 100), soc)
+        # Сколько кВт·ч отдала АКБ за отключение: по ним бот сам узнаёт фактическую ёмкость.
+        if no_grid is True and p.get("no_grid") and p.get("off_t") and dkw is not None:
+            dt = (t - datetime.fromisoformat(p["off_t"])).total_seconds() / 3600
+            if 0 < dt < 0.5:  # большой разрыв (не было связи) не считаем
+                p["off_kwh"] = p.get("off_kwh", 0) + dkw * dt
+            p["off_t"] = t.isoformat()
+        if p.get("no_grid") and st["dtek"].get("emerg"):
+            p["off_emerg"] = True  # во время отключения ДТЭК объявил экстренные - для проверки очереди не считаем
+        cap_warn(tg, st, sid, p, t)
+        queue_review(tg, st, sid, p, t)
 
         low = soc is not None and soc < low_soc
         if low and not p.get("low_soc") and p.get("no_grid") and not p.get("on_since"):
@@ -1486,11 +1929,16 @@ def check(api, tg, st, dtek):
     if do_alerts:
         st["alerts_at"] = t.isoformat()
     firmware_mismatch(tg, st)
+    write_fields(st, fields)
     # клиенты, которые подключились, но за 30 минут так и не прислали очередь
-    for p in st["stations"].values():
+    for sid, p in st["stations"].items():
         for chat_id, j in list((p.get("joins") or {}).items()):
             if (t - datetime.fromisoformat(j["at"])).total_seconds() > 1800:
-                tg.staff_msg(f"👤 {j['who']} подключился к <b>{esc(p.get('title') or p.get('name'))}</b>. Очередь ДТЭК не указал — задайте сами: /queue {esc(p.get('name'))} 3.1")
+                head = f"👤 {j['who']} подключился к <b>{esc(p.get('title') or p.get('name'))}</b>."
+                if queues(p):  # очередь за это время поставил другой клиент или сотрудник
+                    tg.staff_msg(f"{head} Очередь ДТЭК {' и '.join(q.replace('GPV', '') for q in queues(p))}.")
+                else:
+                    tg.send(tg.staff, f"{head} Очередь ДТЭК не указана ни им, ни другими клиентами. Выберите:", queue_grid(f"q:{sid}:"))
                 p["joins"].pop(chat_id)
     morning(tg, st, dtek, t)
     return len(stations)
@@ -1508,9 +1956,13 @@ def dtek_alerts(tg, st, dtek):
     by_q, all_chats = {}, []
     for sid in st["stations"]:
         c = setup(st, cfgs, sid)
-        all_chats += c["chats"]
-        if c["queue"]:
-            by_q.setdefault(c["queue"], []).append((c["title"], c["chats"]))
+        p = st["stations"][sid]
+        all_chats += c["chats"]  # экстренные - всем, даже кто отключил графики
+        want = [ch for ch in c["chats"] if sched_on(p, ch)]
+        q2 = queue_key(p.get("queue2"))
+        for q, n in ((c["queue"], c["title"]), (q2, f"{c['title']} (лінія 2)")):
+            if q and want:
+                by_q.setdefault(q, []).append((n, want))
 
     # 1. общий текст ДТЭК: экстренные / аварийные
     att = dtek["attention"]
@@ -1669,11 +2121,31 @@ def diag(api, tg, st, dtek):
                      f"\nнапряжение сети: {', '.join(str(v) for k, v in sorted(volts.items()) if 'L1L2' not in k or len(volts) == 1) + ' В' if volts else 'нет в данных'}"
                      f"\nАКБ {kw(lt.get('batterySOC'), 1, 0)}% · нагрузка {kw(lt.get('consumptionPower'))} кВт · из сети {kw(lt.get('wirePower', lt.get('gridPower')))} кВт"
                      f"\nочередь ДТЭК: {(c['queue'] or 'не указана').replace('GPV', '')} · клиентов подключено: {len(c['chats'])}")
+        # АКБ: какие поля отдаёт Deye (только в группу сотрудников, не в журнал)
+        units = {}
+        for x in sn:
+            units.update(api.units.get(x) or {})
+        bat = [f"{k}={v}{(' ' + units[k]) if units.get(k) else ''}" for k, v in sorted(dev.items())
+               if k and re.search(r"batt|bms|capacit|soh", k, re.I)][:20]
+        p = st["stations"][sid]
+        cap, src = capacity(st, sid, p)
+        dkw = discharge_kw(lt)
+        lines.append(f"АКБ: разряд {'—' if dkw is None else f'{dkw:.1f}'} кВт (dischargePower {kw(lt.get('dischargePower'))}, chargePower {kw(lt.get('chargePower'))}, "
+                     f"солнце {kw(lt.get('generationPower'))}) · ёмкость: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна'}"
+                     f" · данные Deye на {hm(deye_time(lt)) if deye_time(lt) else '—'}"
+                     + (f"\nполя АКБ: <code>{esc(', '.join(bat))}</code>" if bat else "\nполей АКБ в данных инвертора нет"))
     if dtek:
         lines.append(f"\nДТЭК: график обновлён {esc(dtek['updated'])}, дни: {', '.join(sorted(dtek['days']))}")
     else:
         lines.append("\nДТЭК: график сейчас недоступен")
-    tg.staff_msg("\n".join(lines))
+    msg = ""  # длинная диагностика - несколькими сообщениями, по станциям
+    for ln in lines:
+        if msg and len(msg) + len(ln) > 3800:
+            tg.staff_msg(msg)
+            msg = ""
+        msg += ("\n" if msg else "") + ln
+    if msg:
+        tg.staff_msg(msg)
     # в журнал - только технические названия полей, без станций и значений
     print("DIAG mode:", mode)
     # разведка: какие оповещения об ошибках отдаёт Deye (только названия полей и коды)
@@ -1727,8 +2199,16 @@ def main():
             tg.staff_msg("⚠️ Графики ДТЭК не загружаются уже час. Отключения по станциям по-прежнему отслеживаются.")
     api = Deye()
     if mode == "cmd":
-        commands(tg, st, dtek)
+        commands(tg, st, dtek, api)
         print("Команды обработаны, сообщений:", tg.sent)
+        # Пока клиенты нажимают кнопки, таймер пропускает плановые проверки (запуск уже идёт).
+        # Поэтому запуск для команд сам делает проверку, если прошлая была больше 100 секунд назад.
+        la = st.get("last_check_at")
+        if not la or (now() - datetime.fromisoformat(la)).total_seconds() > 100:
+            n = check(api, tg, st, dtek)
+            dtek_alerts(tg, st, dtek)
+            st["last_check"], st["last_check_at"] = now().strftime("%Y-%m-%d %H:%M"), now().isoformat()
+            print(f"Заодно проверено станций: {n}")
     elif mode == "help":
         tg.staff_msg(HELP)
     elif mode == "setup":
@@ -1772,24 +2252,24 @@ def main():
             tg.staff_msg("⚠️ Отчёт за месяц не собрался: Deye Cloud не ответил. Запустите его вручную позже (Actions → monitor → report).")
             print("Отчёт: ошибка,", type(e).__name__)
     else:
-        commands(tg, st, dtek)
+        commands(tg, st, dtek, api)
         n = check(api, tg, st, dtek)
         dtek_alerts(tg, st, dtek)
-        st["last_check"] = now().strftime("%Y-%m-%d %H:%M")
+        st["last_check"], st["last_check_at"] = now().strftime("%Y-%m-%d %H:%M"), now().isoformat()
         print(f"Проверено станций: {n}, сообщений: {tg.sent}, ДТЭК: {'ок' if dtek else 'нет'}")
     blocked_clients(tg, st)
     # Память сохраняется в кэш каждый запуск, а в репозиторий - только когда изменилось важное
     # (клиенты, очереди, отключения, отправленные сообщения) или раз в 6 часов как резервная копия.
     def durable(x):
         x = json.loads(json.dumps(x, sort_keys=True, ensure_ascii=False))
-        for k in ("last_check", "alerts_at", "committed_at"):
+        for k in ("last_check", "last_check_at", "alerts_at", "committed_at"):
             x.pop(k, None)
         x.get("tg", {}).pop("done", None)
         x.get("tg", {}).pop("offset", None)
         for k in ("fail", "fail_since"):
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
-            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how"):
+            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye"):
                 q.pop(k, None)
         return x
 

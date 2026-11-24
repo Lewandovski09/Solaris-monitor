@@ -101,6 +101,8 @@ jobs:
               git reset -q --hard origin/main
               cp /tmp/solaris-cache/state.enc state.enc
               git add state.enc
+              # список полей Deye (без значений и данных станций) - чтобы настраивать код без доступа к Deye
+              if [ -f "$STATE_FILE.fields" ]; then cp "$STATE_FILE.fields" deye_fields.json; git add deye_fields.json; fi
               if [ -f "$STATE_FILE.inbox" ]; then
                 while read -r f; do
                   if [ -n "$f" ] && [ -f "inbox/$f" ]; then git rm -q "inbox/$f"; fi
