@@ -43,15 +43,21 @@ async function fast(key, upd) {
   const chat = String(cq ? ((cq.message || {}).chat || {}).id : (msg.chat || {}).id);
   if (!cq && (msg.chat || {}).type !== "private") return null;
   const look = cq ? String(cq.data || "") : String(msg.text || "").trim().split("@")[0];
-  if (cq && !/^o:[^:]+:(menu|status|grafik)$/.test(look)) return null;
   let snap;
   try { snap = await snapshot(key); } catch (e) { return null; }
   const c = snap && snap.chats && snap.chats[chat];
-  const ans = c && ((cq ? c.cb : c.t) || {})[look];
+  if (!c) return null;
+  const ans = ((cq ? c.cb : c.t) || {})[look];
   if (!ans) return null;
-  const [text, markup] = Array.isArray(ans) ? ans : [ans, c.kb];
-  return { method: "sendMessage", chat_id: chat, text: String(text).slice(0, 4000), parse_mode: "HTML",
-           disable_web_page_preview: true, reply_markup: markup || c.kb };
+  if (ans.m) return { chat, ch: !!ans.ch, h: ans.h, m: ans.m, clear: snap.clear || [] };
+  if (!Array.isArray(ans)) return { chat, ch: false, m: [[ans, c.kb]] }; // старый формат снимка
+  return { chat, ch: false, m: [[ans[0], ans[1] || c.kb]] };
+}
+
+function msgBody(chat, text, markup) {
+  const b = { chat_id: chat, text: String(text).slice(0, 4000), parse_mode: "HTML", disable_web_page_preview: true };
+  if (markup) b.reply_markup = markup;
+  return b;
 }
 
 module.exports = async (req, res) => {
@@ -95,12 +101,19 @@ module.exports = async (req, res) => {
     return res.status(200).send("skip");
 
   const quick = await fast(key, upd);
-  if (quick) {
-    if (cq && process.env.TELEGRAM_TOKEN) {
-      await tgCall("sendMessage", quick);
-      return res.status(200).json({ method: "answerCallbackQuery", callback_query_id: cq.id });
+  if (quick && process.env.TELEGRAM_TOKEN) {
+    // мгновенный ответ из снимка
+    if (cq && cq.message && quick.clear && quick.clear.includes(String(cq.data || "").split(":")[0]) && cq.data !== "cq:?")
+      tgCall("editMessageReplyMarkup", { chat_id: quick.chat, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } });
+    for (const [t, mk] of quick.m) await tgCall("sendMessage", msgBody(quick.chat, t, mk));
+    if (quick.ch) {
+      // нажатие что-то меняет: передаём боту, он применит молча (и пришлёт правильный ответ, если этот устарел)
+      upd._answered = true; upd._chat = quick.chat; upd._h = quick.h;
+    } else {
+      return cq ? res.status(200).json({ method: "answerCallbackQuery", callback_query_id: cq.id }) : res.status(200).send("ok");
     }
-    return res.status(200).json(quick);
+  } else if (quick && !cq && quick.m.length === 1 && !quick.ch) {
+    return res.status(200).json(Object.assign({ method: "sendMessage" }, msgBody(quick.chat, quick.m[0][0], quick.m[0][1])));
   }
 
   const iv = crypto.randomBytes(16);
@@ -116,6 +129,7 @@ module.exports = async (req, res) => {
   const run = await gh("/actions/workflows/monitor.yml/dispatches", "POST", { ref: "main", inputs: { mode: "cmd" } });
   if (!run.ok) return res.status(502).send("dispatch failed " + run.status);
   // Telegram lets a webhook answer with one API call: stop the button spinner / show "typing"
-  if (cq) return res.status(200).json({ method: "answerCallbackQuery", callback_query_id: cq.id, text: "⏳ Секунду…" });
+  if (cq) return res.status(200).json(Object.assign({ method: "answerCallbackQuery", callback_query_id: cq.id }, upd._answered ? {} : { text: "⏳ Секунду…" }));
+  if (upd._answered) return res.status(200).send("ok");
   return res.status(200).json({ method: "sendChatAction", chat_id: msg.chat.id, action: "typing" });
 };

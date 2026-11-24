@@ -112,9 +112,13 @@ class Telegram:
         self.blocked = set()
         self.kb_fn = None  # клавиатура клиента своя: кнопка «Виробіток» только у тех, у кого есть панели
         self.kb_seen = None  # какие кнопки у какого клиента уже стоят (st["kb_sent"])
+        self.mute = None  # чат, которому Vercel уже ответил мгновенно: сообщения не шлём, а запоминаем для сверки
+        self.muted = []
 
     def photo(self, chat, path, caption, markup=None):
         """Картинка с подписью. Если не получилось - обычный текст."""
+        if self.mute is not None and str(chat) == str(self.mute):
+            return self.send(chat, caption, markup)
         try:
             data = {"chat_id": chat, "caption": caption[:1000], "parse_mode": "HTML"}
             if markup is KEYBOARD and self.kb_fn:
@@ -145,6 +149,9 @@ class Telegram:
                 markup = self.kb_fn(chat)
                 if self.kb_seen is not None:
                     self.kb_seen[str(chat)] = hashlib.sha1(json.dumps(markup, sort_keys=True).encode()).hexdigest()[:10]
+            if self.mute is not None and str(chat) == str(self.mute):
+                self.muted.append((text, markup))
+                return True
             body = {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
             if markup:
                 body["reply_markup"] = markup
@@ -847,6 +854,9 @@ def kb_for(st, chat):
     rows.append([{"text": BTN_SET}, {"text": BTN_HELP}])
     return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
 
+
+# нажатия, после которых у старого сообщения убираем кнопки
+CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr")
 
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
@@ -1834,32 +1844,161 @@ def hook_secret():
     return hashlib.sha256(("tg:" + env("INBOX_KEY")).encode()).hexdigest()
 
 
-def write_snapshot(st, dtek):
-    """Готовые ответы на простые кнопки для каждого клиента - чтобы приёмник на Vercel отвечал за секунду,
-    не дожидаясь запуска на GitHub. Шифруется ключом INBOX_KEY (как входящие), лежит в ветке snapshot."""
+HC_FIELDS = ("year", "month", "day", "generationValue", "consumptionValue", "purchaseValue", "gridValue",
+             "chargeValue", "chargeRatio", "dischargeValue")
+
+
+class CacheMiss(Exception):
+    pass
+
+
+def cached_history(st, real):
+    """История Deye с кэшем на 20 минут в памяти бота: реже ходим в Deye и можем заранее готовить ответы."""
+    def history(sid, gran, a, b):
+        hc = st.setdefault("hcache", {})
+        key = f"{sid}|{gran}|{a}|{b}"
+        e = hc.get(key)
+        if e and time.time() - e["at"] < 1200:
+            return e["rows"]
+        if real is None:
+            raise CacheMiss(key)
+        rows = [{k: r.get(k) for k in HC_FIELDS if k in r} for r in real(sid, gran, a, b)]
+        hc[key] = {"at": time.time(), "rows": rows}
+        for k in [k for k, v in hc.items() if time.time() - v["at"] > 86400]:
+            hc.pop(k)
+        return rows
+    return history
+
+
+class SimAPI:
+    """Deye для репетиции: только кэш истории. Чего нет в кэше - ответ не готовим заранее."""
+    def __init__(self, st):
+        self.token = "sim"
+        self.history = cached_history(st, None)
+
+    def login(self):
+        pass
+
+    def latest(self, sid):
+        raise CacheMiss("latest")
+
+
+class SimTG:
+    """Telegram для репетиции: записывает, что бот ответил бы этому чату."""
+    def __init__(self, st, chat, staff):
+        self.token, self.staff, self.chat, self.out = "sim", staff, str(chat), []
+        self.sent, self.last_id, self.blocked, self.mute, self.muted, self.kb_seen = 0, None, set(), None, [], None
+        self.kb_fn = lambda c: kb_for(st, c)
+
+    def send(self, chat, text, markup=None):
+        if str(chat) == self.chat:
+            self.out.append([text[:4000], self.kb_fn(chat) if markup is KEYBOARD else markup])
+        return True
+
+    def photo(self, chat, path, caption, markup=None):
+        return self.send(chat, caption, markup)
+
+    def staff_msg(self, text):
+        return True
+
+    def clients(self, chats, text, urgent=False, markup=None):
+        for c in chats or []:
+            self.send(c, text, markup)
+        return True
+
+    def call(self, *a, **k):
+        return {}
+
+    def api(self, *a, **k):
+        return []
+
+    def quiet(self):
+        return False
+
+
+def rehearse(st, chat, staff, dtek, inp):
+    """Прогнать нажатие на копии памяти: что бот ответит и поменяет ли что-то. None - заранее не готовим."""
+    import copy
+    sim = copy.deepcopy({k: v for k, v in st.items() if k != "hcache"})
+    sim["hcache"] = st.get("hcache", {})
+    sim.setdefault("log", [])
+    stg, sapi = SimTG(sim, chat, staff), SimAPI(st)
+    try:
+        if inp.startswith("cb:"):
+            callback(stg, sim, chat, inp[3:], "клиент", dtek, sapi)
+        else:
+            handle_message(stg, sim, chat, inp, "клиент", dtek, sapi)
+    except CacheMiss:
+        return None
+    except Exception:
+        return None
+    if not stg.out or any("не віддав" in t or "не відповідає" in t for t, _ in stg.out):
+        return None
+    drop = ("hcache", "await")
+    a = json.dumps({k: v for k, v in st.items() if k not in drop}, sort_keys=True, default=str)
+    b_ = json.dumps({k: v for k, v in sim.items() if k not in drop}, sort_keys=True, default=str)
+    changed = a != b_ or (sim.get("await") or {}).get(str(chat)) != (st.get("await") or {}).get(str(chat))
+    return {"m": stg.out, "ch": changed, "h": hashlib.sha1(stg.out[0][0].encode()).hexdigest()[:12]}
+
+
+def warm_cache(api, st, t):
+    """Подогреть кэш истории Deye, чтобы «Виробіток» и «Економія» отвечали мгновенно."""
+    for sid, p in st["stations"].items():
+        if not p.get("clients"):
+            continue
+        try:
+            if p.get("has_pv"):
+                pv_days(api, sid, 8)
+                pv_month(api, sid)
+            if p.get("tariff"):
+                pv_days(api, sid, 7)
+                lm = t.replace(day=1) - timedelta(days=1)
+                api.history(int(sid), 3, lm.strftime("%Y-%m"), lm.strftime("%Y-%m"))
+                api.history(int(sid), 3, f"{t.year}-01", t.strftime("%Y-%m"))
+                api.history(int(sid), 4, "2015", str(t.year))
+                api.history(int(sid), 3, t.strftime("%Y-%m"), t.strftime("%Y-%m"))
+        except Exception:
+            pass
+
+
+def write_snapshot(st, dtek, api=None):
+    """Готовые ответы для приёмника на Vercel: на любую кнопку клиента бот заранее «репетирует» ответ на копии
+    памяти. Vercel отвечает из этого снимка за секунду; если нажатие что-то меняет - пересылает его сюда,
+    и бот применяет изменение без повторного сообщения (а если ответ успел устареть - присылает правильный).
+    Шифруется ключом INBOX_KEY, лежит в ветке snapshot."""
     key = env("INBOX_KEY")
     if not key:
         return
+    if api is not None:
+        safe(Telegram(), st, "кэш истории", warm_cache, api, st, now())
+    staff = env("TELEGRAM_CHAT_ID")
     chats = {}
     for chat in sorted({str(c) for p in st["stations"].values() for c in p.get("clients") or []}):
         kb = kb_for(st, chat)
-        objs = my_objects(st, chat)
-        status = client_status(st, chat)
-        sched = client_schedule(st, chat, dtek)
-        hlp = client_help(st, chat)
-        t = {BTN_STATUS: status, "/status": status, BTN_SCHED: sched, "/grafik": sched, BTN_HELP: hlp, "/help": hlp}
-        cb = {}
-        for sid, p in objs:
-            menu = obj_menu(st, chat, sid)
-            t[obj_button(p)] = menu
-            cb[f"o:{sid}:menu"] = menu
-            cb[f"o:{sid}:status"] = client_status(st, chat, only=sid)
-            cb[f"o:{sid}:grafik"] = client_schedule(st, chat, dtek, only=sid)
-        chats[chat] = {"kb": kb, "t": t, "cb": cb}
-    data = json.dumps({"at": int(time.time()), "chats": chats}, ensure_ascii=False).encode("utf-8")
+        texts = [b["text"] for row in kb["keyboard"] for b in row] + ["/status", "/grafik", "/help", "/cherga",
+                                                                      "/nalashtuvannia", "/ekonomiya", "/vyrobitok", "/grafiky"]
+        t_ans, cb_ans, queue = {}, {}, []
+        for x in dict.fromkeys(texts):
+            r = rehearse(st, chat, staff, dtek, x)
+            if r:
+                t_ans[x] = r
+                queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
+        seen = set()
+        while queue and len(seen) < 120:  # кнопки внутри ответов, на 2 уровня вглубь
+            d = queue.pop(0)
+            if not d or d in seen or d == "cq:?":
+                continue
+            seen.add(d)
+            r = rehearse(st, chat, staff, dtek, "cb:" + d)
+            if r:
+                cb_ans[d] = r
+                if len(seen) < 60:
+                    queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
+        chats[chat] = {"kb": kb, "t": t_ans, "cb": cb_ans}
+    data = json.dumps({"at": int(time.time()), "v": 2, "clear": list(CLEAR_KINDS), "chats": chats}, ensure_ascii=False).encode("utf-8")
     iv = secrets.token_hex(16)
     r = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-base64", "-A", "-K", hashlib.sha256(key.encode()).hexdigest(), "-iv", iv],
-                       input=data, capture_output=True, timeout=20)
+                       input=data, capture_output=True, timeout=30)
     if r.returncode == 0:
         with open(STATE + ".snap", "w", encoding="utf-8") as f:
             f.write(iv + "\n" + r.stdout.decode() + "\n")
@@ -1907,35 +2046,58 @@ def commands(tg, st, dtek=None, api=None):
         done.add(u.get("update_id"))
         T["done"] = sorted(done)[-200:]
         T["offset"] = max(T.get("offset", 0), u["update_id"] + 1)
-        cq = u.get("callback_query")
-        if cq:
-            c_chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
-            c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
-            if c_chat:
-                mid = (cq.get("message") or {}).get("message_id")
-                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr") and cq.get("data") != "cq:?":
-                    tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
-                callback(tg, st, c_chat, cq.get("data"), c_who, dtek, api)
+        if u.get("_answered"):  # Vercel уже ответил мгновенно по снимку: применяем изменения, а сообщения - только если вышло иначе
+            chat_a = str(u.get("_chat") or "")
+            tg.mute, tg.muted = chat_a, []
+            try:
+                handle_update(tg, st, u, dtek, api)
+            finally:
+                tg.mute = None
+            got = hashlib.sha1((tg.muted[0][0] if tg.muted else "").encode()).hexdigest()[:12]
+            if tg.muted and got != u.get("_h"):
+                print("мгновенный ответ устарел - отправляем правильный")
+                for text_m, mk in tg.muted:
+                    tg.send(chat_a, text_m, mk)
             continue
-        m = u.get("message") or {}
-        chat = str((m.get("chat") or {}).get("id", ""))
-        text = (m.get("text") or "").strip()
-        private = (m.get("chat") or {}).get("type", "private") == "private"
-        if not chat or not text or (not text.startswith("/") and (chat == str(tg.staff) or not private)):
-            continue
-        cmd, _, arg = text.partition(" ")
-        cmd, arg = cmd.split("@")[0].lower(), arg.strip()
+        handle_update(tg, st, u, dtek, api)
+
+
+def handle_update(tg, st, u, dtek=None, api=None):
+    """Одно сообщение или нажатие кнопки."""
+    cq = u.get("callback_query")
+    if cq:
+        c_chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+        c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
+        if c_chat:
+            mid = (cq.get("message") or {}).get("message_id")
+            if mid and str(cq.get("data", "")).split(":")[0] in CLEAR_KINDS and cq.get("data") != "cq:?":
+                tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
+            callback(tg, st, c_chat, cq.get("data"), c_who, dtek, api)
+        return
+    m = u.get("message") or {}
+    chat = str((m.get("chat") or {}).get("id", ""))
+    text = (m.get("text") or "").strip()
+    private = (m.get("chat") or {}).get("type", "private") == "private"
+    if not chat or not text or (not text.startswith("/") and (chat == str(tg.staff) or not private)):
+        return
+    who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
+    handle_message(tg, st, chat, text, who, dtek, api)
+
+
+def handle_message(tg, st, chat, text, who, dtek=None, api=None):
+    cmd, _, arg = text.partition(" ")
+    cmd, arg = cmd.split("@")[0].lower(), arg.strip()
+    if True:
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
             cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_SCHED_OFF: "/grafiky", BTN_SCHED_ON: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
-        who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
             staff_command(tg, st, cmd, arg)
         elif cmd == "/start":
             sid = next((k for k, p in st["stations"].items() if arg and p.get("code") == arg), None)
             if not sid:
                 tg.send(chat, "Вітаємо! Це бот сповіщень Solaris. Щоб підключитися, відкрийте посилання, яке вам надіслав менеджер.")
-                continue
+                return
             p = st["stations"][sid]
             p.setdefault("names", {})[chat] = who
             if chat in (p.get("clients") or []):
@@ -1943,7 +2105,7 @@ def commands(tg, st, dtek=None, api=None):
                 tg.send(chat, f"Ви вже підключені до <b>{esc(p.get('title') or p.get('name'))}</b>. Кнопки внизу екрана працюють.", KEYBOARD)
                 if not queue_key(p.get("queue")):
                     ask_queue(tg, st, chat, sid=sid)
-                continue
+                return
             p.setdefault("clients", []).append(chat)
             title = esc(p.get("title") or p.get("name"))
             ask = ""
@@ -3531,6 +3693,7 @@ def main():
                          "но «по графику / вне графика» и напоминания сейчас не работают. Источник графиков — сторонний проект "
                          "Baskerville42/outage-data-ua; бот напишет, когда графики вернутся.")
     api = Deye()
+    api.history = cached_history(st, api.history)  # история Deye с кэшем на 20 минут
     if mode == "cmd":
         safe(tg, st, "команды", commands, tg, st, dtek, api)
         print("Команды обработаны, сообщений:", tg.sent)
@@ -3594,12 +3757,12 @@ def main():
         print(f"Проверено станций: {n}, сообщений: {tg.sent}, ДТЭК: {'ок' if dtek else 'нет'}")
     blocked_clients(tg, st)
     if mode in ("check", "cmd"):
-        safe(tg, st, "быстрые ответы", write_snapshot, st, dtek)
+        safe(tg, st, "быстрые ответы", write_snapshot, st, dtek, api)
     # Память сохраняется в кэш каждый запуск, а в репозиторий - только когда изменилось важное
     # (клиенты, очереди, отключения, отправленные сообщения) или раз в 6 часов как резервная копия.
     def durable(x):
         x = json.loads(json.dumps(x, sort_keys=True, ensure_ascii=False))
-        for k in ("last_check", "last_check_at", "alerts_at", "committed_at", "dev_fail", "api_fail", "api_fail_since", "last_err", "err_sent"):
+        for k in ("last_check", "last_check_at", "alerts_at", "committed_at", "dev_fail", "api_fail", "api_fail_since", "last_err", "err_sent", "hcache", "kb_sent"):
             x.pop(k, None)
         x.get("tg", {}).pop("done", None)
         x.get("tg", {}).pop("offset", None)
