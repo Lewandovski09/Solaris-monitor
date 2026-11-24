@@ -733,7 +733,7 @@ HELP = ("📋 <b>Команды бота</b>\n"
         "задать вручную: <code>/lines пбс ats</code> (или 1, 2, auto). Убрать вторую линию: <code>/queue пбс 3.1 0</code>.\n\n"
         "<b>Ёмкость АКБ</b>\n"
         "<code>/akb пбс 180</code> — ёмкость в кВт·ч. По ней бот считает клиенту, на сколько хватит заряда. "
-        "<code>/akb пбс</code> — показать, что вписано, что передаёт Deye и что получилось по факту отключений.\n\n"
+        "<code>/akb пбс 0</code> — убрать вписанную. <code>/akb пбс</code> — показать, что вписано, что передаёт Deye и что получилось по факту отключений.\n\n"
         "<b>Назвать объект по-человечески</b>\n"
         "<code>/title пбс = Офис на Хуторской</code> — так объект будет называться в сообщениях клиенту.\n\n"
         "<b>Контакт техподдержки для клиентов</b>\n"
@@ -1261,6 +1261,10 @@ def staff_command(tg, st, cmd, arg):
         p = S[sid]
         if m:
             val = float(m.group(2).replace(",", "."))
+            if val == 0:  # /akb name 0 - убрать вписанную вручную
+                p.pop("cap_kwh", None)
+                tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: вписанная ёмкость убрана, бот снова берёт её из Deye и по факту отключений.")
+                return
             if not 1 <= val <= 5000:
                 tg.staff_msg("Ёмкость пишется в кВт·ч, например /akb ПБС 180.")
                 return
@@ -1785,9 +1789,29 @@ def check(api, tg, st, dtek):
         # кВт·ч = А·ч × напряжение, а напряжение гуляет с зарядом (у полной АКБ выше номинала, у пустой ниже).
         # Поэтому пересчитываем только при заряде 40-60% (напряжение около номинального)
         # или если в инверторе поменяли А·ч (добавили модули, поправили настройку).
-        if cap_d and (not p.get("cap_deye") or p.get("cap_sig") != cap_sig or (soc_now is not None and 40 <= soc_now <= 60)):
-            if p.get("cap_sig") and p["cap_sig"] != cap_sig and p.get("cap_deye"):
-                tg.staff_msg(f"ℹ️ <b>{esc(name)}</b>: в инверторе изменилась ёмкость АКБ: было ~{p['cap_deye']:.0f} кВт·ч, стало ~{cap_d:.0f} кВт·ч. "
+        # Смена А·ч в Deye: принимаем, только если новое значение держится 5 проверок подряд (~10 мин) -
+        # Deye иногда отдаёт неполные данные. Резкий скачок (меньше 70% или больше 150% прежней) сам не принимаем:
+        # пишем в группу и считаем по прежней, пока не подтвердит факт отключений или /akb.
+        changed = bool(cap_d and p.get("cap_sig") and p.get("cap_deye")) and p["cap_sig"] != cap_sig
+        if changed:
+            p["cap_sig_n"] = p.get("cap_sig_n", 0) + 1 if p.get("cap_sig_new") == cap_sig else 1
+            p["cap_sig_new"] = cap_sig
+            jump = not 0.7 <= cap_d / p["cap_deye"] <= 1.5
+            if p["cap_sig_n"] >= 5 and jump and p.get("cap_rejected") != cap_sig:
+                p["cap_rejected"] = cap_sig
+                tg.staff_msg(f"⚠️ <b>{esc(name)}</b>: Deye вдруг показывает ёмкость АКБ ~{cap_d:.0f} кВт·ч вместо ~{p['cap_deye']:.0f}.\n"
+                             f"Данные инвертора: было <code>{esc(p['cap_sig'])}</code>, стало <code>{esc(cap_sig)}</code> (А·ч).\n"
+                             f"Прогнозы клиенту считаю по прежней ~{p['cap_deye']:.0f} кВт·ч. Если ёмкость правда изменилась (сняли модули) — "
+                             f"<code>/akb {esc(name)} {cap_d:.0f}</code>. Если нет — ничего делать не нужно, бот сверит с фактом отключений.")
+            if p["cap_sig_n"] < 5 or jump:
+                cap_d = None
+        else:
+            for k in ("cap_sig_new", "cap_sig_n", "cap_rejected"):
+                p.pop(k, None)
+        if cap_d and (not p.get("cap_deye") or changed or (soc_now is not None and 40 <= soc_now <= 60 and p.get("cap_sig") == cap_sig)):
+            if changed:
+                tg.staff_msg(f"ℹ️ <b>{esc(name)}</b>: в инверторе изменилась ёмкость АКБ: было ~{p['cap_deye']:.0f} кВт·ч, стало ~{cap_d:.0f} кВт·ч "
+                             f"(<code>{esc(p['cap_sig'])}</code> → <code>{esc(cap_sig)}</code>). "
                              "Если добавляли или меняли модули — всё верно, прогнозы уже считаются по новой.")
             p["cap_deye"], p["cap_deye1"], p["cap_sig"] = round(cap_d, 1), round(cap_1, 1), cap_sig
         # Для настройки кода: какие поля отдаёт Deye. Только названия и единицы - без значений и названий станций.
@@ -2300,7 +2324,7 @@ def main():
         for k in ("fail", "fail_since"):
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
-            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig"):
+            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected"):
                 q.pop(k, None)
         return x
 
