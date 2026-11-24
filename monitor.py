@@ -1784,6 +1784,10 @@ def check(api, tg, st, dtek):
         for sn in sns.get(sid, []):
             dev.update(devdata.get(sn) or {})
             units.update(api.units.get(sn) or {})
+        if p.get("cap_v") != 2:  # однократно: сбросить ёмкость, принятую до защиты от скачков (Dynamica: сбой 100 А·ч вместо 300)
+            for k in ("cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected"):
+                p.pop(k, None)
+            p["cap_v"] = 2
         cap_d, cap_1, cap_sig = deye_cap_kwh(dev, units)
         soc_now = num(lt.get("batterySOC"))
         # кВт·ч = А·ч × напряжение, а напряжение гуляет с зарядом (у полной АКБ выше номинала, у пустой ниже).
