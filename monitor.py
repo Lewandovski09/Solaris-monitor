@@ -805,9 +805,41 @@ def has_pv_chat(st, chat):
     return any(p.get("has_pv") for p in st["stations"].values() if str(chat) in [str(c) for c in p.get("clients") or []])
 
 
+def my_objects(st, chat):
+    return [(sid, p) for sid, p in st["stations"].items() if str(chat) in [str(c) for c in p.get("clients") or []]]
+
+
+def obj_button(p):
+    return ("🏠 " + str(p.get("title") or p.get("name")).strip())[:32]
+
+
+def obj_menu(st, chat, sid):
+    """Меню одного объекта: что клиент может сделать на нём."""
+    p = st["stations"][sid]
+    last = p.get("last") or {}
+    if p.get("offline"):
+        head = "🔴 станція не на зв'язку"
+    elif p.get("no_grid"):
+        head = "🟠 світла немає" + (f", АКБ {last['soc']:.0f}%" if last.get("soc") is not None else "")
+    else:
+        head = "🟢 світло є" + (f", АКБ {last['soc']:.0f}%" if last.get("soc") is not None else "")
+    on = sched_on(p, chat)
+    b = lambda txt, act: {"text": txt, "callback_data": f"o:{sid}:{act}"}
+    rows = [[b("🔌 Стан", "status"), b("🗓 Графік", "grafik")],
+            [b("🔁 Черга", "queue"), b("🔕 Вимкнути графіки" if on else "🔔 Увімкнути графіки", "notify")]]
+    rows.append([b("☀️ Виробіток", "pv"), b("💰 Економія", "save")] if p.get("has_pv") else [b("💰 Економія", "save")])
+    rows.append([b("⚙️ Налаштування", "set")])
+    return f"<b>{esc(p.get('title') or p.get('name'))}</b>: {head}. Що зробити?", {"inline_keyboard": rows}
+
+
 def kb_for(st, chat):
     """Клавиатура клиента: «💰 Економія» у всех (инвертор с АКБ есть у всех), «☀️ Виробіток» - только если есть панели."""
-    mine = [p for p in st["stations"].values() if str(chat) in [str(c) for c in p.get("clients") or []]]
+    objs = my_objects(st, chat)
+    if len(objs) > 1:  # несколько объектов: сначала объекты, меню - по нажатию на объект
+        btns = [{"text": obj_button(p)} for _, p in objs]
+        return {"keyboard": [btns[i:i + 2] for i in range(0, len(btns), 2)] + [[{"text": BTN_STATUS}, {"text": BTN_HELP}]],
+                "resize_keyboard": True, "is_persistent": True}
+    mine = [p for _, p in objs]
     ons = {sched_on(p, chat) for p in mine}
     notify = BTN_SCHED_OFF if ons == {True} else BTN_SCHED_ON if ons == {False} else BTN_NOTIFY  # кнопка сразу показывает, что сделает
     rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": notify}]]
@@ -938,6 +970,28 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         else:
             tg.send(chat, save_calc(api, st, c_sid, per), {"inline_keyboard": save_periods(c_sid, st["stations"][c_sid])})
         return
+    if kind == "o":  # меню объекта (у кого несколько объектов)
+        c_sid, _, act = rest.partition(":")
+        p = st["stations"].get(c_sid)
+        if not p or chat not in (p.get("clients") or []):
+            return
+        if act == "status":
+            tg.send(chat, client_status(st, chat, api, only=c_sid), KEYBOARD)
+        elif act == "grafik":
+            tg.send(chat, client_schedule(st, chat, dtek, only=c_sid), KEYBOARD)
+        elif act == "queue":
+            ask_queue(tg, st, chat, change=True, sid=c_sid)
+        elif act == "notify":
+            sched_toggle(tg, st, chat, c_sid)
+        elif act == "pv":
+            tg.send(chat, pv_reply(st, chat, api, only=c_sid), KEYBOARD)
+        elif act == "save":
+            save_menu(tg, st, chat, c_sid)
+        elif act == "set":
+            settings_menu(tg, st, chat, c_sid)
+        elif act == "menu":
+            tg.send(chat, *obj_menu(st, chat, c_sid))
+        return
     if kind in ("zs", "zg", "zr"):  # настройки клиента
         c_sid, _, arg = rest.partition(":")
         if chat not in (st["stations"].get(c_sid, {}).get("clients") or []):
@@ -1040,6 +1094,8 @@ def client_help(st, chat=None):
             "• екстрені відключення;\n"
             "• станція зникла зі зв'язку — і чому;\n"
             "• звіт за місяць.\n\n"
+            + ("<b>У вас кілька об'єктів.</b> Внизу екрана — кнопка 🏠 для кожного: натисніть на об'єкт, і відкриється меню, що з ним можна зробити. "
+               f"{BTN_STATUS} — стан усіх об'єктів одразу.\n\n" if chat is not None and len(my_objects(st, chat)) > 1 else "") +
             "<b>Кнопки внизу екрана:</b>\n"
             f"{BTN_STATUS} — чи є світло, заряд АКБ, навантаження.\n"
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
@@ -1101,7 +1157,7 @@ def pv_month(api, sid):
     return {"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue"))}
 
 
-def pv_reply(st, chat, api):
+def pv_reply(st, chat, api, only=None):
     """Кнопка «Виробіток»: сегодня, вчера, 7 дней, месяц - по каждому объекту клиента с панелями."""
     out = []
     t = now()
@@ -1111,7 +1167,7 @@ def pv_reply(st, chat, api):
         except Exception:
             return "Deye Cloud зараз не відповідає, спробуйте за кілька хвилин."
     for sid, p in st["stations"].items():
-        if chat not in (p.get("clients") or []):
+        if chat not in (p.get("clients") or []) or (only and sid != only):
             continue
         title = esc(p.get("title") or p.get("name"))
         try:
@@ -1661,10 +1717,10 @@ def pv_weekly(api, tg, st, t):
             tg.send(c, txt, kb)
 
 
-def client_status(st, chat, api=None):
+def client_status(st, chat, api=None, only=None):
     out = []
     for sid, p in st["stations"].items():
-        if chat not in (p.get("clients") or []):
+        if chat not in (p.get("clients") or []) or (only and sid != only):
             continue
         if api and not p.get("offline"):
             # Кнопка показывает свежие данные из Deye, а не то, что сохранила последняя проверка.
@@ -1707,11 +1763,11 @@ def client_status(st, chat, api=None):
     return "\n\n".join(out)
 
 
-def client_schedule(st, chat, dtek):
+def client_schedule(st, chat, dtek, only=None):
     out = []
     t = now()
     for sid, p in st["stations"].items():
-        if chat not in (p.get("clients") or []):
+        if chat not in (p.get("clients") or []) or (only and sid != only):
             continue
         title = esc(p.get("title") or p.get("name"))
         qs = queues(p)
@@ -1768,6 +1824,37 @@ INBOX = os.path.join(HERE, "inbox")
 
 def hook_secret():
     return hashlib.sha256(("tg:" + env("INBOX_KEY")).encode()).hexdigest()
+
+
+def write_snapshot(st, dtek):
+    """Готовые ответы на простые кнопки для каждого клиента - чтобы приёмник на Vercel отвечал за секунду,
+    не дожидаясь запуска на GitHub. Шифруется ключом INBOX_KEY (как входящие), лежит в ветке snapshot."""
+    key = env("INBOX_KEY")
+    if not key:
+        return
+    chats = {}
+    for chat in sorted({str(c) for p in st["stations"].values() for c in p.get("clients") or []}):
+        kb = kb_for(st, chat)
+        objs = my_objects(st, chat)
+        status = client_status(st, chat)
+        sched = client_schedule(st, chat, dtek)
+        hlp = client_help(st, chat)
+        t = {BTN_STATUS: status, "/status": status, BTN_SCHED: sched, "/grafik": sched, BTN_HELP: hlp, "/help": hlp}
+        cb = {}
+        for sid, p in objs:
+            menu = obj_menu(st, chat, sid)
+            t[obj_button(p)] = menu
+            cb[f"o:{sid}:menu"] = menu
+            cb[f"o:{sid}:status"] = client_status(st, chat, only=sid)
+            cb[f"o:{sid}:grafik"] = client_schedule(st, chat, dtek, only=sid)
+        chats[chat] = {"kb": kb, "t": t, "cb": cb}
+    data = json.dumps({"at": int(time.time()), "chats": chats}, ensure_ascii=False).encode("utf-8")
+    iv = secrets.token_hex(16)
+    r = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-base64", "-A", "-K", hashlib.sha256(key.encode()).hexdigest(), "-iv", iv],
+                       input=data, capture_output=True, timeout=20)
+    if r.returncode == 0:
+        with open(STATE + ".snap", "w", encoding="utf-8") as f:
+            f.write(iv + "\n" + r.stdout.decode() + "\n")
 
 
 def read_inbox():
@@ -1867,6 +1954,9 @@ def commands(tg, st, dtek=None, api=None):
                            "/help": lambda: client_help(st, chat)}[cmd](), KEYBOARD)
         elif cmd == "/cherga" and is_client:
             ask_queue(tg, st, chat, change=True)
+        elif is_client and any(text == obj_button(p) for _, p in my_objects(st, chat)):
+            sid = next(k for k, p in my_objects(st, chat) if text == obj_button(p))
+            tg.send(chat, *obj_menu(st, chat, sid))
         elif cmd == "/nalashtuvannia" and is_client:
             settings_start(tg, st, chat)
         elif cmd == "/grafiky" and is_client:
@@ -3494,6 +3584,8 @@ def main():
         st["last_check"], st["last_check_at"] = now().strftime("%Y-%m-%d %H:%M"), now().isoformat()
         print(f"Проверено станций: {n}, сообщений: {tg.sent}, ДТЭК: {'ок' if dtek else 'нет'}")
     blocked_clients(tg, st)
+    if mode in ("check", "cmd"):
+        safe(tg, st, "быстрые ответы", write_snapshot, st, dtek)
     # Память сохраняется в кэш каждый запуск, а в репозиторий - только когда изменилось важное
     # (клиенты, очереди, отключения, отправленные сообщения) или раз в 6 часов как резервная копия.
     def durable(x):

@@ -89,6 +89,18 @@ jobs:
             rm -f /tmp/peek.k "$STATE_FILE.peek"
           fi
 
+      - name: Быстрые ответы для приёмника (ветка snapshot, одна перезаписываемая версия)
+        if: always()
+        run: |
+          if [ -f "$STATE_FILE.snap" ]; then
+            export GIT_AUTHOR_NAME=solaris-monitor GIT_AUTHOR_EMAIL=monitor@users.noreply.github.com
+            export GIT_COMMITTER_NAME=solaris-monitor GIT_COMMITTER_EMAIL=monitor@users.noreply.github.com
+            blob=$(git hash-object -w "$STATE_FILE.snap")
+            tree=$(printf "100644 blob %s\tsnapshot.enc\n" "$blob" | git mktree)
+            commit=$(git commit-tree "$tree" -m snapshot)
+            git push -q -f origin "$commit:refs/heads/snapshot" || echo "snapshot не записался"
+          fi
+
       - name: Сохранить память в кэш
         if: always()
         uses: actions/cache/save@v4
