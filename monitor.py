@@ -2271,8 +2271,9 @@ def check(api, tg, st, dtek):
                 p["cap_sig_n"] = p.get("cap_sig_n", 0) + 1 if p.get("cap_sig_new") == cap_sig else 1
                 p["cap_sig_new"] = cap_sig
                 jump = not 0.7 <= cap_d / p["cap_deye"] <= 1.5
-                if p["cap_sig_n"] >= 5 and jump and p.get("cap_rejected") != cap_sig:
-                    p["cap_rejected"] = cap_sig
+                rej = p.setdefault("cap_rej", {})  # Deye иногда «прыгает» туда-обратно: про одно значение не чаще раза в 7 дней
+                if p["cap_sig_n"] >= 5 and jump and (not rej.get(cap_sig) or (t - datetime.fromisoformat(rej[cap_sig])).days >= 7):
+                    rej[cap_sig] = t.isoformat()
                     tg.staff_msg(f"⚠️ <b>{esc(name)}</b>: Deye вдруг показывает ёмкость АКБ ~{cap_d:.0f} кВт·ч вместо ~{p['cap_deye']:.0f}.\n"
                                  f"Данные инвертора: было <code>{esc(p['cap_sig'])}</code>, стало <code>{esc(cap_sig)}</code> (А·ч).\n"
                                  f"Прогнозы клиенту считаю по прежней ~{p['cap_deye']:.0f} кВт·ч. Если ёмкость правда изменилась (сняли модули) — "
@@ -2280,7 +2281,7 @@ def check(api, tg, st, dtek):
                 if p["cap_sig_n"] < 5 or jump:
                     cap_d = None
             else:
-                for k in ("cap_sig_new", "cap_sig_n", "cap_rejected"):
+                for k in ("cap_sig_new", "cap_sig_n"):
                     p.pop(k, None)
             # По номинальному напряжению цифра от заряда не зависит - обновляем сразу; иначе только при заряде 40-60%.
             steady = p.get("cap_sig") == cap_sig and (cap_nom or (soc_now is not None and 40 <= soc_now <= 60))
