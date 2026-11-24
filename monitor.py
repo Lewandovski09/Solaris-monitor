@@ -1287,6 +1287,8 @@ def staff_command(tg, st, cmd, arg):
                      f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}")
     elif cmd == "/health":
         tg.staff_msg(health(st))
+    elif cmd == "/id":  # айди этой группы - нужен для TELEGRAM_CHAT_ID в Vercel
+        tg.staff_msg(f"Айди этой группы (для TELEGRAM_CHAT_ID): <code>{esc(str(tg.staff))}</code>")
     elif cmd == "/akb":
         m = re.match(r"(.+?)\s+(\d+(?:[.,]\d+)?)\s*(квт.*|kwh)?\s*$", arg, re.I)
         sid, err = find_station(st, m.group(1) if m else arg)
