@@ -2,7 +2,7 @@
  "note": "Только названия полей Deye и единицы измерения. Значений и данных станций здесь нет.",
  "per_station": [
   {
-   "capacity_found": true,
+   "capacity_found": false,
    "device_types": [
     "BATTERY",
     "COLLECTOR",
@@ -67,14 +67,6 @@
     "ExternalCT1Power": "W",
     "ExternalCT2Power": "W",
     "ExternalCT3Power": "W",
-    "GenDailyRunTime": "h",
-    "GenPowerL1": "W",
-    "GenPowerL2": "W",
-    "GenPowerL3": "W",
-    "GenVoltageL1": "V",
-    "GenVoltageL2": "V",
-    "GenVoltageL3": "V",
-    "GeneratorActivePower": "W",
     "GridCurrentL1": "A",
     "GridCurrentL2": "A",
     "GridCurrentL3": "A",
@@ -126,11 +118,10 @@
     "TotalEnergyBuy": "kWh",
     "TotalEnergySell": "kWh",
     "TotalExternalCTPower": "W",
-    "TotalGeneratorPower": "W",
-    "TotalGeneratorProduction": "kWh",
     "TotalGridPower": "W",
     "TotalGridReactivePower": "Var",
     "TotalInverterOutputPower": "W",
+    "TotalMIPower": "W",
     "TotalSolarPower": "W",
     "UPSLoadPower": "W"
    },
