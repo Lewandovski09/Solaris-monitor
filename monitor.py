@@ -771,6 +771,9 @@ HELP = ("📋 <b>Команды бота</b>\n"
         "<b>Отключить клиента</b>\n"
         "<code>/reset пбс</code> — отключает всех клиентов станции и выдаёт новую ссылку. Старая перестаёт работать.\n\n"
 
+        "<b>Генератор</b>\n"
+        "<code>/gen пбс</code> — работает ли сейчас и моточасы. <code>/gen пбс то</code> — отметить ТО. <code>/gen пбс интервал 250</code> — интервал ТО в часах (по умолчанию 200). "
+        "Включение и выключение бот определяет сам: по входу GEN инвертора или по частоте, если генератор подключён через АВР.\n\n"
         "<b>Состояние самого бота</b>\n"
         "<code>/health</code> — когда была последняя проверка, отвечают ли Deye и ДТЭК, были ли ошибки программы.\n\n"
         "<b>Эта памятка</b>\n"
@@ -798,6 +801,7 @@ STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
                   ("contact", "Контакт техподдержки для клиентов"),
                   ("reset", "Отключить клиентов станции"),
                   ("links", "Все ссылки"),
+                  ("gen", "Генератор: моточасы, ТО — /gen пбс"),
                   ("health", "Состояние монитора: проверки, Deye, ДТЭК, ошибки"),
                   ("help", "Памятка")]
 
@@ -1016,7 +1020,9 @@ def client_status(st, chat, api=None):
                 line += f" · навантаження {last['load'] / 1000:.1f} кВт"
             if p.get("no_grid"):
                 left, how = runtime(st, sid, p, last["soc"], last.get("dkw"))
-                if how == "pv":
+                if p.get("gen_on"):
+                    line += f"\n⚙️ Працює генератор з {since_hm(datetime.fromisoformat(p['gen_since']))}."
+                elif how == "pv":
                     line += "\nЗараз АКБ не розряджається: навантаження покривають сонячні панелі."
                 elif left is not None and left > 0:
                     word = "За такого споживання" if how == "energy" else "За звичного споживання"
@@ -1285,6 +1291,22 @@ def staff_command(tg, st, cmd, arg):
                      + (f"\nграфики отключили клиенты: {len(p['nosched'])}" if p.get("nosched") else "") +
                      f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}"
                      f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}")
+    elif cmd == "/gen":
+        m = re.match(r"(.+?)\s+(то|сброс|интервал\s+\d+)\s*$", arg, re.I)
+        sid, err = find_station(st, m.group(1) if m else arg)
+        if err:
+            tg.staff_msg(err if arg else "Пример: /gen ПБС — моточасы генератора. /gen ПБС то — отметить ТО. /gen ПБС интервал 250 — интервал ТО, ч.")
+            return
+        p = S[sid]
+        if m and m.group(2).lower() in ("то", "сброс"):
+            p["gen_service_at"] = p.get("gen_hours", 0)
+        elif m:
+            p["gen_service"] = int(re.findall(r"\d+", m.group(2))[0])
+        h, done, svc = p.get("gen_hours", 0), p.get("gen_service_at", 0), p.get("gen_service", 200)
+        tg.staff_msg(f"⚙️ <b>{esc(p.get('name'))}</b>: " + (
+            f"генератор {'работает с ' + since_hm(datetime.fromisoformat(p['gen_since'])) if p.get('gen_on') else 'сейчас не работает'}.\n"
+            f"Моточасов всего (с начала наблюдения): {h:.1f} · после ТО: {h - done:.1f} из {svc}."
+            if p.get("has_gen") else "генератор на этом объекте бот ещё ни разу не видел."))
     elif cmd == "/health":
         tg.staff_msg(health(st))
     elif cmd == "/id":  # айди этой группы - нужен для TELEGRAM_CHAT_ID в Vercel
@@ -1486,6 +1508,132 @@ def device_alerts(tg, p, title, items, t):
                      f"{when.strftime('%d.%m %H:%M')}, {state}.{many}\n\n"
                      f"<b>Что это:</b> {what}.\n<b>Возможные причины:</b> {why}\n<b>Что сделать:</b> {do}"
                      "\n\n<b>Откуда это:</b> ошибку записал сам инвертор, программа взяла её из журнала Deye Cloud. Причины — типовые для такого вида ошибки, точную покажет осмотр на месте.")
+
+
+# ---------------------------------------------------------------- генератор и фазы
+GEN_P = re.compile(r"^(total)?gen(erator)?_?power$", re.I)
+GEN_V = re.compile(r"^gen(erator)?.*volt", re.I)
+GEN_F = re.compile(r"^gen(erator)?.*freq", re.I)
+
+
+def dev_val(dev, rx):
+    vals = [num(v) for k, v in (dev or {}).items() if k and rx.search(k)]
+    vals = [v for v in vals if v is not None]
+    return max(vals) if vals else None
+
+
+def gen_detect(dev, grid_on, dtek, q, t):
+    """Работает ли генератор и как бот это понял. Возвращает (True/False, способ, частота, напряжение).
+    1) вход GEN инвертора (у 6 кВт Deye есть мощность, напряжение и частота генератора);
+    2) генератор через АВР на входе сети: инвертор видит «сеть», но частота гуляет. Городская сеть держит
+       50,0 ±0,2 Гц; генератор - заметно хуже. Отклонение от 0,5 Гц - генератор; от 0,2 Гц - генератор,
+       только если по графику ДТЭК сейчас точно отключение (не на краю интервала)."""
+    gp, gv, gf = dev_val(dev, GEN_P), dev_val(dev, GEN_V), dev_val(dev, GEN_F)
+    if (gp is not None and gp > 150) or (gv and gv > 150 and gf and 45 < gf < 55):
+        return True, "port", gf, gv
+    f = num((dev or {}).get("GridFrequency"))
+    volts = [num(v) for k, v in (dev or {}).items() if k and VOLT_KEY.search(k)]
+    v = max([x for x in volts if x is not None] or [0])
+    if grid_on and f and 45 < f < 55:
+        if abs(f - 50) >= 0.5:
+            return True, "freq", f, v
+        if abs(f - 50) >= 0.2 and q and all(planned_now(dtek, q, t + timedelta(minutes=d), margin_min=0) for d in (-30, 30)):
+            return True, "freq+schedule", f, v
+    return False, "", f, v
+
+
+def gen_track(tg, st, sid, p, title, chat, t, on, how, f, v, soc, dkw, no_grid):
+    """Генератор: события клиенту, моточасы, проблемы сотрудникам. Включение/выключение - после 2 проверок подряд."""
+    name = esc(p.get("name"))
+    if on == bool(p.get("gen_on")):
+        p.pop("gen_flip", None)
+    else:
+        p["gen_flip"] = p.get("gen_flip", 0) + 1
+        if p["gen_flip"] >= 2:
+            p.pop("gen_flip", None)
+            if on:
+                p["gen_on"], p["gen_since"], p["gen_how"], p["has_gen"] = True, t.isoformat(), how, True
+                starts = [x for x in p.get("gen_starts", []) if (t - datetime.fromisoformat(x)).total_seconds() < 3600] + [t.isoformat()]
+                p["gen_starts"] = starts
+                tg.clients(chat, f"⚙️ <b>{title}</b>: запущено генератор о ~{hm(t)}." + (" Світла від мережі досі немає." if how != "port" or no_grid else ""))
+                if len(starts) >= 3 and day_once(p, "gen_cycle", t):
+                    tg.staff_msg(f"⚙️ <b>{name}</b>: генератор запускается {len(starts)}-й раз за час — частые пуски.\n"
+                                 "Как определено: включения генератора за последние 60 минут.\n"
+                                 "Возможные причины: генератор глохнет под нагрузкой (мала мощность, топливо, воздушный фильтр); "
+                                 "слишком узкий диапазон заряда для автозапуска в настройках GEN; инвертор отбрасывает генератор из-за частоты/напряжения.")
+            else:
+                mins = (t - datetime.fromisoformat(p["gen_since"])).total_seconds() / 60 if p.get("gen_since") else 0
+                p["gen_hours"] = round(p.get("gen_hours", 0) + mins / 60, 2)
+                for k in ("gen_on", "gen_since", "gen_how", "gen_bad", "gen_drain"):
+                    p.pop(k, None)
+                tg.clients(chat, f"⚙️ <b>{title}</b>: генератор зупинено, працював {dur(mins)}." + (" Світла від мережі немає — об'єкт працює від АКБ." if no_grid else ""))
+                svc = p.get("gen_service", 200)
+                done = p.get("gen_service_at", 0)
+                if p["gen_hours"] - done >= svc and day_once(p, "gen_svc", t):
+                    tg.staff_msg(f"🔧 <b>{name}</b>: генератор отработал {p['gen_hours'] - done:.0f} моточасов после ТО (интервал {svc} ч) — пора на обслуживание.\n"
+                                 f"После ТО: <code>/gen {name} то</code>. Другой интервал: <code>/gen {name} интервал 250</code>.")
+    if not p.get("gen_on"):
+        # генератор на объекте есть (его уже видели), света нет, АКБ почти пустая, а он не работает
+        if p.get("has_gen") and no_grid and soc is not None and soc < 25 and p.get("off_since") and once_key(p, "gen_nostart", p["off_since"]):
+            tg.staff_msg(f"⚠️ <b>{name}</b>: света нет, АКБ {soc:.0f}%, а генератор не работает.\n"
+                         "Как определено: генератор на этом объекте раньше запускался, а сейчас его мощности нет.\n"
+                         "Что проверить: автозапуск (настройки GEN в инверторе, сигнал запуска), топливо, аккумулятор стартера; или позвонить клиенту, чтобы запустил вручную.")
+        return
+    mins_on = (t - datetime.fromisoformat(p["gen_since"])).total_seconds() / 60
+    bad = (f and not 49 <= f <= 51) or (v and v > 50 and not 195 <= v <= 253)
+    p["gen_bad"] = p.get("gen_bad", 0) + 1 if bad else 0
+    if p["gen_bad"] >= 3 and day_once(p, "gen_quality", t):
+        tg.staff_msg(f"⚙️ <b>{name}</b>: генератор даёт ток плохого качества: {f or '—'} Гц, {v or '—'} В (норма 49–51 Гц, 195–253 В).\n"
+                     "Как определено: 3 проверки подряд вне нормы.\nЧем грозит: инвертор может отбрасывать генератор, техника клиента греется. "
+                     "Что сделать: ТО генератора (регулятор оборотов/AVR), не перегружать его; в инверторе — проверить допуски частоты для входа генератора.")
+    drain = mins_on >= 10 and dkw is not None and dkw > 0.5
+    p["gen_drain"] = p.get("gen_drain", 0) + 1 if drain else 0
+    if p["gen_drain"] >= 3 and day_once(p, "gen_drain", t):
+        tg.staff_msg(f"⚙️ <b>{name}</b>: генератор работает {dur_ru(mins_on)}, а АКБ всё равно разряжается ({dkw:.1f} кВт).\n"
+                     "Как определено: мощность разряда АКБ 3 проверки подряд при работающем генераторе.\n"
+                     "Возможные причины: нагрузка больше мощности генератора; в инверторе ограничена мощность/ток от генератора; "
+                     "инвертор не принимает генератор (частота/напряжение) и работает от АКБ.")
+    if how == "port" and not no_grid and mins_on >= 10 and day_once(p, "gen_with_grid", t):
+        tg.staff_msg(f"⚙️ <b>{name}</b>: генератор работает {dur_ru(mins_on)}, хотя сеть есть. Забыли выключить или не срабатывает автоостанов (настройки GEN).")
+
+
+def day_once(p, key, t):
+    """Не чаще раза в сутки по одной теме на станцию."""
+    sent = p.setdefault("once", {})
+    if sent.get(key) and (t - datetime.fromisoformat(sent[key])).total_seconds() < 86400:
+        return False
+    sent[key] = t.isoformat()
+    return True
+
+
+def once_key(p, key, val):
+    """Один раз на значение (например, на одно отключение)."""
+    sent = p.setdefault("once", {})
+    if sent.get(key) == val:
+        return False
+    sent[key] = val
+    return True
+
+
+def phase_check(tg, p, dev, t):
+    """Перегруз одной фазы трёхфазного инвертора при нормальной общей нагрузке."""
+    rated = num((dev or {}).get("RatedPower"))
+    ph = [num(dev.get(k)) for k in ("LoadPhasePowerA", "LoadPhasePowerB", "LoadPhasePowerC")]
+    if None in ph:
+        ph = [num(dev.get(k)) for k in ("LoadPowerL1", "LoadPowerL2", "LoadPowerL3")]
+    if not rated or None in ph:
+        return
+    lim = rated / 3
+    i = max(range(3), key=lambda k: ph[k])
+    over = ph[i] > 0.9 * lim
+    p["ph_over"] = p.get("ph_over", 0) + 1 if over else 0
+    names = "ABC"
+    if p["ph_over"] >= 2 and day_once(p, "phase", t):
+        tg.staff_msg(f"⚡ <b>{esc(p.get('name'))}</b>: фаза {names[i]} нагружена на {ph[i] / 1000:.1f} кВт из ~{lim / 1000:.1f} возможных "
+                     f"({ph[i] / lim * 100:.0f}%), остальные: " + ", ".join(f"{names[k]} {ph[k] / 1000:.1f}" for k in range(3) if k != i) + " кВт.\n"
+                     f"Как посчитано: номинал инвертора {rated / 1000:.0f} кВт ÷ 3 фазы; 2 проверки подряд выше 90%.\n"
+                     f"Чем грозит: перегрузка и отключение инвертора по одной фазе, хотя суммарно запас есть. "
+                     f"Что сделать: перекинуть часть нагрузки с фазы {names[i]} на менее загруженные.")
 
 
 def problems(tg, st, p, title, dev, soc, load, low_soc, t, no_grid):
@@ -2029,6 +2177,12 @@ def check(api, tg, st, dtek):
                 dkw = p["last"]["dkw"] = sorted(h)[len(h) // 2]
 
             no_grid, how = grid_state(lt, dev)
+            # Генератор: через вход GEN или через АВР на входе сети. Если через АВР - для клиента это не «світло є».
+            g_on, g_how, g_f, g_v = gen_detect(dev, no_grid is False, dtek, q, t)
+            if (g_on and g_how != "port") or (p.get("gen_on") and p.get("gen_how") != "port" and no_grid is False and not g_on and p.get("gen_flip") is None):
+                no_grid, how = True, "generator"  # пока генератор на входе сети, отключение продолжается
+            gen_track(tg, st, sid, p, title, chat, t, g_on, g_how, g_f, g_v, soc, dkw, no_grid is True or bool(p.get("no_grid")))
+            phase_check(tg, p, dev, t)
             p["how"] = how
             if no_grid is True:
                 p["off_n"] = p.get("off_n", 0) + 1
@@ -2519,7 +2673,7 @@ def main():
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
             for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected",
-                      "dkw_h", "last_soc_t", "soc_sus", "miss_n"):
+                      "dkw_h", "last_soc_t", "soc_sus", "miss_n", "gen_flip", "gen_bad", "gen_drain", "ph_over"):
                 q.pop(k, None)
         return x
 
