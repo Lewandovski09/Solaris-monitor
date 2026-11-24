@@ -24,5 +24,6 @@ module.exports = async (req, res) => {
       "Что сделать: cron-job.org → задание «Solaris» → включено ли оно и что в истории запусков.", true);
     return res.status(500).send("stale " + lastMin);
   }
-  return res.status(200).send("ok, last run " + lastMin + " min ago");
+  const exp = r.headers.get("github-authentication-token-expiration") || "no expiration";
+  return res.status(200).send("ok, last run " + lastMin + " min ago; github token expires: " + exp);
 };
