@@ -2,7 +2,7 @@
  "note": "Только названия полей Deye и единицы измерения. Значений и данных станций здесь нет.",
  "per_station": [
   {
-   "capacity_found": true,
+   "capacity_found": false,
    "device_types": [
     "BATTERY",
     "COLLECTOR",
