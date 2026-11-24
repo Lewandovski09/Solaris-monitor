@@ -110,11 +110,14 @@ class Telegram:
         self.sent = 0
         self.last_id = None
         self.blocked = set()
+        self.kb_fn = None  # клавиатура клиента своя: кнопка «Виробіток» только у тех, у кого есть панели
 
     def photo(self, chat, path, caption, markup=None):
         """Картинка с подписью. Если не получилось - обычный текст."""
         try:
             data = {"chat_id": chat, "caption": caption[:1000], "parse_mode": "HTML"}
+            if markup is KEYBOARD and self.kb_fn:
+                markup = self.kb_fn(chat)
             if markup:
                 data["reply_markup"] = json.dumps(markup)
             with open(path, "rb") as f:
@@ -137,6 +140,8 @@ class Telegram:
         if not self.token or not chat:
             return False
         try:
+            if markup is KEYBOARD and self.kb_fn:
+                markup = self.kb_fn(chat)
             body = {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
             if markup:
                 body["reply_markup"] = markup
@@ -786,13 +791,24 @@ HELP = ("📋 <b>Команды бота</b>\n"
 BTN_STATUS, BTN_SCHED, BTN_HELP, BTN_QUEUE = "🔌 Стан станції", "🗓 Графік", "❓ Допомога", "🔁 Змінити чергу"
 BTN_NOTIFY = "🔔 Графіки: увімк./вимк."
 BTN_PV = "☀️ Виробіток"
-KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_PV}, {"text": BTN_HELP}]],
+KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
+
+
+def has_pv_chat(st, chat):
+    return any(p.get("has_pv") for p in st["stations"].values() if str(chat) in [str(c) for c in p.get("clients") or []])
+
+
+def kb_for(st, chat):
+    """Клавиатура клиента: «☀️ Виробіток» появляется, только если хотя бы на одном его объекте есть панели."""
+    if not has_pv_chat(st, chat):
+        return KEYBOARD
+    return {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}],
+                         [{"text": BTN_PV}, {"text": BTN_HELP}]], "resize_keyboard": True, "is_persistent": True}
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
                    ("grafiky", "Увімкнути або вимкнути графіки ДТЕК"),
-                   ("vyrobitok", "Виробіток сонячних панелей: сьогодні, вчора, тиждень, місяць"),
                    ("help", "Що вміє бот і як змінити чергу"),
                    ("stop", "Вимкнути сповіщення")]
 STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
@@ -976,7 +992,7 @@ def support(st):
     return f"\nТехнічна підтримка Solaris: {esc(c)}" if c else ""
 
 
-def client_help(st):
+def client_help(st, chat=None):
     c = st.get("contact")
     return ("ℹ️ <b>Бот Solaris стежить за вашою станцією і сам пише, коли щось змінюється:</b>\n"
             "• вимкнули або увімкнули світло;\n"
@@ -989,7 +1005,8 @@ def client_help(st):
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
             f"{BTN_NOTIFY} — вимкнути або знову увімкнути графіки й нагадування, окремо по кожному об'єкту.\n"
-            f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
+            + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
+               if chat is None or has_pv_chat(st, chat) else "") +
             f"{BTN_HELP} — ця підказка.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
@@ -1050,9 +1067,7 @@ def pv_reply(st, chat, api):
             out.append(f"☀️ <b>{title}</b>: Deye Cloud зараз не віддав дані, спробуйте за кілька хвилин.")
             continue
         if not mon["gen"] and not any(x["gen"] for x in days.values()):
-            p["has_pv"] = False
-            out.append(f"☀️ <b>{title}</b>: виробітку сонячних панелей за цей місяць немає — схоже, панелей на об'єкті немає.")
-            continue
+            continue  # панелей нет - этот объект не показываем
         p["has_pv"] = True
         d = lambda k: days.get((t - timedelta(days=k)).strftime("%Y-%m-%d"), {}).get("gen", 0)
         week = sum(d(k) for k in range(7))
@@ -1064,7 +1079,28 @@ def pv_reply(st, chat, api):
         if mon.get("use") and mon.get("buy") is not None:
             lines.append(f"Власною енергією за місяць покрито {max(0, (1 - mon['buy'] / mon['use']) * 100):.0f}% споживання.")
         out.append("\n".join(lines))
-    return "\n\n".join(out) or "Об'єктів не знайдено."
+    return "\n\n".join(out) or "На ваших об'єктах сонячних панелей немає — виробітку немає."
+
+
+def pv_detect(api, tg, sid, p, lt, t):
+    """Есть ли на объекте панели. Видели выработку (сейчас >50 Вт или за месяц в истории Deye) - есть.
+    Историю спрашиваем не чаще раза в сутки и только пока панелей не видели. Появились - сообщаем клиентам, у них появится кнопка."""
+    if p.get("has_pv"):
+        return
+    found = (num(lt.get("generationPower")) or 0) > 50
+    if not found and p.get("pv_checked") != t.strftime("%Y-%m-%d") and (10 <= t.hour < 16 or not p.get("pv_checked_once")):
+        p["pv_checked"] = t.strftime("%Y-%m-%d")
+        try:
+            found = pv_month(api, sid)["gen"] > 0
+        except Exception:
+            pass
+    if found:
+        first = p.get("has_pv") is None and not p.get("pv_checked_once")
+        p["has_pv"] = True
+        if not first:  # панели появились на объекте, где их не было - сказать клиентам
+            tg.clients(p.get("clients"), f"☀️ <b>{esc(p.get('title') or p.get('name'))}</b>: бот бачить сонячні панелі. "
+                       f"У меню з'явилась кнопка «{BTN_PV}» — виробіток за сьогодні, вчора, тиждень і місяць; раз на тиждень прийде підсумок.", markup=KEYBOARD)
+    p["pv_checked_once"] = True
 
 
 def pv_weekly(api, tg, st, t):
@@ -1076,7 +1112,7 @@ def pv_weekly(api, tg, st, t):
     mon_this = (t - timedelta(days=t.weekday())).date()
     for sid, p in st["stations"].items():
         chats = [c for c in p.get("clients") or [] if c not in (p.get("nopvweek") or [])]
-        if not chats:
+        if not chats or not p.get("has_pv"):
             continue
         try:
             days = pv_days(api, sid, 15)
@@ -1086,7 +1122,6 @@ def pv_weekly(api, tg, st, t):
         last, prev = gen(0, 7), gen(7, 14)
         tot, ptot = sum(v for _, v in last), sum(v for _, v in prev)
         if not tot and not ptot:
-            p["has_pv"] = False
             continue
         best = max(last, key=lambda x: x[1])
         WD = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
@@ -1287,7 +1322,7 @@ def commands(tg, st, dtek=None, api=None):
             ask = ""
             tg.photo(chat, os.path.join(HERE, "assets", "logo.jpg"),
                      f"✅ Підключено: <b>{title}</b>.\nСюди надходитимуть повідомлення, коли на об'єкті вимикають і вмикають світло, графіки ДТЕК і звіт за місяць.{ask}", KEYBOARD)
-            if tg.send(chat, client_help(st), KEYBOARD) and tg.last_id:  # памятку закрепляем вверху чата
+            if tg.send(chat, client_help(st, chat), KEYBOARD) and tg.last_id:  # памятку закрепляем вверху чата
                 tg.call("pinChatMessage", chat_id=chat, message_id=tg.last_id, disable_notification=True)
             if not queue_key(p.get("queue")):
                 ask_queue(tg, st, chat)
@@ -1297,7 +1332,7 @@ def commands(tg, st, dtek=None, api=None):
                 p.setdefault("joins", {})[chat] = {"who": who, "at": now().isoformat()}
         elif cmd in ("/status", "/grafik", "/help") and is_client:
             tg.send(chat, {"/status": lambda: client_status(st, chat, api), "/grafik": lambda: client_schedule(st, chat, dtek),
-                           "/help": lambda: client_help(st)}[cmd](), KEYBOARD)
+                           "/help": lambda: client_help(st, chat)}[cmd](), KEYBOARD)
         elif cmd == "/cherga" and is_client:
             ask_queue(tg, st, chat, change=True)
         elif cmd == "/grafiky" and is_client:
@@ -2351,6 +2386,7 @@ def check(api, tg, st, dtek):
             p.pop("last", None)
             apply_latest(p, lt, t)
             dkw = p["last"].get("dkw")
+            pv_detect(api, tg, sid, p, lt, t)
             if dkw is not None:  # мощность разряда - медиана последних 3 проверок: один скачок прогноз не дёргает
                 h = (p.get("dkw_h") or [])[-2:] + [dkw]
                 p["dkw_h"] = h
@@ -2766,6 +2802,7 @@ def main():
         print("Память не расшифровалась - остановка без изменений")
         sys.exit(1)
     st = load_state()
+    tg.kb_fn = lambda chat: kb_for(st, chat)
     before = json.dumps(st, sort_keys=True, ensure_ascii=False)
     if mode == "test":
         ok = tg.staff_msg("✅ Монитор Solaris подключён. Сюда будут приходить уведомления о станциях и графиках ДТЭК.")
