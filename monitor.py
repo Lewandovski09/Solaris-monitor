@@ -2125,6 +2125,34 @@ def report(api, tg, st):
     return n
 
 
+def peek(api, st):
+    """Отчёт для Claude (с разрешения владельца, 24.11.2026): что бот видит в Deye и его память по станциям.
+    Без чатов и имён клиентов. Шифруется открытым ключом claude_pub.pem (шаг GitHub Actions) -
+    прочитать может только владелец закрытого ключа. Запускается только вручную: режим peek."""
+    api.login()
+    out = {"at": now().isoformat(), "stations": []}
+    for s in api.stations_with_devices():
+        sid = str(s.get("id") or s.get("stationId"))
+        sns = [str(d.get("deviceSn")) for d in s.get("deviceListItems") or [] if str(d.get("deviceType", "")).upper() == "INVERTER"]
+        try:
+            dev = api.device_latest(sns) if sns else {}
+        except Exception as e:
+            dev = {"error": str(e)[-80:]}
+        try:
+            lt = api.latest(int(sid))
+        except Exception as e:
+            lt = {"error": str(e)[-80:]}
+        p = st["stations"].get(sid, {})
+        out["stations"].append({"sid": sid, "name": p.get("name"), "inverters": dev, "latest": lt,
+                                "units": {sn: api.units.get(sn) for sn in sns},
+                                "memory": {k: v for k, v in p.items() if k not in ("clients", "names", "joins", "code", "nosched", "off_snap")},
+                                "log": [x for x in st["log"] if x.get("sid") == sid][-10:]})
+    with open(STATE + ".peek", "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, default=str)
+    open(STATE + ".commit", "w").close()
+    print("peek: станций", len(out["stations"]))
+
+
 def probe(api):
     """Разведка: какие организации есть у аккаунта и сколько станций видно с каждым входом. В журнал - только числа."""
     api.login()
@@ -2296,6 +2324,8 @@ def main():
             st.setdefault("tg", {})["webhook"] = False
             tg.staff_msg("Быстрые команды выключены: бот снова отвечает при очередной проверке.")
         print("webhook:", st["tg"]["webhook"])
+    elif mode == "peek":
+        peek(api, st)
     elif mode == "probe":
         probe(api)
     elif mode == "diag":

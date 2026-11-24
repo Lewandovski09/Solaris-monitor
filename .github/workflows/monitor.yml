@@ -10,7 +10,7 @@ on:
         description: "check - проверка, test - тест Telegram, diag - диагностика, report - отчёт"
         default: "check"
         type: choice
-        options: [check, cmd, help, setup, probe, test, diag, report, tokenwarn, webhook, webhook-off]
+        options: [check, cmd, help, setup, probe, peek, test, diag, report, tokenwarn, webhook, webhook-off]
 
 permissions:
   contents: write
@@ -80,6 +80,14 @@ jobs:
           if [ -f "$STATE_FILE" ]; then
             openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STATE_KEY -in "$STATE_FILE" -out /tmp/solaris-cache/state.enc
           fi
+          # режим peek: отчёт для Claude. Случайный ключ шифрует отчёт, сам ключ - открытым ключом claude_pub.pem
+          if [ -f "$STATE_FILE.peek" ] && [ -f claude_pub.pem ]; then
+            mkdir -p /tmp/peek
+            openssl rand -hex 32 > /tmp/peek.k
+            openssl pkeyutl -encrypt -pubin -inkey claude_pub.pem -in /tmp/peek.k -out /tmp/peek/peek.key.enc
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/tmp/peek.k -in "$STATE_FILE.peek" -out /tmp/peek/peek.enc
+            rm -f /tmp/peek.k "$STATE_FILE.peek"
+          fi
 
       - name: Сохранить память в кэш
         if: always()
@@ -103,6 +111,7 @@ jobs:
               git add state.enc
               # список полей Deye (без значений и данных станций) - чтобы настраивать код без доступа к Deye
               if [ -f "$STATE_FILE.fields" ]; then cp "$STATE_FILE.fields" deye_fields.json; git add deye_fields.json; fi
+              if [ -f /tmp/peek/peek.enc ]; then mkdir -p claude_peek; cp /tmp/peek/peek.enc /tmp/peek/peek.key.enc claude_peek/; git add claude_peek; fi
               if [ -f "$STATE_FILE.inbox" ]; then
                 while read -r f; do
                   if [ -n "$f" ] && [ -f "inbox/$f" ]; then git rm -q "inbox/$f"; fi
