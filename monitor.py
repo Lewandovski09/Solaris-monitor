@@ -1225,13 +1225,13 @@ def staff_daily(api, tg, st, t):
     y = (t - timedelta(days=1)).strftime("%Y-%m-%d")
     gens = {}
     for sid, p in st["stations"].items():
-        if p.get("has_pv") and p.get("kwp"):
+        if p.get("has_pv"):
             try:
                 g = pv_days(api, sid, 2).get(y, {}).get("gen")
             except Exception:
                 g = None
             if g is not None:
-                gens[sid] = g / p["kwp"]
+                gens[sid] = g  # размер станции не важен: сравниваем с её же обычным отношением к остальным
         c = learned_cap(st, sid)
         if c:
             p.setdefault("cap_hist", {})[t.strftime("%Y-%m")] = round(c, 1)
@@ -1250,7 +1250,7 @@ def pv_underperform(tg, st, gens, day, t):
     if len(gens) < 3:
         return
     med = sorted(gens.values())[len(gens) // 2]
-    if med <= 0.2:  # совсем пасмурный день - ничего не сравниваем
+    if med <= 1:  # совсем пасмурный день - ничего не сравниваем
         return
     for sid, y in gens.items():
         p = st["stations"][sid]
@@ -1266,7 +1266,7 @@ def pv_underperform(tg, st, gens, day, t):
         if all(v < 0.8 * base for v in last3) and once_days(p, "pv_under", t, 14):
             tg.staff_msg(f"🧽 <b>{esc(p.get('name'))}</b>: панели 3 дня подряд дают меньше обычного — "
                          f"{sum(last3) / 3 / base * 100:.0f}% от своей нормы.\n"
-                         f"Как посчитано: выработка на 1 кВт панелей ({p['kwp']:g} кВт) в сравнении с остальными станциями в те же дни "
+                         f"Как посчитано: выработка станции в сравнении с остальными станциями в те же дни "
                          f"(погода у всех одна), против обычного отношения этой станции за прошлые {len(hist)} дн.\n"
                          "Возможные причины: грязь или снег на панелях, новая тень, отключился стринг или автомат DC. Что сделать: осмотр, мойка, проверка стрингов.")
 
