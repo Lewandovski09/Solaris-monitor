@@ -1,0 +1,20 @@
+{
+  "crons": [
+    {
+      "path": "/api/watchdog?h=5",
+      "schedule": "0 5 * * *"
+    },
+    {
+      "path": "/api/watchdog?h=9",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/watchdog?h=13",
+      "schedule": "0 13 * * *"
+    },
+    {
+      "path": "/api/watchdog?h=17",
+      "schedule": "0 17 * * *"
+    }
+  ]
+}
