@@ -3529,6 +3529,8 @@ def peek(api, st):
                                 "units": {sn: api.units.get(sn) for sn in sns},
                                 "memory": {k: v for k, v in p.items() if k not in ("clients", "names", "joins", "code", "nosched", "off_snap")},
                                 "log": [x for x in st["log"] if x.get("sid") == sid][-10:]})
+    chats = sorted({str(c) for p in st["stations"].values() for c in p.get("clients") or []})
+    out["keyboards"] = [[[b["text"] for b in row] for row in kb_for(st, c)["keyboard"]] for c in chats]  # без айди чатов
     with open(STATE + ".peek", "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, default=str)
     open(STATE + ".commit", "w").close()
