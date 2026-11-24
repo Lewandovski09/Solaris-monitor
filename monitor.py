@@ -2502,7 +2502,14 @@ def peek(api, st):
         except Exception as e:
             lt = {"error": str(e)[-80:]}
         p = st["stations"].get(sid, {})
-        out["stations"].append({"sid": sid, "name": p.get("name"), "inverters": dev, "latest": lt,
+        hist = {}
+        for gran, a_, b_ in ((2, (now() - timedelta(days=9)).strftime("%Y-%m-%d"), now().strftime("%Y-%m-%d")),
+                             (3, now().strftime("%Y-%m"), now().strftime("%Y-%m"))):
+            try:
+                hist[str(gran)] = api.history(int(sid), gran, a_, b_)
+            except Exception as e:
+                hist[str(gran)] = {"error": str(e)[-120:]}
+        out["stations"].append({"sid": sid, "name": p.get("name"), "inverters": dev, "latest": lt, "history": hist,
                                 "units": {sn: api.units.get(sn) for sn in sns},
                                 "memory": {k: v for k, v in p.items() if k not in ("clients", "names", "joins", "code", "nosched", "off_snap")},
                                 "log": [x for x in st["log"] if x.get("sid") == sid][-10:]})
