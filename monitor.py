@@ -547,28 +547,34 @@ def discharge_kw(lt):
 
 
 def deye_cap_kwh(dev, units):
-    """Ёмкость АКБ из данных инвертора в Deye, кВт·ч. У инверторов 50 кВт два входа АКБ
-    (BatteryRatedCapacity и Battery2RatingCapacity, в А·ч) - складываем оба: А·ч × напряжение своего входа."""
+    """Ёмкость АКБ из данных инвертора в Deye, кВт·ч: (всего, только первый вход, подпись А·ч).
+    У инверторов 50 кВт два входа АКБ (BatteryRatedCapacity и Battery2RatingCapacity, в А·ч):
+    А·ч × напряжение своего входа. Второй вход учитывается, только если на нём есть напряжение."""
     dev, units = dev or {}, units or {}
-    total = 0.0
-    for k, v in dev.items():
+    total, first, sig = 0.0, 0.0, []
+    for k, v in sorted(dev.items()):
         val = num(v)
         if not k or not CAP_KEY.search(k) or not val or val <= 0:
             continue
         u = str(units.get(k) or "").lower().replace("·", "").replace(" ", "")
+        second = bool(re.search(r"batt?(ery)?2|2$", k, re.I))
+        kwh = None
         if u == "kwh":
-            total += val
+            kwh = val
         elif u == "wh":
-            total += val / 1000
+            kwh = val / 1000
         elif u == "ah":
-            second = bool(re.search(r"batt?(ery)?2|2$", k, re.I))
             names = ("BatteryVoltage2", "BMS2Voltage") if second else ("BatteryVoltage", "BMSVoltage")
             volt = next((num(dev[n]) for n in names if (num(dev.get(n)) or 0) > 10), None)
             if volt is None and not second:
                 volt = 51.2
-            if volt:  # второй вход без напряжения - батареи там нет
-                total += val * volt / 1000
-    return total or None
+            if volt:
+                kwh = val * volt / 1000
+        if kwh:
+            total += kwh
+            first += 0 if second else kwh
+            sig.append(f"{k}={val:g}")
+    return (total, first or total, ",".join(sig)) if total else (None, None, "")
 
 
 def learned_cap(st, sid):
@@ -581,13 +587,22 @@ def learned_cap(st, sid):
 
 
 def capacity(st, sid, p):
-    """Ёмкость АКБ, кВт·ч, и откуда она: вписана командой /akb, из Deye, или вычислена по отключениям."""
+    """Ёмкость АКБ, кВт·ч, и откуда она.
+    1) вписана командой /akb - главная; 2) из Deye; 3) по факту отключений.
+    Если факт отключений уже есть и расходится с Deye больше чем на 20%, для прогноза берём факт:
+    в инвертор могли вписать неверные А·ч, оба входа 50 кВт могут идти на одну батарею, батарея стареет."""
     if p.get("cap_kwh"):
         return p["cap_kwh"], "вписана вручную"
-    if p.get("cap_deye"):
-        return p["cap_deye"], "из Deye"
-    c = learned_cap(st, sid)
-    return (c, "по прошлым отключениям") if c else (None, "")
+    fact = learned_cap(st, sid)
+    d = p.get("cap_deye")
+    if d and fact and abs(fact - d) / d > 0.2:
+        d1 = p.get("cap_deye1")
+        if d1 and d1 != d and abs(fact - d1) / d1 <= 0.2:
+            return d1, "из Deye, только первый вход АКБ (по факту отключений второй вход — та же батарея)"
+        return fact, "по факту отключений (Deye показывает другую)"
+    if d:
+        return d, "из Deye"
+    return (fact, "по прошлым отключениям") if fact else (None, "")
 
 
 def cap_warn(tg, st, sid, p, t):
@@ -602,6 +617,7 @@ def cap_warn(tg, st, sid, p, t):
     src = "вписана командой /akb" if p.get("cap_kwh") else "в настройках инвертора (Deye)"
     tg.staff_msg(f"⚙️ <b>{esc(p.get('name'))}</b>: ёмкость АКБ {src} — {set_cap:.0f} кВт·ч, а по факту отключений ~{fact:.0f} кВт·ч.\n"
                  f"Как посчитано: сколько кВт·ч отдала АКБ за отключение ÷ на сколько % упал заряд, медиана за 60 дней (отключения с падением от 10%).\n"
+                 f"Прогнозы клиенту уже считаются по факту{' (кроме случая, когда ёмкость вписана вручную)' if p.get('cap_kwh') else ''}.\n"
                  f"Что сделать: проверить Battery Capacity в настройках инвертора и количество модулей АКБ. Если в Deye неверно — поправить там; "
                  f"если верно, а батарея отдаёт меньше — проверить состояние АКБ (SOH, баланс модулей).")
 
@@ -1764,9 +1780,16 @@ def check(api, tg, st, dtek):
         for sn in sns.get(sid, []):
             dev.update(devdata.get(sn) or {})
             units.update(api.units.get(sn) or {})
-        cap_d = deye_cap_kwh(dev, units)
-        if cap_d:
-            p["cap_deye"] = round(cap_d, 1)
+        cap_d, cap_1, cap_sig = deye_cap_kwh(dev, units)
+        soc_now = num(lt.get("batterySOC"))
+        # кВт·ч = А·ч × напряжение, а напряжение гуляет с зарядом (у полной АКБ выше номинала, у пустой ниже).
+        # Поэтому пересчитываем только при заряде 40-60% (напряжение около номинального)
+        # или если в инверторе поменяли А·ч (добавили модули, поправили настройку).
+        if cap_d and (not p.get("cap_deye") or p.get("cap_sig") != cap_sig or (soc_now is not None and 40 <= soc_now <= 60)):
+            if p.get("cap_sig") and p["cap_sig"] != cap_sig and p.get("cap_deye"):
+                tg.staff_msg(f"ℹ️ <b>{esc(name)}</b>: в инверторе изменилась ёмкость АКБ: было ~{p['cap_deye']:.0f} кВт·ч, стало ~{cap_d:.0f} кВт·ч. "
+                             "Если добавляли или меняли модули — всё верно, прогнозы уже считаются по новой.")
+            p["cap_deye"], p["cap_deye1"], p["cap_sig"] = round(cap_d, 1), round(cap_1, 1), cap_sig
         # Для настройки кода: какие поля отдаёт Deye. Только названия и единицы - без значений и названий станций.
         fields.append({"inverters": len(sns.get(sid, [])),
                        "device_types": sorted({str(d.get("deviceType")) for d in s.get("deviceListItems") or []}),
@@ -2277,7 +2300,7 @@ def main():
         for k in ("fail", "fail_since"):
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
-            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye"):
+            for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig"):
                 q.pop(k, None)
         return x
 
