@@ -794,6 +794,7 @@ HELP = ("📋 <b>Команды бота</b>\n"
 BTN_STATUS, BTN_SCHED, BTN_HELP, BTN_QUEUE = "🔌 Стан станції", "🗓 Графік", "❓ Допомога", "🔁 Змінити чергу"
 BTN_NOTIFY = "🔔 Графіки: увімк./вимк."
 BTN_PV = "☀️ Виробіток"
+BTN_SET = "⚙️ Налаштування"
 BTN_SAVE = "💰 Економія"
 KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
@@ -805,7 +806,7 @@ def has_pv_chat(st, chat):
 
 def kb_for(st, chat):
     """Клавиатура клиента: «💰 Економія» у всех (инвертор с АКБ есть у всех), «☀️ Виробіток» - только если есть панели."""
-    rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}]]
+    rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_SET}]]
     rows.append([{"text": BTN_PV}, {"text": BTN_SAVE}] if has_pv_chat(st, chat) else [{"text": BTN_SAVE}])
     rows.append([{"text": BTN_HELP}])
     return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
@@ -814,7 +815,7 @@ def kb_for(st, chat):
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
-                   ("grafiky", "Увімкнути або вимкнути графіки ДТЕК"),
+                   ("nalashtuvannia", "Налаштування: графіки ДТЕК і зведення виробітку"),
                    ("help", "Що вміє бот і як змінити чергу"),
                    ("stop", "Вимкнути сповіщення")]
 STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
@@ -933,16 +934,34 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         else:
             tg.send(chat, save_calc(api, st, c_sid, per), {"inline_keyboard": save_periods(c_sid, st["stations"][c_sid])})
         return
-    if kind == "pw":  # еженедельный отчёт о выработке вкл/выкл
+    if kind in ("zs", "zg", "zr"):  # настройки клиента
+        c_sid, _, arg = rest.partition(":")
+        if chat not in (st["stations"].get(c_sid, {}).get("clients") or []):
+            return
+        p = st["stations"][c_sid]
+        if kind == "zg":
+            off = p.setdefault("nosched", [])
+            off.remove(str(chat)) if str(chat) in off else off.append(str(chat))
+            if not off:
+                p.pop("nosched", None)
+        elif kind == "zr":
+            cur = pv_pref(p, chat)
+            if arg == "none":
+                cur = set()
+            elif arg in ("d", "w", "m"):
+                cur ^= {arg}
+            p.setdefault("pvrep", {})[str(chat)] = sorted(cur)
+            if str(chat) in (p.get("nopvweek") or []):
+                p["nopvweek"].remove(str(chat))
+        settings_menu(tg, st, chat, c_sid)
+        return
+    if kind == "pw":  # еженедельный отчёт о выработке вкл/выкл (кнопка под недельным итогом)
         if chat in mine:
             p = st["stations"][rest]
-            off = p.setdefault("nopvweek", [])
-            if chat in off:
-                off.remove(chat)
-                tg.send(chat, "🔔 Щотижневий підсумок виробітку знову увімкнено.", KEYBOARD)
-            else:
-                off.append(chat)
-                tg.send(chat, f"🔕 Щотижневий підсумок виробітку вимкнено. Подивитися будь-коли — кнопка «{BTN_PV}».", KEYBOARD)
+            cur = pv_pref(p, chat) - {"w"}
+            p.setdefault("pvrep", {})[str(chat)] = sorted(cur)
+            tg.send(chat, f"🔕 Щотижневий підсумок виробітку вимкнено. Подивитися будь-коли — кнопка «{BTN_PV}»; "
+                          f"що надсилати — у «{BTN_SET}».", KEYBOARD)
         return
     if kind == "gs":  # графики вкл/выкл по объекту
         if chat in mine:
@@ -1021,7 +1040,7 @@ def client_help(st, chat=None):
             f"{BTN_STATUS} — чи є світло, заряд АКБ, навантаження.\n"
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
-            f"{BTN_NOTIFY} — вимкнути або знову увімкнути графіки й нагадування, окремо по кожному об'єкту.\n"
+            f"{BTN_SET} — що надсилати: графіки ДТЕК і нагадування, зведення виробітку панелей (щодня, щотижня, щомісяця), окремо по кожному об'єкту.\n"
             + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
                if chat is None or has_pv_chat(st, chat) else "") +
             f"{BTN_SAVE} — економія (панелі, інвертор з АКБ під час відключень) і витрати (заряд АКБ з мережі, генератор), і підсумок.\n" +
@@ -1520,10 +1539,87 @@ def kb_sync(tg, st, t):
         if True:  # у новичков кнопки отмечаются при /start (любое сообщение с кнопками), сюда попадают те, у кого кнопки старые
             extra = (f"\n{BTN_PV} — скільки виробили панелі: сьогодні, вчора, тиждень, місяць." if has_pv_chat(st, chat) else "") + \
                 (f"\n{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ (робота без світла), і разом.")
-            tg.send(chat, f"🔄 Бот оновився — нові кнопки внизу екрана:\n{BTN_NOTIFY} — вимкнути або увімкнути графіки ДТЕК окремо по кожному об'єкту.{extra}", kb)
+            tg.send(chat, f"🔄 Бот оновився — нові кнопки внизу екрана:\n{BTN_SET} — що надсилати: графіки ДТЕК"
+                          + (", зведення виробітку щодня / щотижня / щомісяця" if has_pv_chat(st, chat) else "") + f".{extra}", kb)
         sent[chat] = h
     for c in [c for c in sent if c not in chats]:
         sent.pop(c)
+
+
+# ---------------------------------------------------------------- настройки клиента и сводки выработки
+PV_REP = {"d": "Щодня (о ~20:00)", "w": "Щотижня (пн)", "m": "Щомісяця (1-го)"}
+
+
+def pv_pref(p, chat):
+    """Какие сводки выработки клиент хочет получать по объекту. По умолчанию - раз в неделю."""
+    v = (p.get("pvrep") or {}).get(str(chat))
+    if v is not None:
+        return set(v)
+    return set() if str(chat) in (p.get("nopvweek") or []) else {"w"}
+
+
+def settings_start(tg, st, chat):
+    mine = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
+    if len(mine) > 1:
+        tg.send(chat, "Налаштування якого об'єкта?", {"inline_keyboard": [[
+            {"text": str(st["stations"][k].get("title") or st["stations"][k].get("name"))[:40], "callback_data": f"zs:{k}"}] for k in mine]})
+    elif mine:
+        settings_menu(tg, st, chat, mine[0])
+
+
+def settings_menu(tg, st, chat, sid):
+    p = st["stations"][sid]
+    on = sched_on(p, chat)
+    rows = [[{"text": f"{'🔔' if on else '🔕'} Графіки ДТЕК і нагадування: {'так' if on else 'ні'}", "callback_data": f"zg:{sid}"}]]
+    txt = f"⚙️ <b>{esc(p.get('title') or p.get('name'))}</b> — що надсилати. Натисніть, щоб змінити:"
+    if p.get("has_pv"):
+        pref = pv_pref(p, chat)
+        rows += [[{"text": f"{'✅' if k in pref else '▫️'} Зведення виробітку: {v}", "callback_data": f"zr:{sid}:{k}"}] for k, v in PV_REP.items()]
+        rows.append([{"text": ("✅ " if not pref else "") + "Не надсилати зведення виробітку", "callback_data": f"zr:{sid}:none"}])
+        txt += "\nЗведення — коротко скільки виробили панелі. Можна обрати кілька або жодного."
+    tg.send(chat, txt, {"inline_keyboard": rows})
+
+
+def pv_daily(api, tg, st, t):
+    """Щодня після 20:00 тим, хто обрав: скільки виробили панелі сьогодні, у порівнянні з учора."""
+    day = t.strftime("%Y-%m-%d")
+    if t.hour < 20 or t.hour >= 23 or st.get("pv_day") == day:
+        return
+    st["pv_day"] = day
+    for sid, p in st["stations"].items():
+        chats = [c for c in p.get("clients") or [] if "d" in pv_pref(p, c)]
+        if not chats or not p.get("has_pv"):
+            continue
+        try:
+            d = pv_days(api, sid, 2)
+        except Exception:
+            continue
+        today = d.get(day, {}).get("gen", 0)
+        yest = d.get((t - timedelta(days=1)).strftime("%Y-%m-%d"), {}).get("gen", 0)
+        ch = f" (учора {kwh(yest)}, {'+' if today >= yest else '−'}{abs(today - yest) / yest * 100:.0f}%)" if yest else ""
+        tg.clients(chats, f"☀️ <b>{esc(p.get('title') or p.get('name'))}</b>: сьогодні панелі виробили <b>{kwh(today)} кВт·год</b>{ch}.")
+
+
+def pv_monthly(api, tg, st, t):
+    """1-го числа після 9:00 тим, хто обрав: виробіток за минулий місяць, у порівнянні з позаминулим."""
+    ym = t.strftime("%Y-%m")
+    if t.day != 1 or t.hour < 9 or st.get("pv_month") == ym:
+        return
+    st["pv_month"] = ym
+    lm = t.replace(day=1) - timedelta(days=1)
+    pm = lm.replace(day=1) - timedelta(days=1)
+    for sid, p in st["stations"].items():
+        chats = [c for c in p.get("clients") or [] if "m" in pv_pref(p, c)]
+        if not chats or not p.get("has_pv"):
+            continue
+        try:
+            g = lambda d: sum(num(r.get("generationValue")) or 0 for r in api.history(int(sid), 3, d.strftime("%Y-%m"), d.strftime("%Y-%m")))
+            last, prev = g(lm), g(pm)
+        except Exception:
+            continue
+        ch = f"\nПорівняно з попереднім місяцем ({MONTHS[pm.month]}, {kwh(prev)}): {'+' if last >= prev else '−'}{abs(last - prev) / prev * 100:.0f}%." if prev else ""
+        tg.clients(chats, f"📅 <b>{esc(p.get('title') or p.get('name'))}</b> — виробіток панелей за {MONTHS[lm.month]}: <b>{kwh(last)} кВт·год</b>, "
+                          f"у середньому {kwh(last / lm.day)} на день.{ch}")
 
 
 def pv_weekly(api, tg, st, t):
@@ -1534,7 +1630,7 @@ def pv_weekly(api, tg, st, t):
     st["pv_week"] = wk
     mon_this = (t - timedelta(days=t.weekday())).date()
     for sid, p in st["stations"].items():
-        chats = [c for c in p.get("clients") or [] if c not in (p.get("nopvweek") or [])]
+        chats = [c for c in p.get("clients") or [] if "w" in pv_pref(p, c)]
         if not chats or not p.get("has_pv"):
             continue
         try:
@@ -1709,7 +1805,7 @@ def commands(tg, st, dtek=None, api=None):
             c_who = esc(" ".join(x for x in ((cq.get("from") or {}).get("first_name"), (cq.get("from") or {}).get("last_name")) if x) or "клиент")
             if c_chat:
                 mid = (cq.get("message") or {}).get("message_id")
-                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg") and cq.get("data") != "cq:?":
+                if mid and str(cq.get("data", "")).split(":")[0] in ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr") and cq.get("data") != "cq:?":
                     tg.call("editMessageReplyMarkup", chat_id=c_chat, message_id=mid, reply_markup={"inline_keyboard": []})
                 callback(tg, st, c_chat, cq.get("data"), c_who, dtek, api)
             continue
@@ -1722,7 +1818,7 @@ def commands(tg, st, dtek=None, api=None):
         cmd, _, arg = text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
         if chat == str(tg.staff):
@@ -1758,6 +1854,8 @@ def commands(tg, st, dtek=None, api=None):
                            "/help": lambda: client_help(st, chat)}[cmd](), KEYBOARD)
         elif cmd == "/cherga" and is_client:
             ask_queue(tg, st, chat, change=True)
+        elif cmd == "/nalashtuvannia" and is_client:
+            settings_start(tg, st, chat)
         elif cmd == "/grafiky" and is_client:
             sched_toggle(tg, st, chat)
         elif cmd == "/ekonomiya" and is_client:
@@ -2946,6 +3044,8 @@ def check(api, tg, st, dtek):
                 p["joins"].pop(chat_id)
     morning(tg, st, dtek, t)
     safe(tg, st, "недельный отчёт о выработке", pv_weekly, api, tg, st, t)
+    safe(tg, st, "дневная сводка выработки", pv_daily, api, tg, st, t)
+    safe(tg, st, "месячная сводка выработки", pv_monthly, api, tg, st, t)
     safe(tg, st, "аналитика дня", staff_daily, api, tg, st, t)
     safe(tg, st, "обновление кнопок у клиентов", kb_sync, tg, st, t)
     safe(tg, st, "сводка недели", staff_weekly, api, tg, st, t)
