@@ -1239,10 +1239,14 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         if chat not in mine:
             return
         p = st["stations"][c_sid]
-        cur = queue_key(p.get("queue")).replace("GPV", "")
-        if kind == "c2":
+        cur = (queue_key(p.get("queue")) or "").replace("GPV", "")
+        if kind == "c2" and not cur:
+            tg.send(chat, f"Спершу оберіть чергу першої лінії: «{BTN_QUEUE}».", KEYBOARD)
+        elif kind == "c2":
             kb = queue_grid(f"cr:{c_sid}:")
             kb["inline_keyboard"].insert(0, [{"text": f"🟰 Та сама черга, що й у першої ({cur})", "callback_data": f"cr:{c_sid}:same"}])
+            if p.get("queue2") or p.get("lines_same"):
+                kb["inline_keyboard"].append([{"text": "1️⃣ На об'єкті одна лінія", "callback_data": f"cx:{c_sid}"}])
             tg.send(chat, "Оберіть чергу ДТЕК другої лінії. Якщо обидві лінії на одній черзі — натисніть «Та сама черга».", kb)
         elif kind == "cr" and (q == "same" or queue_key(q) == queue_key(p.get("queue"))):
             for k in ("queue2", "lines_mode"):
@@ -1319,6 +1323,8 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         p = st["stations"][sid]
         tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>: есть ли генератор?",
                 {"inline_keyboard": [[{"text": "🚫 Нет", "callback_data": f"G:{sid}:нет"}, {"text": "🔀 Через АВР", "callback_data": f"G:{sid}:авр"},
+                                      {"text": "🔌 На порт GEN", "callback_data": f"G:{sid}:порт"}],
+                                     [
                                       {"text": "❓ Определять самому", "callback_data": f"G:{sid}:авто"}]]})
     elif kind == "G":
         staff_command(tg, st, "/gen", f"{sid} {arg}")
@@ -1889,6 +1895,8 @@ def settings_menu(tg, st, chat, sid):
         rows.append([{"text": ("✅ " if not pref else "") + "Не надсилати зведення виробітку", "callback_data": f"zr:{sid}:none"}])
         txt += "\nЗведення — коротко скільки виробили панелі. Можна обрати кілька або жодного."
     rows.append([{"text": f"⚙️ Генератор: {GEN_KINDS_SHORT[p.get('gen_kind') or 'auto']}", "callback_data": f"zk:{sid}"}])
+    nl = ("2, черги " + " і ".join(q.replace("GPV", "") for q in queues(p))) if p.get("queue2") else "2, одна черга" if p.get("lines_same") else "1"
+    rows.append([{"text": f"🔌 Лінії (вводи) від ДТЕК: {nl}", "callback_data": f"c2:{sid}"}])
     tg.send(chat, txt, {"inline_keyboard": rows})
 
 
@@ -2523,7 +2531,7 @@ def staff_command(tg, st, cmd, arg):
                      + (f"\nАКБ сейчас: {p['last']['soc']:.0f}%" if (p.get("last") or {}).get("soc") is not None else "")
                      + f"\nгенератор: {gk}" + (" · сейчас работает" if p.get("gen_on") else ""), card_kb)
     elif cmd == "/gen":
-        m = re.match(r"(.+?)\s+(то|сброс|интервал\s+\d+|нет|авр|auto|авто)\s*$", arg, re.I)
+        m = re.match(r"(.+?)\s+(то|сброс|интервал\s+\d+|нет|авр|порт|gen|auto|авто)\s*$", arg, re.I)
         sid, err = find_station(st, m.group(1) if m else arg)
         if err:
             tg.staff_msg(err if arg else "Пример: /gen ПБС — моточасы генератора. /gen ПБС то — отметить ТО. /gen ПБС интервал 250 — интервал ТО, ч.")
@@ -2531,14 +2539,15 @@ def staff_command(tg, st, cmd, arg):
         p = S[sid]
         if m and m.group(2).lower() in ("то", "сброс"):
             p["gen_service_at"] = p.get("gen_hours", 0)
-        elif m and m.group(2).lower() in ("нет", "авр", "auto", "авто"):
-            kind = {"нет": "none", "авр": "ats"}.get(m.group(2).lower())
+        elif m and m.group(2).lower() in ("нет", "авр", "порт", "gen", "auto", "авто"):
+            kind = {"нет": "none", "авр": "ats", "порт": "port", "gen": "port"}.get(m.group(2).lower())
             if kind:
                 p["gen_kind"] = kind
             else:
                 p.pop("gen_kind", None)
             tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: " + {"none": "генератора нет — по косвенным признакам генератор не ищу.",
                                                                  "ats": "генератор через АВР — определяю его увереннее.",
+                                                                 "port": "генератор на порту GEN инвертора — включение и мощность беру прямо из Deye.",
                                                                  None: "определяю генератор автоматически."}[kind])
             return
         elif m:
@@ -2759,6 +2768,7 @@ def device_alerts(tg, p, title, items, t):
 
 # ---------------------------------------------------------------- генератор и фазы
 GEN_P = re.compile(r"^(total)?gen(erator)?_?power$", re.I)
+MI_P = re.compile(r"^totalmipower$", re.I)  # 50 кВт Deye: мощность порта GEN (Deye пишет её как «микроинвертор»)
 GEN_V = re.compile(r"^gen(erator)?.*volt", re.I)
 GEN_F = re.compile(r"^gen(erator)?.*freq", re.I)
 
@@ -2776,6 +2786,8 @@ def gen_detect(dev, grid_on, dtek, q, t, st=None, sid=None, p=None, dkw=None):
        50,0 ±0,2 Гц; генератор - заметно хуже. Отклонение от 0,5 Гц - генератор; от 0,2 Гц - генератор,
        только если по графику ДТЭК сейчас точно отключение (не на краю интервала)."""
     gp, gv, gf = dev_val(dev, GEN_P), dev_val(dev, GEN_V), dev_val(dev, GEN_F)
+    if gp is None and p is not None and p.get("gen_kind") == "port":
+        gp = dev_val(dev, MI_P)
     if (gp is not None and gp > 150) or (gv and gv > 150 and gf and 45 < gf < 55):
         return True, "port", gf, gv
     f = num((dev or {}).get("GridFrequency"))
@@ -3571,6 +3583,15 @@ def check(api, tg, st, dtek):
                 p["last_soc"], p["last_soc_t"] = soc, t.isoformat()
             p.pop("last", None)
             apply_latest(p, lt, t)
+            if "dynamica" in str(p.get("name", "")).lower() and p.get("fix_v", 0) < 1:
+                # со слов владельца (25.11): генератор на порту GEN, два ввода на одной очереди
+                p["fix_v"], p["gen_kind"], p["lines_same"] = 1, "port", True
+                for k in ("queue2", "lines_mode", "gen_force", "gen_sc"):
+                    p.pop(k, None)
+            if p.get("gen_kind") == "port" and dev_val(dev, GEN_P) is None and (p.get("last") or {}).get("pv"):
+                mi = dev_val(dev, MI_P) or 0  # Deye прибавляет генератор на порту GEN к «выработке» - панели считаем без него
+                if mi > 0:
+                    p["last"]["pv"] = max(0.0, p["last"]["pv"] - mi)
             if p.get("has_pv"):
                 wx_fetch(st, p, t)
                 pv_learn(st, p, t)
@@ -3595,7 +3616,7 @@ def check(api, tg, st, dtek):
                 prev_t, p["gen_t"] = p.get("gen_t"), t.isoformat()
                 gdt = (t - datetime.fromisoformat(prev_t)).total_seconds() / 3600 if prev_t else 0
                 if 0 < gdt < 0.5:
-                    gpw = dev_val(dev, GEN_P) if p.get("gen_how") == "port" else abs(num((dev or {}).get("TotalGridPower")) or num(lt.get("wirePower")) or 0)
+                    gpw = (dev_val(dev, GEN_P) or dev_val(dev, MI_P)) if p.get("gen_how") == "port" else abs(num((dev or {}).get("TotalGridPower")) or num(lt.get("wirePower")) or 0)
                     gd = p.setdefault("gen_day", {}).setdefault(t.strftime("%Y-%m-%d"), {"kwh": 0, "min": 0, "chg": 0})
                     gd["kwh"] = round(gd["kwh"] + (gpw or 0) / 1000 * gdt, 2)
                     gd["min"] = round(gd["min"] + gdt * 60, 1)
