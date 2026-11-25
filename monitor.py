@@ -1147,7 +1147,7 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         elif kind in ("st", "sg"):
             save_ask(tg, st, chat, c_sid, "tariff" if kind == "st" else "gen")
         else:
-            tg.send(chat, save_calc(api, st, c_sid, per), {"inline_keyboard": save_periods(c_sid, st["stations"][c_sid])})
+            tg.send(chat, save_calc(api, st, c_sid, per.split(":")[0]), {"inline_keyboard": save_periods(c_sid, st["stations"][c_sid])})
         return
     if kind == "o":  # меню объекта (у кого несколько объектов)
         c_sid, _, act = rest.partition(":")
@@ -1449,7 +1449,10 @@ GEN_PRICE = 35.0
 
 
 def save_periods(sid, p):
-    b = lambda per: {"text": SAVE_PER[per][0].upper() + SAVE_PER[per][1:], "callback_data": f"sv:{sid}:{per}"}
+    # отметка цен в кнопке: после смены цены у кнопок новая отметка, и быстрый ответ из старого снимка
+    # (посчитанный по старой цене) к ним уже не подходит - ответ считается заново
+    mark = hashlib.sha1(f"{p.get('tariff')}|{p.get('gen_price')}".encode()).hexdigest()[:4]
+    b = lambda per: {"text": SAVE_PER[per][0].upper() + SAVE_PER[per][1:], "callback_data": f"sv:{sid}:{per}:{mark}"}
     rows = [[b("w"), b("m")], [b("pm"), b("y")], [b("all")]]
     rows.append([{"text": "✏️ Ціна світла з мережі", "callback_data": f"st:{sid}"}])
     rows.append([{"text": "✏️ Ціна кВт·год від генератора", "callback_data": f"sg:{sid}"}])
