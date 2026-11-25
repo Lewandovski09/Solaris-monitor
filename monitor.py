@@ -1119,13 +1119,11 @@ def staff_menu(tg, st):
     P = list(S.values())
     dark = sum(1 for p in P if p.get("no_grid") and not p.get("offline"))
     off = sum(1 for p in P if p.get("offline"))
-    rows = [[{"text": "📊 Сводка", "callback_data": "S:*"}, {"text": "🔗 Все ссылки", "callback_data": "M:links"}],
-            [{"text": "🩺 Состояние бота", "callback_data": "M:health"}, {"text": "❓ Команды", "callback_data": "M:help"}]]
-    btns = [{"text": ("🔴 " if p.get("offline") else "🟠 " if p.get("no_grid") else "🟢 ") + str(p.get("title") or p.get("name"))[:26],
-             "callback_data": f"S:{sid}"} for sid, p in sorted(S.items(), key=lambda kv: str(kv[1].get("name")).lower())][:40]
-    rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows = [[{"text": "📊 Сводка", "callback_data": "S:*"}, {"text": "💼 Допродажи", "callback_data": "M:sales"}],
+            [{"text": "🔗 Все ссылки", "callback_data": "M:links"}, {"text": "🩺 Состояние бота", "callback_data": "M:health"}],
+            [{"text": "❓ Команды", "callback_data": "M:help"}]]
     tg.send(tg.staff, f"📋 <b>Меню Solaris</b>\nСтанций: {len(P)} · без света: {dark} · не на связи: {off}\n"
-                      "Нажмите станцию — карточка с кнопками (ссылка, очередь, генератор).", {"inline_keyboard": rows})
+                      "Карточка станции (ссылка, очередь, генератор, линии): <code>/stations название</code>", {"inline_keyboard": rows})
 
 
 PICK = {"/link": ("L", "Для какой станции нужна ссылка?"), "/stations": ("S", "Какую станцию показать?"),
@@ -1281,6 +1279,8 @@ def callback(tg, st, chat, data, who, dtek, api=None):
     if kind == "M":
         if not sid:
             staff_menu(tg, st)
+        elif sid == "sales":
+            sales_menu(tg, st, api, now())
         else:
             staff_command(tg, st, {"links": "/links", "health": "/health", "help": "/help"}.get(sid, "/help"), "")
         return
@@ -1773,11 +1773,30 @@ def staff_weekly(api, tg, st, t):
         if gh > 0.05:
             line += f" · генератор {gh:.1f} ч"
         week.append(line)
+    if week:
+        tg.staff_msg("📋 <b>Неделя по станциям</b>\n" + "\n".join(week))
+    leads = sales_leads(api, st, t)
+    if leads:
+        tg.staff_msg("💼 <b>Кому что предложить</b> (по данным станций)\n\n" + "\n\n".join(leads) + SALES_HOW)
+
+
+SALES_HOW = "\n\nКак посчитано: покупка из сети и потребление за 30 дней из Deye; отключения и заряд — по журналу бота; нагрузка — по проверкам."
+
+
+def sales_leads(api, st, t):
+    """Кому что предложить: панели, больше АКБ, генератор, инвертор мощнее. Для понедельничной сводки и кнопки «Допродажи»."""
+    since30 = (t - timedelta(days=30)).isoformat()
+    leads = []
+    for sid, p in sorted(st["stations"].items(), key=lambda x: str(x[1].get("name"))):
+        name = esc(p.get("name"))
+        log30 = [r for r in st["log"] if r.get("sid") == sid and r.get("start", "") >= since30]
         # --- кому что предложить
         offers = []
         try:
             d30 = pv_days(api, sid, 30)
             use, buy = sum(x.get("use") or 0 for x in d30.values()), sum(x.get("buy") or 0 for x in d30.values())
+        except CacheMiss:
+            raise
         except Exception:
             use = buy = 0
         if use and buy / use > 0.6:
@@ -1799,11 +1818,24 @@ def staff_weekly(api, tg, st, t):
         if offers:
             who = ", ".join(esc(n) for n in (p.get("names") or {}).values())[:120]
             leads.append(f"<b>{name}</b>" + (f" ({who})" if who else "") + ":\n• " + "\n• ".join(offers))
-    if week:
-        tg.staff_msg("📋 <b>Неделя по станциям</b>\n" + "\n".join(week))
-    if leads:
-        tg.staff_msg("💼 <b>Кому что предложить</b> (по данным станций)\n\n" + "\n\n".join(leads) +
-                     "\n\nКак посчитано: покупка из сети и потребление за 30 дней из Deye; отключения и заряд — по журналу бота; нагрузка — по проверкам.")
+    return leads
+
+
+def sales_menu(tg, st, api, t):
+    try:
+        leads = sales_leads(api, st, t)
+    except CacheMiss:
+        raise
+    except Exception:
+        leads = None
+    if leads is None:
+        tg.staff_msg("Не получилось посчитать — Deye не ответил. Попробуйте через пару минут.")
+    elif not leads:
+        tg.staff_msg("💼 <b>Допродажи</b>: сейчас явных кандидатов нет.\n\nБот предлагает: панели — если из сети куплено больше 60% потребления за 30 дней; "
+                     "больше АКБ — если она 2+ раза садилась до 20% или отключения длиннее полного заряда; генератор — если отключения длиннее заряда, а генератора нет; "
+                     "инвертор мощнее — если нагрузка 2+ дня за неделю выше 90% номинала.")
+    else:
+        tg.staff_msg("💼 <b>Допродажи — кому что предложить</b>\n\n" + "\n\n".join(leads) + SALES_HOW)
 
 
 def good_moment(tg, p, mins, low, t):
@@ -2202,6 +2234,7 @@ def warm_cache(api, st, t):
         if not p.get("clients"):
             continue
         try:
+            pv_days(api, sid, 30)  # «Допродажи» в группе
             if p.get("has_pv"):
                 pv_days(api, sid, 8)
                 pv_month(api, sid)
