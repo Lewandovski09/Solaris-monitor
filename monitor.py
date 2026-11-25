@@ -399,6 +399,13 @@ def queues(p):
     return [q for q in (queue_key(p.get("queue")), queue_key(p.get("queue2"))) if q]
 
 
+def lines_note(p, ru=False):
+    """Два ввода на одной очереди: график общий, но клиент и сотрудники должны это видеть."""
+    if not p.get("lines_same") or p.get("queue2"):
+        return ""
+    return " (две линии, обе на этой очереди)" if ru else " (дві лінії, обидві на цій черзі)"
+
+
 def sched_on(p, chat):
     """Клиент не отключал графики по этому объекту."""
     return str(chat) not in (p.get("nosched") or [])
@@ -1045,11 +1052,13 @@ def ask_queue(tg, st, chat, change=False, sid=None):
     p = st["stations"][sid]
     cur = queue_key(p.get("queue"))
     name = f"<b>{esc(p.get('title') or p.get('name'))}</b>. " if len(mine) > 1 else ""
-    head = (f"{name}Зараз черга ДТЕК: <b>{cur.replace('GPV', '')}</b>.\nОберіть нову:" if cur
+    head = (f"{name}Зараз черга ДТЕК: <b>{cur.replace('GPV', '')}</b>{lines_note(p)}.\nОберіть нову:" if cur
             else f"{name}Оберіть вашу чергу ДТЕК — так бот знатиме ваш графік відключень:")
     kb = queue_grid(f"cq:{sid}:", {"text": "Не знаю свою чергу", "callback_data": "cq:?"})
     if cur:  # друга лінія - тільки коли основна черга вже є
         q2 = queue_key(p.get("queue2"))
+        if not q2 and p.get("lines_same"):
+            q2 = cur + " (та сама)"
         kb["inline_keyboard"].append([{"text": f"Друга лінія: {q2.replace('GPV', '')} — змінити", "callback_data": f"c2:{sid}"},
                                       {"text": "Прибрати другу лінію", "callback_data": f"cx:{sid}"}] if q2 else
                                      [{"text": "➕ На об'єкті дві лінії (дві черги)", "callback_data": f"c2:{sid}"}])
@@ -1230,15 +1239,27 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         if chat not in mine:
             return
         p = st["stations"][c_sid]
+        cur = queue_key(p.get("queue")).replace("GPV", "")
         if kind == "c2":
-            tg.send(chat, "Оберіть чергу ДТЕК другої лінії:", queue_grid(f"cr:{c_sid}:"))
+            kb = queue_grid(f"cr:{c_sid}:")
+            kb["inline_keyboard"].insert(0, [{"text": f"🟰 Та сама черга, що й у першої ({cur})", "callback_data": f"cr:{c_sid}:same"}])
+            tg.send(chat, "Оберіть чергу ДТЕК другої лінії. Якщо обидві лінії на одній черзі — натисніть «Та сама черга».", kb)
+        elif kind == "cr" and (q == "same" or queue_key(q) == queue_key(p.get("queue"))):
+            for k in ("queue2", "lines_mode"):
+                p.pop(k, None)
+            p["lines_same"] = True
+            tg.send(chat, f"✅ Записано: дві лінії, обидві на черзі {cur}. Графік у них однаковий. "
+                          "Якщо черга зміниться — змініть її кнопкою «Змінити чергу», вона зміниться для обох ліній.", KEYBOARD)
+            tg.staff_msg(f"👤 {who}: <b>{esc(p.get('name'))}</b> — две линии, обе на очереди {cur}.")
         elif kind == "cx":
             p.pop("queue2", None)
             p.pop("lines_mode", None)
+            p.pop("lines_same", None)
             tg.send(chat, "Другу лінію прибрано.", KEYBOARD)
             tg.staff_msg(f"👤 {who}: <b>{esc(p.get('name'))}</b> — вторая линия убрана, очередь {queue_key(p.get('queue')).replace('GPV', '')}.")
         elif re.fullmatch(r"[1-6]\.[12]", q) and queue_key(q) != queue_key(p.get("queue")):
             p["queue2"], p["lines_mode"] = queue_key(q), "auto"
+            p.pop("lines_same", None)
             tg.send(chat, f"✅ Записано: дві лінії, черги {queue_key(p.get('queue')).replace('GPV', '')} і {q}. Графіки приходитимуть по обох.", KEYBOARD)
             tg.staff_msg(f"👤 {who}: <b>{esc(p.get('name'))}</b> — две линии, очереди {queue_key(p.get('queue')).replace('GPV', '')} и {q}. "
                          "Схему (АВР или станция на одной линии) бот определит сам по 2–3 отключениям.")
@@ -1279,6 +1300,21 @@ def callback(tg, st, chat, data, who, dtek, api=None):
                 {"inline_keyboard": [[{"text": "Да, отключить", "callback_data": f"r:{sid}"}, {"text": "Отмена", "callback_data": "x:"}]]})
     elif kind == "r":
         staff_command(tg, st, "/reset", sid)
+    elif kind == "W" and not arg:
+        p = st["stations"][sid]
+        q1 = (queue_key(p.get("queue")) or "?").replace("GPV", "")
+        tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>: сколько вводов (линий) от ДТЭК? Очередь первой: {q1}.\n"
+                          f"Две линии на разных очередях: <code>/queue {esc(p.get('name'))} {q1} 5.1</code> (вторая цифра — очередь второй линии).",
+                {"inline_keyboard": [[{"text": "1 линия", "callback_data": f"W:{sid}:1"}, {"text": "2 линии, одна очередь", "callback_data": f"W:{sid}:same"}]]})
+    elif kind == "W":
+        p = st["stations"][sid]
+        for k in ("queue2", "lines_mode", "lines_same"):
+            p.pop(k, None)
+        if arg == "same":
+            p["lines_same"] = True
+        q1 = (queue_key(p.get("queue")) or "не указана").replace("GPV", "")
+        tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: " + (f"две линии, обе на очереди {q1}. График общий; смена очереди меняет обе."
+                                                           if arg == "same" else f"одна линия, очередь {q1}."))
     elif kind == "G" and not arg:
         p = st["stations"][sid]
         tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>: есть ли генератор?",
@@ -2008,7 +2044,7 @@ def client_schedule(st, chat, dtek, only=None):
             continue
         lines = [f"🗓 <b>{title}</b>" + ("" if sched_on(p, chat) else " (сповіщення про графіки вимкнено)")]
         for n, q in enumerate(qs, 1):
-            lines.append((f"<b>Лінія {n}</b>, " if len(qs) > 1 else "") + f"черга {q.replace('GPV', '')}")
+            lines.append((f"<b>Лінія {n}</b>, " if len(qs) > 1 else "") + f"черга {q.replace('GPV', '')}" + lines_note(p))
             for day, label in ((t, "Сьогодні"), (t + timedelta(days=1), "Завтра")):
                 sl = (dtek["days"].get(day.strftime("%Y-%m-%d")) or {}).get(q)
                 lines.append(f"<b>{label} ({day.strftime('%d.%m')}):</b> " + (fmt_intervals(sl) if sl is not None else "графік ще не опубліковано"))
@@ -2422,7 +2458,7 @@ def client_queue(tg, st, chat, text, who, sid=None):
         tg.send(chat, f"Черга ДТЕК {q} вже встановлена.", KEYBOARD)
         return
     p["queue"] = "GPV" + q
-    tg.send(chat, f"✅ Чергу ДТЕК {q} записано. Графік відключень надійде за кілька хвилин.")
+    tg.send(chat, f"✅ Чергу ДТЕК {q} записано{' для обох ліній' if lines_note(p) else ''}. Графік відключень надійде за кілька хвилин.")
     if joined:  # в группу пишем один раз - при подключении; смену очереди потом клиент делает молча
         tg.staff_msg(f"👤 {who} подключился к <b>{esc(p.get('title') or p.get('name'))}</b>. Очередь ДТЭК {q}.")
 
@@ -2474,10 +2510,13 @@ def staff_command(tg, st, cmd, arg):
         cap, src = capacity(st, sid, p)
         gk = {"none": "нет", "ats": "через АВР", "port": "на входе GEN"}.get(p.get("gen_kind"), "определяю сам")
         card_kb = {"inline_keyboard": [[{"text": "🔗 Ссылка для клиента", "callback_data": f"L:{sid}"}, {"text": "🔁 Очередь", "callback_data": f"Q:{sid}"}],
-                                       [{"text": f"⚙️ Генератор: {gk}", "callback_data": f"G:{sid}"}, {"text": "📋 Меню", "callback_data": "M:"}]]}
+                                       [{"text": f"⚙️ Генератор: {gk}", "callback_data": f"G:{sid}"},
+                                        {"text": "🔌 Линии: " + ("2, разные очереди" if p.get("queue2") else "2, одна очередь" if p.get("lines_same") else "1"), "callback_data": f"W:{sid}"}],
+                                       [{"text": "📋 Меню", "callback_data": "M:"}]]}
         tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
                      f"\nочередь ДТЭК: {' и '.join(q.replace('GPV', '') for q in queues(p)) or 'не указана'} · клиентов: {len(p.get('clients') or [])}"
                      + (f"\nдве линии: {MODE_RU.get(p.get('lines_mode'), 'схема ещё не определена')}" if p.get("queue2") else "")
+                     + ("\nдве линии, обе на одной очереди" if lines_note(p) else "")
                      + (f"\nграфики отключили клиенты: {len(p['nosched'])}" if p.get("nosched") else "") +
                      f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}"
                      f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}"
@@ -2574,11 +2613,17 @@ def staff_command(tg, st, cmd, arg):
         p = S[sid]
         p["queue"] = queue_key(m.group(2))
         if m.group(3) in ("0", "-"):
-            p.pop("queue2", None)
+            for k in ("queue2", "lines_mode", "lines_same"):
+                p.pop(k, None)
+        elif m.group(3) and queue_key(m.group(3)) == p["queue"]:  # два ввода на одной очереди
+            for k in ("queue2", "lines_mode"):
+                p.pop(k, None)
+            p["lines_same"] = True
         elif m.group(3) and queue_key(m.group(3)) != p["queue"]:
+            p.pop("lines_same", None)
             if queue_key(m.group(3)) != p.get("queue2"):
                 p["queue2"], p["lines_mode"] = queue_key(m.group(3)), "auto"
-        txt = " и ".join(q.replace("GPV", "") for q in queues(p))
+        txt = " и ".join(q.replace("GPV", "") for q in queues(p)) + lines_note(p, ru=True)
         extra = ("\nДве линии. Схему (АВР или станция на одной линии) бот определит сам по 2–3 отключениям и напишет сюда. "
                  f"Задать вручную: <code>/lines {esc(p.get('name'))} ats</code> (или 1, 2)." if p.get("queue2") and p.get("lines_mode", "auto") == "auto" else "")
         tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: очередь ДТЭК {txt}. График придёт при следующей проверке.{extra}")
@@ -3696,7 +3741,7 @@ def dtek_alerts(tg, st, dtek):
             if want:
                 two.append((sid, p, c["title"], c["queue"], q2, want))
         elif c["queue"] and want:
-            by_q.setdefault(c["queue"], []).append((c["title"], want))
+            by_q.setdefault(c["queue"], []).append((c["title"] + (" — обидві лінії" if lines_note(p) else ""), want))
 
     # 1. общий текст ДТЭК: экстренные / аварийные
     att = dtek["attention"]
