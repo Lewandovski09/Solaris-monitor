@@ -1147,7 +1147,9 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         elif kind in ("st", "sg"):
             save_ask(tg, st, chat, c_sid, "tariff" if kind == "st" else "gen")
         else:
-            tg.send(chat, save_calc(api, st, c_sid, per.split(":")[0]), {"inline_keyboard": save_periods(c_sid, st["stations"][c_sid])})
+            per = per.split(":")[0]
+            if per in SAVE_PER:
+                tg.send(chat, save_calc(api, st, c_sid, per), {"inline_keyboard": save_periods(c_sid, st["stations"][c_sid])})
         return
     if kind == "o":  # меню объекта (у кого несколько объектов)
         c_sid, _, act = rest.partition(":")
@@ -1371,8 +1373,49 @@ def apply_latest(p, lt, t):
 
 
 # ---------------------------------------------------------------- выработка панелей
+class Lin:
+    """Сумма вида c + a×(цена сети) + b×(цена генератора). Так экономия считается «в общем виде», и Vercel
+    подставляет любые цены мгновенно - без запуска бота."""
+    def __init__(self, c=0.0, a=0.0, b=0.0):
+        self.c, self.a, self.b = c, a, b
+
+    @staticmethod
+    def _o(x):
+        return x if isinstance(x, Lin) else Lin(float(x))
+
+    def __add__(self, x):
+        x = Lin._o(x)
+        return Lin(self.c + x.c, self.a + x.a, self.b + x.b)
+    __radd__ = __add__
+
+    def __sub__(self, x):
+        x = Lin._o(x)
+        return Lin(self.c - x.c, self.a - x.a, self.b - x.b)
+
+    def __rsub__(self, x):
+        return Lin._o(x) - self
+
+    def __mul__(self, k):
+        return Lin(self.c * k, self.a * k, self.b * k)
+    __rmul__ = __mul__
+
+    def __format__(self, spec):
+        return "⟦T⟧" if (self.a, self.b) == (1, 0) else "⟦G⟧" if (self.a, self.b) == (0, 1) else "⟦?⟧"
+
+    def tok(self, signed=False):
+        return f"⟦{self.c:.4f};{self.a:.6f};{self.b:.6f}{';s' if signed else ''}⟧"
+
+
 def grn(v):
+    if isinstance(v, Lin):
+        return v.tok()
     return f"{v:,.0f}".replace(",", " ")
+
+
+def grn_signed(v):
+    if isinstance(v, Lin):
+        return v.tok(signed=True)
+    return ("+" if v >= 0 else "−") + grn(abs(v))
 
 
 def kwh(v):
@@ -1451,7 +1494,9 @@ GEN_PRICE = 35.0
 def save_periods(sid, p):
     # отметка цен в кнопке: после смены цены у кнопок новая отметка, и быстрый ответ из старого снимка
     # (посчитанный по старой цене) к ним уже не подходит - ответ считается заново
-    mark = hashlib.sha1(f"{p.get('tariff')}|{p.get('gen_price')}".encode()).hexdigest()[:4]
+    # цены в кнопке: Vercel считает ответ сам по этим ценам (мгновенно), а после смены цены старый ответ не подойдёт
+    tf, gp = p.get("tariff"), p.get("gen_price", GEN_PRICE)
+    mark = f"{tf:g}:{gp:g}" if isinstance(tf, (int, float)) and isinstance(gp, (int, float)) else "{T}:{G}"
     b = lambda per: {"text": SAVE_PER[per][0].upper() + SAVE_PER[per][1:], "callback_data": f"sv:{sid}:{per}:{mark}"}
     rows = [[b("w"), b("m")], [b("pm"), b("y")], [b("all")]]
     rows.append([{"text": "✏️ Ціна світла з мережі", "callback_data": f"st:{sid}"}])
@@ -1486,12 +1531,22 @@ def save_ask(tg, st, chat, sid, kind="tariff"):
     title = esc(p.get("title") or p.get("name"))
     if kind == "tariff":
         cur = f"Зараз записано {p['tariff']:g} грн. " if p.get("tariff") else ""
-        tg.send(chat, f"💰 <b>{title}</b>: {cur}Скільки ви платите за 1 кВт·год світла з мережі?\n"
-                      "Напишіть число в гривнях, наприклад: <b>4.32</b> (побут) або <b>9.8</b> (бізнес). Ціну видно в рахунку за світло.", KEYBOARD)
+        tg.send(chat, f"{price_mark('tariff', sid)} <b>{title}</b>: {cur}Скільки ви платите за 1 кВт·год світла з мережі?\n"
+                      "Напишіть число в гривнях, наприклад: <b>4.32</b> (побут) або <b>9.8</b> (бізнес). Ціну видно в рахунку за світло.",
+                {"force_reply": True, "input_field_placeholder": "Ціна за кВт·год, напр. 4.32"})
     else:
-        tg.send(chat, f"💰 <b>{title}</b>: зараз рахую {p.get('gen_price', GEN_PRICE):g} грн за 1 кВт·год від генератора "
+        tg.send(chat, f"{price_mark('gen', sid)} <b>{title}</b>: зараз рахую {p.get('gen_price', GEN_PRICE):g} грн за 1 кВт·год від генератора "
                       "(дизель ~101 грн/л, генератор витрачає ~0,35 л на кВт·год).\n"
-                      "Якщо у вас інша ціна — напишіть число в гривнях, наприклад: <b>40</b>.", KEYBOARD)
+                      "Якщо у вас інша ціна — напишіть число в гривнях, наприклад: <b>40</b>.",
+                {"force_reply": True, "input_field_placeholder": "Ціна за кВт·год, напр. 40"})
+
+
+PRICE_URL = "https://solaris.org.ua/#price:"
+
+
+def price_mark(kind, sid):
+    """Невидимая метка в вопросе о цене: ответ на него (reply) несёт её с собой, и Vercel/бот знают, что это за цена."""
+    return f'<a href="{PRICE_URL}{kind}:{sid}">💰</a>'
 
 
 def save_input(tg, st, chat, text):
@@ -1556,7 +1611,7 @@ def gen_usage(p, a, b):
     return sum(r.get("min", 0) for r in rows) / 60, sum(r.get("kwh", 0) for r in rows), sum(r.get("chg", 0) for r in rows)
 
 
-def save_calc(api, st, sid, per):
+def save_calc(api, st, sid, per, prices=None):
     """Экономия и расходы по отдельности.
     Экономия: панели - энергия, использованная на объекте × цена сети; инвертор с АКБ - энергия во время отключений
     × цена того же от генератора. Расходы: заряд АКБ из сети × цена сети; генератор - его кВт·ч × цена генераторного кВт·ч.
@@ -1566,9 +1621,9 @@ def save_calc(api, st, sid, per):
     p = st["stations"][sid]
     t = now()
     title = esc(p.get("title") or p.get("name"))
-    if not p.get("tariff"):
+    if not p.get("tariff") and not prices:
         return "Спочатку вкажіть ціну світла з мережі."
-    tf, gp = p["tariff"], p.get("gen_price", GEN_PRICE)
+    tf, gp = prices or (p["tariff"], p.get("gen_price", GEN_PRICE))
     lines = [f"💰 <b>{title}</b> — економія і витрати {SAVE_PER[per]}"]
     a, b = period_range(per, t)
     rows = None
@@ -1586,6 +1641,8 @@ def save_calc(api, st, sid, per):
             else:
                 args = (4, "2015", str(t.year))
             rows = [hrow(r) for r in api.history(int(sid), args[0], args[1], args[2])]
+    except CacheMiss:
+        raise
     except Exception:
         rows = None
     save = cost = 0.0
@@ -1637,7 +1694,7 @@ def save_calc(api, st, sid, per):
                 g_since = f" (облік з {datetime.fromisoformat(g0).strftime('%d.%m.%Y')})"
         lines.append(f"⛽ Генератор{g_since}: працював {dur(gh * 60)}, дав ~{kwh(gk)} кВт·год"
                      + (f" (з них ~{kwh(gchg)} на заряд АКБ)" if gchg >= 0.1 else "") + f" → <b>~{grn(gk * gp)} грн</b>")
-    lines.append(f"\n<b>Підсумок: економія ~{grn(save)} грн − витрати ~{grn(cost)} грн = {'+' if save - cost >= 0 else '−'}{grn(abs(save - cost))} грн</b>")
+    lines.append(f"\n<b>Підсумок: економія ~{grn(save)} грн − витрати ~{grn(cost)} грн = {grn_signed(save - cost)} грн</b>")
     lines.append(f"Ціни: світло з мережі {tf:g} грн, генератор {gp:g} грн за кВт·год. "
                  "Заряд АКБ з мережі у звичайний час окремо не рахується: це те саме світло, яке ви б і так купили.")
     return "\n".join(lines)
@@ -2286,6 +2343,22 @@ def write_snapshot(st, dtek, api=None):
                 if len(seen) < 60:
                     queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
         chats[chat] = {"kb": kb, "t": t_ans, "cb": cb_ans}
+    save = {}  # экономия «в общем виде» - Vercel подставляет цены сам
+    sapi = SimAPI(st)
+    for sid, p in st["stations"].items():
+        if not p.get("clients"):
+            continue
+        tpl = {}
+        for per in SAVE_PER:
+            try:
+                tpl[per] = save_calc(sapi, st, sid, per, prices=(Lin(0, 1, 0), Lin(0, 0, 1)))
+            except Exception:
+                pass
+        q = {"tariff": None, "gen_price": None}
+        save[sid] = {"T": p.get("tariff"), "G": p.get("gen_price", GEN_PRICE), "tpl": tpl,
+                     "kb": save_periods(sid, dict(p, **q)), "title": esc(p.get("title") or p.get("name"))}
+    for chat in chats:
+        chats[chat]["sids"] = [k for k, p in st["stations"].items() if chat in (p.get("clients") or [])]
     if staff:  # группа сотрудников: меню и частые команды тоже отвечают из снимка
         texts = ["/menu", "/m", "/start", "/stations", "/links", "/health", "/help", "/id", "/link", "/queue", "/reset", "/gen"]
         for p in st["stations"].values():
@@ -2309,7 +2382,8 @@ def write_snapshot(st, dtek, api=None):
                 if len(seen) < 120:
                     queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
         chats[str(staff)] = {"kb": None, "t": t_ans, "cb": cb_ans}
-    data = json.dumps({"at": int(time.time()), "v": 2, "clear": list(CLEAR_KINDS), "chats": chats}, ensure_ascii=False).encode("utf-8")
+    data = json.dumps({"at": int(time.time()), "v": 2, "clear": list(CLEAR_KINDS), "chats": chats, "save": save,
+                       "saved_txt": f"Змінити можна будь-коли кнопкою «{BTN_SAVE}». За який період порахувати?"}, ensure_ascii=False).encode("utf-8")
     iv = secrets.token_hex(16)
     r = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-base64", "-A", "-K", hashlib.sha256(key.encode()).hexdigest(), "-iv", iv],
                        input=data, capture_output=True, timeout=30)
@@ -2395,6 +2469,12 @@ def handle_update(tg, st, u, dtek=None, api=None):
     if not chat or not text or (not text.startswith("/") and (chat == str(tg.staff) or not private)):
         return
     who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
+    for e in ((m.get("reply_to_message") or {}).get("entities") or []):  # ответ на вопрос о цене
+        url = str(e.get("url") or "")
+        if url.startswith(PRICE_URL):
+            kind, _, sid = url[len(PRICE_URL):].partition(":")
+            if sid in st["stations"] and chat in (st["stations"][sid].get("clients") or []) and kind in ("tariff", "gen"):
+                st.setdefault("await", {})[chat] = {"kind": kind, "sid": sid, "at": now().isoformat()}
     handle_message(tg, st, chat, text, who, dtek, api)
 
 

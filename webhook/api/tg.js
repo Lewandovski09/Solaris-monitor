@@ -54,11 +54,67 @@ async function fast(key, upd) {
   try { snap = await snapshot(key); } catch (e) { return null; }
   const c = snap && snap.chats && snap.chats[chat];
   if (!c) return null;
+  const sv = saveFast(snap, c, chat, cq, msg);
+  if (sv) return sv;
   const ans = ((cq ? c.cb : c.t) || {})[look];
   if (!ans) return null;
   if (ans.m) return { chat, ch: !!ans.ch, h: ans.h, m: ans.m, clear: snap.clear || [] };
   if (!Array.isArray(ans)) return { chat, ch: false, m: [[ans, c.kb]] }; // старый формат снимка
   return { chat, ch: false, m: [[ans[0], ans[1] || c.kb]] };
+}
+
+// ---- экономия: шаблон «в общем виде» из снимка + цены из кнопки или из ответа клиента
+const VERSION = "2026-11-25b";
+const PRICE_URL = "https://solaris.org.ua/#price:";
+
+function grn(v) {
+  const r = Math.round(Math.abs(v));
+  return (v < 0 && r ? "-" : "") + String(r).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+}
+function num(x) { return String(Number(Number(x).toPrecision(6))); }
+
+function renderSave(snap, sid, per, T, G) {
+  const s = (snap.save || {})[sid];
+  const tpl = s && s.tpl && s.tpl[per];
+  if (!tpl || !(T > 0) || !(G > 0)) return null;
+  const text = tpl.replace(/⟦T⟧/g, num(T)).replace(/⟦G⟧/g, num(G)).replace(/⟦([-\d.]+);([-\d.]+);([-\d.]+)(;s)?⟧/g,
+    (m, c, a, b, sg) => { const v = +c + a * T + b * G; return sg ? (v >= 0 ? "+" : "−") + grn(Math.abs(v)) : grn(v); });
+  if (text.includes("⟦")) return null;
+  return [text, kbWith(s.kb, T, G)];
+}
+function kbWith(kb, T, G) {
+  return { inline_keyboard: JSON.parse(JSON.stringify(kb).replace(/\{T\}/g, num(T)).replace(/\{G\}/g, num(G))) };
+}
+
+function saveFast(snap, c, chat, cq, msg) {
+  try {
+    if (cq) {
+      const d = String(cq.data || "").split(":");
+      if (d[0] !== "sv" || !(c.sids || []).includes(d[1])) return null;
+      const s = (snap.save || {})[d[1]] || {};
+      const T = d.length >= 5 ? Number(d[3]) : s.T, G = d.length >= 5 ? Number(d[4]) : s.G;
+      const r = renderSave(snap, d[1], d[2], T, G);
+      return r ? { chat, ch: false, m: [r], clear: snap.clear || [] } : null;
+    }
+    // ответ на вопрос о цене: записываем сразу (бот применит молча) и показываем периоды
+    const rep = msg.reply_to_message || {};
+    const e = (rep.entities || []).find(x => String(x.url || "").startsWith(PRICE_URL));
+    if (!e) return null;
+    const [kind, sid] = String(e.url).slice(PRICE_URL.length).split(":");
+    if (!(c.sids || []).includes(sid)) return null;
+    const m = String(msg.text || "").match(/\d+(?:[.,]\d+)?/);
+    const val = m ? Number(m[0].replace(",", ".")) : NaN;
+    const [lo, hi] = kind === "tariff" ? [0.5, 50] : [5, 200];
+    if (!(val >= lo && val <= hi)) return null;
+    const s = (snap.save || {})[sid];
+    if (!s) return null;
+    const T = kind === "tariff" ? val : s.T, G = kind === "gen" ? val : s.G;
+    if (!(T > 0) || !(G > 0)) return null;
+    const what = kind === "tariff" ? "світло з мережі" : "кВт·год від генератора";
+    const text = `✅ Записано: ${what} — ${num(val)} грн. ${snap.saved_txt}`;
+    const h = crypto.createHash("sha1").update(text, "utf8").digest("hex").slice(0, 12);
+    return { chat, ch: true, h, m: [[text, kbWith(s.kb, T, G)]], clear: snap.clear || [] };
+  } catch (err) { return null; }
 }
 
 function msgBody(chat, text, markup) {
@@ -77,15 +133,16 @@ module.exports = async (req, res) => {
       const sha = r.ok ? String((await r.json()).sha).slice(0, 7) : "";
       if (q === sha) {
         const t0 = Date.now();
-        let info;
+        let info, snap;
         try {
           const rr = await fetch("https://api.github.com/repos/" + REPO + "/contents/snapshot.enc?ref=snapshot", {
             headers: { Authorization: "Bearer " + process.env.GITHUB_TOKEN, Accept: "application/vnd.github.raw", "User-Agent": "solaris-webhook" } });
           const [iv, body] = (await rr.text()).split("\n");
           const d = crypto.createDecipheriv("aes-256-cbc", crypto.createHash("sha256").update(key).digest(), Buffer.from(iv.trim(), "hex"));
-          const snap = JSON.parse(Buffer.concat([d.update(Buffer.from(body.trim(), "base64")), d.final()]).toString("utf8"));
+          snap = JSON.parse(Buffer.concat([d.update(Buffer.from(body.trim(), "base64")), d.final()]).toString("utf8"));
           info = "snapshot ok, age " + Math.round(Date.now() / 1000 - snap.at) + " s, chats " + Object.keys(snap.chats || {}).length;
         } catch (e) { info = "snapshot error: " + String(e.message || e).slice(0, 80); }
+        info += "; v " + VERSION + "; save " + Object.keys(snap && snap.save || {}).length;
         return res.status(200).send(info + "; fetch+decrypt " + (Date.now() - t0) + " ms; telegram token " + (process.env.TELEGRAM_TOKEN ? "set" : "missing"));
       }
     }
