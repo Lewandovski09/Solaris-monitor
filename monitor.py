@@ -2663,7 +2663,7 @@ def staff_command(tg, st, cmd, arg):
                 p.pop("gen_kind", None)
             tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: " + {"none": "генератора нет — по косвенным признакам генератор не ищу.",
                                                                  "ats": "генератор через АВР — определяю его увереннее.",
-                                                                 "port": "генератор на порту GEN инвертора — включение и мощность беру прямо из Deye.",
+                                                                 "port": "генератор на порту GEN инвертора — вижу его, только если инвертор передаёт в Deye данные порта GEN (6 кВт передают, 50 кВт — нет). Косвенно не угадываю.",
                                                                  None: "определяю генератор автоматически."}[kind])
             return
         elif m:
@@ -2884,7 +2884,7 @@ def device_alerts(tg, p, title, items, t):
 
 # ---------------------------------------------------------------- генератор и фазы
 GEN_P = re.compile(r"^(total)?gen(erator)?_?power$", re.I)
-MI_P = re.compile(r"^totalmipower$", re.I)  # 50 кВт Deye: мощность порта GEN (Deye пишет её как «микроинвертор»)
+# TotalMIPower у 50 кВт Deye - НЕ генератор (25.11 на Dynamica было ~3,6 кВт без генератора): не используем
 GEN_V = re.compile(r"^gen(erator)?.*volt", re.I)
 GEN_F = re.compile(r"^gen(erator)?.*freq", re.I)
 
@@ -2902,8 +2902,6 @@ def gen_detect(dev, grid_on, dtek, q, t, st=None, sid=None, p=None, dkw=None):
        50,0 ±0,2 Гц; генератор - заметно хуже. Отклонение от 0,5 Гц - генератор; от 0,2 Гц - генератор,
        только если по графику ДТЭК сейчас точно отключение (не на краю интервала)."""
     gp, gv, gf = dev_val(dev, GEN_P), dev_val(dev, GEN_V), dev_val(dev, GEN_F)
-    if gp is None and p is not None and p.get("gen_kind") == "port":
-        gp = dev_val(dev, MI_P)
     if (gp is not None and gp > 150) or (gv and gv > 150 and gf and 45 < gf < 55):
         return True, "port", gf, gv
     f = num((dev or {}).get("GridFrequency"))
@@ -3704,10 +3702,17 @@ def check(api, tg, st, dtek):
                 p["fix_v"], p["gen_kind"], p["lines_same"] = 1, "port", True
                 for k in ("queue2", "lines_mode", "gen_force", "gen_sc"):
                     p.pop(k, None)
-            if p.get("gen_kind") == "port" and dev_val(dev, GEN_P) is None and (p.get("last") or {}).get("pv"):
-                mi = dev_val(dev, MI_P) or 0  # Deye прибавляет генератор на порту GEN к «выработке» - панели считаем без него
-                if mi > 0:
-                    p["last"]["pv"] = max(0.0, p["last"]["pv"] - mi)
+            if p.get("fix_v", 0) < 2 and p.get("gen_kind") == "port" and dev_val(dev, GEN_P) is None:
+                # ложный «генератор» 25.11 (из поля TotalMIPower): тихо убрать, без сообщений клиентам
+                p["fix_v"] = 2
+                today = t.strftime("%Y-%m-%d")
+                for k in ("gen_on", "gen_since", "gen_how", "gen_flip", "gen_bad", "gen_drain", "gen_starts", "pvk_h"):
+                    p.pop(k, None)
+                (p.get("gen_day") or {}).pop(today, None)
+                if not p.get("gen_day"):
+                    p.pop("gen_day", None)
+                    p.pop("has_gen", None)
+                    p.pop("gen_hours", None)
             if p.get("has_pv"):
                 wx_fetch(st, p, t)
                 pv_learn(st, p, t)
@@ -3732,7 +3737,7 @@ def check(api, tg, st, dtek):
                 prev_t, p["gen_t"] = p.get("gen_t"), t.isoformat()
                 gdt = (t - datetime.fromisoformat(prev_t)).total_seconds() / 3600 if prev_t else 0
                 if 0 < gdt < 0.5:
-                    gpw = (dev_val(dev, GEN_P) or dev_val(dev, MI_P)) if p.get("gen_how") == "port" else abs(num((dev or {}).get("TotalGridPower")) or num(lt.get("wirePower")) or 0)
+                    gpw = dev_val(dev, GEN_P) if p.get("gen_how") == "port" else abs(num((dev or {}).get("TotalGridPower")) or num(lt.get("wirePower")) or 0)
                     gd = p.setdefault("gen_day", {}).setdefault(t.strftime("%Y-%m-%d"), {"kwh": 0, "min": 0, "chg": 0})
                     gd["kwh"] = round(gd["kwh"] + (gpw or 0) / 1000 * gdt, 2)
                     gd["min"] = round(gd["min"] + gdt * 60, 1)
