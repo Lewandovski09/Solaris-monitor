@@ -564,19 +564,26 @@ def discharge_kw(lt):
     """Сколько кВт сейчас отдаёт АКБ. Берём мощность разряда из Deye, а если её нет —
     нагрузку минус солнце (+5% на потери инвертора). 0 — АКБ не разряжается (заряжается от солнца)."""
     lt = lt or {}
+    # batteryPower у Deye со знаком: + разряд, − заряд. Это самое надёжное поле (25.11 у Dynamica
+    # dischargePower пустой, а chargePower = −100 при заряде; запасной расчёт «нагрузка − солнце» забывал сеть
+    # и показывал «АКБ разряжается 12 кВт», когда объект брал 18 кВт из сети, а АКБ стояла полная).
+    bp = num(lt.get("batteryPower"))
+    if bp is not None:
+        return max(0.0, bp) / 1000
     d, c = num(lt.get("dischargePower")), num(lt.get("chargePower"))
     load, pv = num(lt.get("consumptionPower")), num(lt.get("generationPower")) or 0
+    grid_in = max(0.0, num(lt.get("wirePower")) or 0)  # что объект берёт из сети/генератора через вход сети
     if d is not None and d > 0:
         # АКБ не может отдавать больше, чем потребляет объект (+ потери): сбойный всплеск Deye
         # (25.11 Dynamica: ~44 кВт при нагрузке 19 кВт -> «хватит до 13:50») заменяем на нагрузку минус солнце
         if load is not None and d > load * 1.2 + 1000:
-            return max(0.0, (load - pv) / 1000 * 1.05)
+            return max(0.0, (load - pv - grid_in) / 1000 * 1.05)
         return d / 1000
     if c is not None and c > 0:
         return 0.0
     if load is None:
         return None
-    return max(0.0, (load - pv) / 1000 * 1.05)
+    return max(0.0, (load - pv - grid_in) / 1000 * 1.05)
 
 
 def deye_cap_kwh(dev, units):
@@ -1674,13 +1681,13 @@ def save_calc(api, st, sid, per, prices=None):
     else:
         charge = sum(r["charge"] for r in rows)
         dis = sum(r["dis"] for r in rows)
-        grid_chg = sum(max(0.0, r["charge"] - r["gen"] * r["cr"] / 100) for r in rows)
-        grid_chg = max(0.0, grid_chg - (gchg if p.get("gen_how_last") != "port" else 0))
-        share = min(1.0, grid_chg / charge) if charge else 1.0  # какая доля заряда АКБ - из сети
+        # Энергия, которую АКБ отдала без света, не бесплатная: её зарядили из сети (заплачено по тарифу) или от
+        # панелей (а эти кВт·ч уже посчитаны выше как «не довелося купувати»). В обоих случаях это e × цена сети.
+        # Так не нужна доля «сеть/солнце» (у Deye её нет: chargeRatio - это заряд ÷ выработка), и нет двойного счёта.
         if n and e:
-            og = e * share
-            cost += og * tf
-            lines.append(f"⚡ Заряд АКБ з мережі для роботи без світла: ~{kwh(og)} кВт·год → <b>~{grn(og * tf)} грн</b>")
+            cost += e * tf
+            lines.append(f"⚡ Заряд АКБ, витрачений без світла: ~{kwh(e)} кВт·год → <b>~{grn(e * tf)} грн</b> "
+                         "(світло з мережі або від панелей, яке інакше пішло б на звичайне споживання)")
         loss = max(0.0, charge - dis)
         if loss >= 0.1:
             cost += loss * tf
@@ -1695,7 +1702,7 @@ def save_calc(api, st, sid, per, prices=None):
         lines.append(f"⛽ Генератор{g_since}: працював {dur(gh * 60)}, дав ~{kwh(gk)} кВт·год"
                      + (f" (з них ~{kwh(gchg)} на заряд АКБ)" if gchg >= 0.1 else "") + f" → <b>~{grn(gk * gp)} грн</b>")
     lines.append(f"\n<b>Підсумок: економія ~{grn(save)} грн − витрати ~{grn(cost)} грн = {grn_signed(save - cost)} грн</b>")
-    lines.append(f"Ціни: світло з мережі {tf:g} грн, генератор {gp:g} грн за кВт·год. "
+    lines.append(f"Ціни: світло з мережі {tf:g} грн, генератор {gp:g} грн за кВт·год — розрахунок за поточними цінами за весь період. "
                  "Заряд АКБ з мережі у звичайний час окремо не рахується: це те саме світло, яке ви б і так купили.")
     return "\n".join(lines)
 
@@ -3725,7 +3732,8 @@ def check(api, tg, st, dtek):
 
             no_grid, how = grid_state(lt, dev)
             # Генератор: через вход GEN или через АВР на входе сети. Если через АВР - для клиента это не «світло є».
-            raw_d = num(lt.get("dischargePower"))  # мгновенная, не сглаженная: при раннем возврате света медиана ещё помнит отключение
+            raw_d = num(lt.get("batteryPower"))
+            raw_d = max(0.0, raw_d) if raw_d is not None else num(lt.get("dischargePower"))  # мгновенная, не сглаженная: при раннем возврате света медиана ещё помнит отключение
             g_on, g_how, g_f, g_v = gen_detect(dev, no_grid is False, dtek, q, t, st, sid, p, raw_d / 1000 if raw_d is not None else None)
             g_on, g_how = gen_force(p, no_grid, g_on, g_how, dtek, q, t)
             if (g_on and g_how != "port") or (p.get("gen_on") and p.get("gen_how") != "port" and no_grid is False and not g_on and p.get("gen_flip") is None):
