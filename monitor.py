@@ -2652,7 +2652,10 @@ def staff_command(tg, st, cmd, arg):
                      f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}"
                      f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}"
                      + (f"\nАКБ сейчас: {p['last']['soc']:.0f}%" if (p.get("last") or {}).get("soc") is not None else "")
-                     + f"\nгенератор: {gk}" + (" · сейчас работает" if p.get("gen_on") else ""), card_kb)
+                     + f"\nгенератор: {gk}" + (" · сейчас работает" if p.get("gen_on") else "")
+                     + (f"\nпорт GEN по Deye (TotalMIPower): сейчас {p.get('mi_now', 0) / 1000:.1f} кВт; "
+                        + "; ".join(f"{k[8:]}.{k[5:7]} — {v['kwh']:.0f} кВт·ч (ночью {v['night']:.0f})" for k, v in sorted(p['mi_day'].items())[-3:])
+                        if p.get("mi_day") else ""), card_kb)
     elif cmd == "/gen":
         m = re.match(r"(.+?)\s+(то|сброс|интервал\s+\d+|нет|авр|порт|gen|auto|авто)\s*$", arg, re.I)
         sid, err = find_station(st, m.group(1) if m else arg)
@@ -3720,6 +3723,18 @@ def check(api, tg, st, dtek):
                     p.pop("gen_day", None)
                     p.pop("has_gen", None)
                     p.pop("gen_hours", None)
+            mi = num((dev or {}).get("TotalMIPower"))
+            if mi is not None:  # порт GEN у 50 кВт Deye: копим, чтобы понять, генератор это или нет (ночью солнца нет)
+                day = t.strftime("%Y-%m-%d")
+                md = p.setdefault("mi_day", {}).setdefault(day, {"kwh": 0.0, "night": 0.0, "max": 0})
+                dt = min(10.0, max(0.0, (t - datetime.fromisoformat(p["mi_t"])).total_seconds() / 60)) if p.get("mi_t") else 2.0
+                md["kwh"] = round(md["kwh"] + max(0.0, mi) / 1000 * dt / 60, 2)
+                if clear_sky(p, t) <= 0:
+                    md["night"] = round(md["night"] + max(0.0, mi) / 1000 * dt / 60, 2)
+                md["max"] = max(md["max"], int(mi))
+                p["mi_t"], p["mi_now"] = t.isoformat(), int(mi)
+                for k in sorted(p["mi_day"])[:-10]:
+                    p["mi_day"].pop(k)
             if p.get("has_pv"):
                 wx_fetch(st, p, t)
                 pv_learn(st, p, t)
