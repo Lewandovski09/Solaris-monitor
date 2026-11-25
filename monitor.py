@@ -3745,6 +3745,9 @@ def check(api, tg, st, dtek):
                 p["fix_v"], p["gen_kind"], p["lines_same"] = 1, "port", True
                 for k in ("queue2", "lines_mode", "gen_force", "gen_sc"):
                     p.pop(k, None)
+            if "dynamica" in str(p.get("name", "")).lower() and p.get("fix_v", 0) == 2:
+                p["fix_v"], p["port_pv_kw"] = 3, 10  # со слов владельца 25.11: на порту GEN доп. панели до 10 кВт
+                p.pop("mi_k", None)
             if p.get("fix_v", 0) < 2 and p.get("gen_kind") == "port" and dev_val(dev, GEN_P) is None:
                 # ложный «генератор» 25.11 (из поля TotalMIPower): тихо убрать, без сообщений клиентам
                 p["fix_v"] = 2
@@ -3765,15 +3768,16 @@ def check(api, tg, st, dtek):
                 if clear_sky(p, t) <= 0:
                     md["night"] = round(md["night"] + max(0.0, mi) / 1000 * dt / 60, 2)
                 md["max"] = max(md["max"], int(mi))
-                # На порту GEN бывает и солнце (сетевой инвертор), и генератор. Солнечная часть - стабильная доля от
-                # мощности панелей на DC (25.11: 17-22% в любое время дня). Всё, что сверх этой доли, - генератор.
+                # На порту GEN бывают доп. панели через сетевой инвертор (Dynamica: до 10 кВт, со слов владельца 25.11)
+                # и генератор. Доп. панели могут смотреть в другую сторону, поэтому «доля от солнца» ненадёжна.
+                # Генератор: (1) основные панели почти ничего не дают (ночь, сумерки), а порт даёт мощность;
+                # (2) порт даёт заметно больше, чем могут доп. панели (их максимум + 15%).
                 dc = num((dev or {}).get("TotalSolarPower")) or 0
                 if dc > 1500 and mi >= 0 and not p.get("gen_on"):
-                    p["mi_k"] = (p.get("mi_k") or [])[-199:] + [round(mi / dc, 3)]
-                ks = sorted(p.get("mi_k") or [])
-                k = ks[len(ks) // 2] if len(ks) >= 10 else None
-                est = max(0.0, mi - (k * dc if k is not None else (mi if dc > 100 else 0)))
-                p["mi_gen"] = int(est) if est >= max(1500, 0.4 * max(mi, 1)) else 0
+                    p["mi_pvmax"] = max(p.get("mi_pvmax", 0), int(mi))
+                port_pv = max(3000, (p.get("port_pv_kw") or 0) * 1000, p.get("mi_pvmax", 0)) * 1.15
+                est = mi if dc < 300 else max(0.0, mi - port_pv)
+                p["mi_gen"] = int(est) if est >= 1500 else 0
                 if p["mi_gen"]:
                     md["gen"] = round(md.get("gen", 0) + p["mi_gen"] / 1000 * dt / 60, 2)
                 p["mi_t"], p["mi_now"] = t.isoformat(), int(mi)
