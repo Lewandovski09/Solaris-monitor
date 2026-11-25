@@ -4056,7 +4056,7 @@ def peek(api, st):
             lt = {"error": str(e)[-80:]}
         p = st["stations"].get(sid, {})
         hist = {}
-        for gran, a_, b_ in ((2, (now() - timedelta(days=2)).strftime("%Y-%m-%d"), (now() + timedelta(days=1)).strftime("%Y-%m-%d")),
+        for gran, a_, b_ in ((2, (now() - timedelta(days=14)).strftime("%Y-%m-%d"), (now() + timedelta(days=1)).strftime("%Y-%m-%d")),
                              (3, now().strftime("%Y-%m"), now().strftime("%Y-%m")),
                              (31, f"{now().year}-01", now().strftime("%Y-%m")), (4, "2015", str(now().year))):
             try:
