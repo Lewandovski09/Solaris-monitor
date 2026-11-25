@@ -558,11 +558,15 @@ def discharge_kw(lt):
     нагрузку минус солнце (+5% на потери инвертора). 0 — АКБ не разряжается (заряжается от солнца)."""
     lt = lt or {}
     d, c = num(lt.get("dischargePower")), num(lt.get("chargePower"))
+    load, pv = num(lt.get("consumptionPower")), num(lt.get("generationPower")) or 0
     if d is not None and d > 0:
+        # АКБ не может отдавать больше, чем потребляет объект (+ потери): сбойный всплеск Deye
+        # (25.11 Dynamica: ~44 кВт при нагрузке 19 кВт -> «хватит до 13:50») заменяем на нагрузку минус солнце
+        if load is not None and d > load * 1.2 + 1000:
+            return max(0.0, (load - pv) / 1000 * 1.05)
         return d / 1000
     if c is not None and c > 0:
         return 0.0
-    load, pv = num(lt.get("consumptionPower")), num(lt.get("generationPower")) or 0
     if load is None:
         return None
     return max(0.0, (load - pv) / 1000 * 1.05)
@@ -730,7 +734,31 @@ def wx_fetch(st, p, t):
             st["wx"][key] = {"t": "2000-01-01T00:00:00+02:00", "h": {}, "err": t.isoformat()}
 
 
+def clear_sky(p, x):
+    """Солнечная радиация при ясном небе по дате и времени (высота солнца над горизонтом), Вт/м²."""
+    import math
+    lat = math.radians(p.get("lat") or ODESA[0])
+    lon = p.get("lon") or ODESA[1]
+    u = x.astimezone(timezone.utc)
+    n = u.timetuple().tm_yday
+    decl = math.radians(23.44) * math.sin(2 * math.pi * (284 + n) / 365)
+    b = 2 * math.pi * (n - 81) / 364
+    eot = 9.87 * math.sin(2 * b) - 7.53 * math.cos(b) - 1.5 * math.sin(b)  # уравнение времени, мин
+    solar_min = u.hour * 60 + u.minute + lon * 4 + eot
+    ha = math.radians((solar_min / 4) - 180)
+    sin_el = math.sin(lat) * math.sin(decl) + math.cos(lat) * math.cos(decl) * math.cos(ha)
+    if sin_el <= 0:
+        return 0.0
+    return 1098 * sin_el * math.exp(-0.057 / sin_el)
+
+
 def ghi(st, p, x):
+    """Солнце по прогнозу погоды; если прогноза нет - по календарю (ясное небо × 0,5: в среднем облачно)."""
+    v = ghi_wx(st, p, x)
+    return v if v is not None else clear_sky(p, x) * 0.5
+
+
+def ghi_wx(st, p, x):
     """Солнечная радиация (Вт/м²) в момент x по прогнозу. Значение часа у Open-Meteo - среднее за предыдущий час,
     поэтому для момента x берём час, который закончится после x; между часами - линейно."""
     h = ((st.get("wx") or {}).get(wx_key(p)[0]) or {}).get("h") or {}
@@ -752,7 +780,7 @@ def pv_learn(st, p, t):
     """Сколько кВт дают панели станции на 1000 Вт/м² радиации - по факту: выработка ÷ радиация в те моменты,
     когда панели не ограничены (АКБ не полная). Последние 60 замеров."""
     last = p.get("last") or {}
-    g = ghi(st, p, t)
+    g = ghi_wx(st, p, t)  # учимся только по настоящему прогнозу
     pv, soc = last.get("pv"), last.get("soc")
     if g is None or g < 120 or pv is None or soc is None or soc >= 95:
         return
@@ -804,7 +832,8 @@ def fore_text(st, sid, p, soc, dkw, t, until):
     base = t + timedelta(hours=left_h) if left_h else None
     sim = sun_sim(st, sid, p, soc, dkw, t, until)
     if sim and (sim["pv"] >= 0.5 or how == "pv"):
-        sun = f"панелі за прогнозом погоди дадуть ще ~{kwh(sim['pv'])} кВт·год"
+        src = "за прогнозом погоди" if ghi_wx(st, p, t) is not None else "за звичайним для цієї пори року сонцем"
+        sun = f"панелі {src} дадуть ще ~{kwh(sim['pv'])} кВт·год"
         if until:
             if sim["empty"] is None or sim["empty"] >= until + timedelta(minutes=30):
                 txt = f"Заряду має вистачити: з урахуванням сонця ({sun}) АКБ до {hm(until)} опуститься щонайбільше до ~{sim['low']:.0f}%."
