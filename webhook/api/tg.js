@@ -41,8 +41,15 @@ async function fast(key, upd) {
   const cq = upd.callback_query;
   const msg = upd.message || {};
   const chat = String(cq ? ((cq.message || {}).chat || {}).id : (msg.chat || {}).id);
-  if (!cq && (msg.chat || {}).type !== "private") return null;
-  const look = cq ? String(cq.data || "") : String(msg.text || "").trim().split("@")[0];
+  const staffChat = String(process.env.TELEGRAM_CHAT_ID || "");
+  const isStaff = staffChat && chat === staffChat;
+  if (!cq && (msg.chat || {}).type !== "private" && !isStaff) return null;
+  let look = cq ? String(cq.data || "") : String(msg.text || "").trim().split("@")[0];
+  if (!cq && isStaff) {
+    // группа: «/link@Solaris_deye_bot sh_home» -> «/link sh_home», регистр не важен
+    const parts = String(msg.text || "").trim().split(/\s+/);
+    look = [parts[0].split("@")[0]].concat(parts.slice(1)).join(" ").toLowerCase();
+  }
   let snap;
   try { snap = await snapshot(key); } catch (e) { return null; }
   const c = snap && snap.chats && snap.chats[chat];

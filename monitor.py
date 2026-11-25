@@ -1010,7 +1010,8 @@ CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд
                    ("nalashtuvannia", "Налаштування: графіки ДТЕК і зведення виробітку"),
                    ("help", "Що вміє бот і як змінити чергу"),
                    ("stop", "Вимкнути сповіщення")]
-STAFF_COMMANDS = [("link", "Ссылка для клиента: /link пбс"),
+STAFF_COMMANDS = [("menu", "Кнопки: станции, ссылки, состояние"),
+                  ("link", "Ссылка для клиента: /link пбс"),
                   ("stations", "Станции: очередь, клиенты, свет"),
                   ("queue", "Очередь ДТЭК: /queue пбс 3.1"),
                   ("lines", "Схема двух линий: /lines пбс ats"),
@@ -1101,6 +1102,21 @@ def pick_station(tg, st, action, prompt, sids=None, all_button=None):
         rows.append([all_button])
     more = "" if len(st["stations"]) <= 60 or len(sids) < 60 else "\nПоказаны первые 60. Чтобы сузить, допишите часть названия после команды."
     tg.send(tg.staff, prompt + more, {"inline_keyboard": rows})
+
+
+def staff_menu(tg, st):
+    """Меню группы кнопками: сводка, ссылки, состояние, станции (нажал - карточка станции с кнопками)."""
+    S = st["stations"]
+    P = list(S.values())
+    dark = sum(1 for p in P if p.get("no_grid") and not p.get("offline"))
+    off = sum(1 for p in P if p.get("offline"))
+    rows = [[{"text": "📊 Сводка", "callback_data": "S:*"}, {"text": "🔗 Все ссылки", "callback_data": "M:links"}],
+            [{"text": "🩺 Состояние бота", "callback_data": "M:health"}, {"text": "❓ Команды", "callback_data": "M:help"}]]
+    btns = [{"text": ("🔴 " if p.get("offline") else "🟠 " if p.get("no_grid") else "🟢 ") + str(p.get("title") or p.get("name"))[:26],
+             "callback_data": f"S:{sid}"} for sid, p in sorted(S.items(), key=lambda kv: str(kv[1].get("name")).lower())][:40]
+    rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    tg.send(tg.staff, f"📋 <b>Меню Solaris</b>\nСтанций: {len(P)} · без света: {dark} · не на связи: {off}\n"
+                      "Нажмите станцию — карточка с кнопками (ссылка, очередь, генератор).", {"inline_keyboard": rows})
 
 
 PICK = {"/link": ("L", "Для какой станции нужна ссылка?"), "/stations": ("S", "Какую станцию показать?"),
@@ -1237,6 +1253,12 @@ def callback(tg, st, chat, data, who, dtek, api=None):
     if chat != str(tg.staff):
         return
     sid, _, arg = rest.partition(":")
+    if kind == "M":
+        if not sid:
+            staff_menu(tg, st)
+        else:
+            staff_command(tg, st, {"links": "/links", "health": "/health", "help": "/help"}.get(sid, "/help"), "")
+        return
     if kind == "S" and sid == "*":
         staff_command(tg, st, "/stations", "*")
     elif sid not in st["stations"]:
@@ -1257,6 +1279,13 @@ def callback(tg, st, chat, data, who, dtek, api=None):
                 {"inline_keyboard": [[{"text": "Да, отключить", "callback_data": f"r:{sid}"}, {"text": "Отмена", "callback_data": "x:"}]]})
     elif kind == "r":
         staff_command(tg, st, "/reset", sid)
+    elif kind == "G" and not arg:
+        p = st["stations"][sid]
+        tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>: есть ли генератор?",
+                {"inline_keyboard": [[{"text": "🚫 Нет", "callback_data": f"G:{sid}:нет"}, {"text": "🔀 Через АВР", "callback_data": f"G:{sid}:авр"},
+                                      {"text": "❓ Определять самому", "callback_data": f"G:{sid}:авто"}]]})
+    elif kind == "G":
+        staff_command(tg, st, "/gen", f"{sid} {arg}")
 
 
 def support(st):
@@ -2081,7 +2110,7 @@ class SimTG:
         return self.send(chat, caption, markup)
 
     def staff_msg(self, text):
-        return True
+        return self.send(self.staff, text)
 
     def clients(self, chats, text, urgent=False, markup=None):
         for c in chats or []:
@@ -2177,6 +2206,29 @@ def write_snapshot(st, dtek, api=None):
                 if len(seen) < 60:
                     queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
         chats[chat] = {"kb": kb, "t": t_ans, "cb": cb_ans}
+    if staff:  # группа сотрудников: меню и частые команды тоже отвечают из снимка
+        texts = ["/menu", "/m", "/start", "/stations", "/links", "/health", "/help", "/id", "/link", "/queue", "/reset", "/gen"]
+        for p in st["stations"].values():
+            n = str(p.get("name") or "").lower().strip()
+            if n:
+                texts += [f"/link {n}", f"/stations {n}", f"/gen {n}"]
+        t_ans, cb_ans, queue, seen = {}, {}, [], set()
+        for x in dict.fromkeys(texts):
+            r = rehearse(st, staff, staff, dtek, x)
+            if r:
+                t_ans[x] = r
+                queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
+        while queue and len(seen) < 200:
+            d = queue.pop(0)
+            if not d or d in seen or d.startswith(("r:", "x:")):  # сброс клиентов - только по-настоящему
+                continue
+            seen.add(d)
+            r = rehearse(st, staff, staff, dtek, "cb:" + d)
+            if r:
+                cb_ans[d] = r
+                if len(seen) < 120:
+                    queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
+        chats[str(staff)] = {"kb": None, "t": t_ans, "cb": cb_ans}
     data = json.dumps({"at": int(time.time()), "v": 2, "clear": list(CLEAR_KINDS), "chats": chats}, ensure_ascii=False).encode("utf-8")
     iv = secrets.token_hex(16)
     r = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-base64", "-A", "-K", hashlib.sha256(key.encode()).hexdigest(), "-iv", iv],
@@ -2377,6 +2429,9 @@ def client_queue(tg, st, chat, text, who, sid=None):
 
 def staff_command(tg, st, cmd, arg):
     S, bot = st["stations"], st.get("tg", {}).get("bot", "")
+    if cmd in ("/menu", "/start", "/m") and S:
+        staff_menu(tg, st)
+        return
     if not S and cmd != "/help":
         tg.staff_msg("Станции ещё не загружены, повторите команду через 10 минут.")
         return
@@ -2387,6 +2442,9 @@ def staff_command(tg, st, cmd, arg):
         name = re.sub(r"(\s+(\d\s*[.,]\s*\d|0|-))+\s*$", "", arg) if cmd == "/queue" else arg
         letter, prompt = PICK[cmd]
         example = {"/link": "/link ПБС", "/stations": "/stations ПБС", "/queue": "/queue ПБС 3.1", "/reset": "/reset ПБС"}[cmd]
+        if not name and len(S) <= 40:  # без названия - станции кнопками
+            pick_station(tg, st, letter, prompt + "\nИли напишите название после команды: <code>" + example + "</code>")
+            return
         if not name:
             tg.staff_msg(f"Напишите после команды название станции, как в Deye Cloud. Пример: <code>{example}</code>\n"
                          "Не помните точно — напишите часть названия, покажу подходящие.")
@@ -2414,12 +2472,17 @@ def staff_command(tg, st, cmd, arg):
             return
         p = S[sid]
         cap, src = capacity(st, sid, p)
-        tg.staff_msg(f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
+        gk = {"none": "нет", "ats": "через АВР", "port": "на входе GEN"}.get(p.get("gen_kind"), "определяю сам")
+        card_kb = {"inline_keyboard": [[{"text": "🔗 Ссылка для клиента", "callback_data": f"L:{sid}"}, {"text": "🔁 Очередь", "callback_data": f"Q:{sid}"}],
+                                       [{"text": f"⚙️ Генератор: {gk}", "callback_data": f"G:{sid}"}, {"text": "📋 Меню", "callback_data": "M:"}]]}
+        tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
                      f"\nочередь ДТЭК: {' и '.join(q.replace('GPV', '') for q in queues(p)) or 'не указана'} · клиентов: {len(p.get('clients') or [])}"
                      + (f"\nдве линии: {MODE_RU.get(p.get('lines_mode'), 'схема ещё не определена')}" if p.get("queue2") else "")
                      + (f"\nграфики отключили клиенты: {len(p['nosched'])}" if p.get("nosched") else "") +
                      f"\nсеть: {'НЕТ с ' + since_hm(datetime.fromisoformat(p['off_since'])) if p.get('no_grid') else 'есть'} · связь: {'нет' if p.get('offline') else 'есть'}"
-                     f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}")
+                     f"\nёмкость АКБ: {f'{cap:.0f} кВт·ч ({src})' if cap else 'неизвестна — задайте: /akb ' + esc(p.get('name')) + ' 180'}"
+                     + (f"\nАКБ сейчас: {p['last']['soc']:.0f}%" if (p.get("last") or {}).get("soc") is not None else "")
+                     + f"\nгенератор: {gk}" + (" · сейчас работает" if p.get("gen_on") else ""), card_kb)
     elif cmd == "/gen":
         m = re.match(r"(.+?)\s+(то|сброс|интервал\s+\d+|нет|авр|auto|авто)\s*$", arg, re.I)
         sid, err = find_station(st, m.group(1) if m else arg)
