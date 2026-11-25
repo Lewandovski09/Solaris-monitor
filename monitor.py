@@ -1447,14 +1447,24 @@ def pv_days(api, sid, days):
         except Exception:
             continue
         out[d] = hrow(r)
+        g = port_gen(sid, d)
+        if g:
+            out[d]["gen"] = max(0.0, out[d]["gen"] - g)  # генератор на порту GEN Deye пишет в «выработку»
     return out
+
+
+def port_gen(sid, prefix):
+    """кВт·ч генератора на порту GEN за дни, начинающиеся с prefix (дата, месяц, год или '')."""
+    st = st_ref[0] or {}
+    p = (st.get("stations") or {}).get(str(sid)) or {}
+    return sum(v.get("gen", 0) for k, v in (p.get("mi_day") or {}).items() if k.startswith(prefix))
 
 
 def pv_month(api, sid):
     ym = now().strftime("%Y-%m")
     rows = api.history(int(sid), 3, ym, ym)
     r = rows[0] if rows else {}
-    return {"gen": num(r.get("generationValue")) or 0, "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue"))}
+    return {"gen": max(0.0, (num(r.get("generationValue")) or 0) - port_gen(sid, ym)), "use": num(r.get("consumptionValue")), "buy": num(r.get("purchaseValue"))}
 
 
 def pv_reply(st, chat, api, only=None):
@@ -1648,6 +1658,10 @@ def save_calc(api, st, sid, per, prices=None):
             else:
                 args = (4, "2015", str(t.year))
             rows = [hrow(r) for r in api.history(int(sid), args[0], args[1], args[2])]
+            pref = {"m": t.strftime("%Y-%m"), "pm": (t.replace(day=1) - timedelta(days=1)).strftime("%Y-%m"), "y": str(t.year)}.get(per, "")
+            g = port_gen(sid, pref)
+            if rows and g:  # генератор на порту GEN Deye пишет в «выработку»
+                rows[0]["gen"] = max(0.0, rows[0]["gen"] - g)
     except CacheMiss:
         raise
     except Exception:
@@ -2912,6 +2926,15 @@ def gen_detect(dev, grid_on, dtek, q, t, st=None, sid=None, p=None, dkw=None):
        50,0 ±0,2 Гц; генератор - заметно хуже. Отклонение от 0,5 Гц - генератор; от 0,2 Гц - генератор,
        только если по графику ДТЭК сейчас точно отключение (не на краю интервала)."""
     gp, gv, gf = dev_val(dev, GEN_P), dev_val(dev, GEN_V), dev_val(dev, GEN_F)
+    if p is not None:
+        p["gen_by_est"] = False
+    if gp is None and p is not None and p.get("gen_kind") == "port" and p.get("mi_gen") is not None:
+        gp = p["mi_gen"]  # 50 кВт Deye: генератор = порт GEN сверх обычной солнечной доли
+        p["gen_by_est"] = bool(gp)
+        if gp:
+            p["gen_how_est"] = True
+        elif not p.get("gen_on"):
+            p.pop("gen_how_est", None)
     if (gp is not None and gp > 150) or (gv and gv > 150 and gf and 45 < gf < 55):
         return True, "port", gf, gv
     f = num((dev or {}).get("GridFrequency"))
@@ -3067,6 +3090,14 @@ def gen_force(p, no_grid, g_on, g_how, dtek, q, t):
     return True, g_how if g_on else "client"
 
 
+EST_TRIAL_END = "2026-11-29"
+
+
+def est_trial(p, t):
+    """Генератор по оценке порта GEN (50 кВт Deye): первые дни - только в группу, клиентам не пишем."""
+    return bool(p.get("gen_by_est") or p.get("gen_how_est")) and t.strftime("%Y-%m-%d") < EST_TRIAL_END
+
+
 def gen_track(tg, st, sid, p, title, chat, t, on, how, f, v, soc, dkw, no_grid):
     """Генератор: события клиенту, моточасы, проблемы сотрудникам. Включение/выключение - после 2 проверок подряд."""
     name = esc(p.get("name"))
@@ -3087,7 +3118,8 @@ def gen_track(tg, st, sid, p, title, chat, t, on, how, f, v, soc, dkw, no_grid):
                                  f"Если на объекте нет генератора: <code>/gen {name} нет</code> — бот перестанет так думать. "
                                  f"Если есть и подключён через АВР: <code>/gen {name} авр</code> — будет определять увереннее.")
                 else:
-                    tg.clients(chat, f"⚙️ <b>{title}</b>: запущено генератор о ~{hm(t)}." + (" Світла від мережі досі немає." if how != "port" or no_grid else ""))
+                    if not est_trial(p, t):
+                        tg.clients(chat, f"⚙️ <b>{title}</b>: запущено генератор о ~{hm(t)}." + (" Світла від мережі досі немає." if how != "port" or no_grid else ""))
                 if len(starts) >= 3 and day_once(p, "gen_cycle", t):
                     tg.staff_msg(f"⚙️ <b>{name}</b>: генератор запускается {len(starts)}-й раз за час — частые пуски.\n"
                                  "Как определено: включения генератора за последние 60 минут.\n"
@@ -3098,7 +3130,8 @@ def gen_track(tg, st, sid, p, title, chat, t, on, how, f, v, soc, dkw, no_grid):
                 p["gen_hours"] = round(p.get("gen_hours", 0) + mins / 60, 2)
                 for k in ("gen_on", "gen_since", "gen_how", "gen_bad", "gen_drain"):
                     p.pop(k, None)
-                tg.clients(chat, f"⚙️ <b>{title}</b>: генератор зупинено, працював {dur(mins)}." + (" Світло від мережі є." if p.get("ga_ans") == "grid" and p.get("ga_for") == p.get("off_since")
+                if not est_trial(p, t):
+                    tg.clients(chat, f"⚙️ <b>{title}</b>: генератор зупинено, працював {dur(mins)}." + (" Світло від мережі є." if p.get("ga_ans") == "grid" and p.get("ga_for") == p.get("off_since")
                                                                           else " Світла від мережі немає — об'єкт працює від АКБ." if no_grid else ""))
                 svc = p.get("gen_service", 200)
                 done = p.get("gen_service_at", 0)
@@ -3732,9 +3765,20 @@ def check(api, tg, st, dtek):
                 if clear_sky(p, t) <= 0:
                     md["night"] = round(md["night"] + max(0.0, mi) / 1000 * dt / 60, 2)
                 md["max"] = max(md["max"], int(mi))
+                # На порту GEN бывает и солнце (сетевой инвертор), и генератор. Солнечная часть - стабильная доля от
+                # мощности панелей на DC (25.11: 17-22% в любое время дня). Всё, что сверх этой доли, - генератор.
+                dc = num((dev or {}).get("TotalSolarPower")) or 0
+                if dc > 1500 and mi >= 0 and not p.get("gen_on"):
+                    p["mi_k"] = (p.get("mi_k") or [])[-199:] + [round(mi / dc, 3)]
+                ks = sorted(p.get("mi_k") or [])
+                k = ks[len(ks) // 2] if len(ks) >= 10 else None
+                est = max(0.0, mi - (k * dc if k is not None else (mi if dc > 100 else 0)))
+                p["mi_gen"] = int(est) if est >= max(1500, 0.4 * max(mi, 1)) else 0
+                if p["mi_gen"]:
+                    md["gen"] = round(md.get("gen", 0) + p["mi_gen"] / 1000 * dt / 60, 2)
                 p["mi_t"], p["mi_now"] = t.isoformat(), int(mi)
-                for k in sorted(p["mi_day"])[:-10]:
-                    p["mi_day"].pop(k)
+                for old in sorted(p["mi_day"])[:-400]:
+                    p["mi_day"].pop(old)
             if p.get("has_pv"):
                 wx_fetch(st, p, t)
                 pv_learn(st, p, t)
@@ -3760,7 +3804,7 @@ def check(api, tg, st, dtek):
                 prev_t, p["gen_t"] = p.get("gen_t"), t.isoformat()
                 gdt = (t - datetime.fromisoformat(prev_t)).total_seconds() / 3600 if prev_t else 0
                 if 0 < gdt < 0.5:
-                    gpw = dev_val(dev, GEN_P) if p.get("gen_how") == "port" else abs(num((dev or {}).get("TotalGridPower")) or num(lt.get("wirePower")) or 0)
+                    gpw = (dev_val(dev, GEN_P) if dev_val(dev, GEN_P) is not None else p.get("mi_gen")) if p.get("gen_how") == "port" else abs(num((dev or {}).get("TotalGridPower")) or num(lt.get("wirePower")) or 0)
                     gd = p.setdefault("gen_day", {}).setdefault(t.strftime("%Y-%m-%d"), {"kwh": 0, "min": 0, "chg": 0})
                     gd["kwh"] = round(gd["kwh"] + (gpw or 0) / 1000 * gdt, 2)
                     gd["min"] = round(gd["min"] + gdt * 60, 1)
