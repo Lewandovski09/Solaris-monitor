@@ -856,7 +856,7 @@ def kb_for(st, chat):
 
 
 # нажатия, после которых у старого сообщения убираем кнопки
-CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr")
+CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr", "zk", "ga")
 
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
@@ -1004,7 +1004,14 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         elif act == "help":
             tg.send(chat, client_help(st, chat), KEYBOARD)
         return
-    if kind in ("zs", "zg", "zr"):  # настройки клиента
+    if kind == "ga":  # клиент ответил: свет от сети или генератор
+        c_sid, _, ans = rest.partition(":")
+        p = st["stations"].get(c_sid)
+        if not p or chat not in (p.get("clients") or []):
+            return
+        gen_answer(tg, st, chat, c_sid, p, ans, who)
+        return
+    if kind in ("zs", "zg", "zr", "zk"):  # настройки клиента
         c_sid, _, arg = rest.partition(":")
         if chat not in (st["stations"].get(c_sid, {}).get("clients") or []):
             return
@@ -1016,6 +1023,18 @@ def callback(tg, st, chat, data, who, dtek, api=None):
                 p.pop("nosched", None)
             # короткое подтверждение с кнопками внизу - чтобы кнопка «Вимкнути/Увімкнути графіки» сразу поменялась
             tg.send(chat, "🔔 Графіки ДТЕК увімкнено." if sched_on(p, chat) else "🔕 Графіки ДТЕК вимкнено.", KEYBOARD)
+        elif kind == "zk":
+            if arg not in GEN_KINDS:
+                gen_kind_menu(tg, st, chat, c_sid)
+                return
+            if arg == "auto":
+                p.pop("gen_kind", None)
+            else:
+                p["gen_kind"] = arg
+            if arg in ("none", "port"):
+                p.pop("gen_force", None)
+            tg.staff_msg(f"⚙️ <b>{esc(p.get('name'))}</b>: клиент {who} указал генератор — {GEN_KINDS_RU[arg]}.")
+            tg.send(chat, f"✅ Генератор: {GEN_KINDS_SHORT[arg]}.", KEYBOARD)
         elif kind == "zr":
             cur = pv_pref(p, chat)
             if arg == "none":
@@ -1658,7 +1677,27 @@ def settings_menu(tg, st, chat, sid):
         rows += [[{"text": f"{'✅' if k in pref else '▫️'} Зведення виробітку: {v}", "callback_data": f"zr:{sid}:{k}"}] for k, v in PV_REP.items()]
         rows.append([{"text": ("✅ " if not pref else "") + "Не надсилати зведення виробітку", "callback_data": f"zr:{sid}:none"}])
         txt += "\nЗведення — коротко скільки виробили панелі. Можна обрати кілька або жодного."
+    rows.append([{"text": f"⚙️ Генератор: {GEN_KINDS_SHORT[p.get('gen_kind') or 'auto']}", "callback_data": f"zk:{sid}"}])
     tg.send(chat, txt, {"inline_keyboard": rows})
+
+
+GEN_KINDS = {"none": "🚫 Генератора немає",
+             "port": "🔌 Підключений до інвертора (вхід GEN)",
+             "ats": "🔀 Через перемикач / АВР на вхід мережі",
+             "auto": "❓ Не знаю"}
+GEN_KINDS_SHORT = {"none": "немає", "port": "до інвертора", "ats": "через перемикач", "auto": "не вказано"}
+GEN_KINDS_RU = {"none": "генератора нет", "port": "генератор на входе GEN инвертора", "ats": "генератор через перемикач/АВР на вход сети",
+                "auto": "не знает — определяю автоматически"}
+
+
+def gen_kind_menu(tg, st, chat, sid):
+    p = st["stations"][sid]
+    cur = p.get("gen_kind") or "auto"
+    rows = [[{"text": ("✅ " if k == cur else "") + v, "callback_data": f"zk:{sid}:{k}"}] for k, v in GEN_KINDS.items()]
+    tg.send(chat, f"⚙️ <b>{esc(p.get('title') or p.get('name'))}</b> — чи є генератор і як він підключений?\n"
+                  "Це допомагає боту не плутати роботу генератора зі світлом від мережі. "
+                  "Інверторний генератор через перемикач інвертор бачить як «мережу» — тому важливо вказати.",
+            {"inline_keyboard": rows})
 
 
 def pv_daily(api, tg, st, t):
@@ -2498,9 +2537,13 @@ def gen_detect(dev, grid_on, dtek, q, t, st=None, sid=None, p=None, dkw=None):
             return True, "freq", f, v
         if abs(f - 50) >= 0.2 and q and all(planned_now(dtek, q, t + timedelta(minutes=d), margin_min=0) for d in (-30, 30)):
             return True, "freq+schedule", f, v
-    if grid_on and p is not None and p.get("gen_kind") != "none":
+    if p is not None:
+        p.pop("gen_sc", None)
+    told_grid = p is not None and ((p.get("ga_ans") == "grid" and p.get("ga_for") and p.get("ga_for") == p.get("off_since"))
+                                   or (p.get("ga_grid_until") and t < datetime.fromisoformat(p["ga_grid_until"])))
+    if grid_on and p is not None and p.get("gen_kind") not in ("none", "port") and not told_grid:
         score, why = suspect_score(dev, dtek, q, t, st, sid, p, f, dkw)
-        p["gen_why"] = why
+        p["gen_why"], p["gen_sc"] = why, score
         if score >= 3:
             return True, "suspect", f, v
     return False, "", f, v
@@ -2541,6 +2584,13 @@ def suspect_score(dev, dtek, q, t, st, sid, p, f, dkw):
             why.append(f"частота 5 проверок подряд ровно {h[-1]:.2f} Гц")
         elif max(h) - min(h) >= 0.02:
             score -= 1
+    # напряжение «застыло»: в городской сети оно гуляет на вольты, инверторный генератор держит его в пределах 1 В
+    vv = [x for x in ph if x is not None and x > 150] or [num((dev or {}).get("GridVoltage")) or 0]
+    vh = (p.get("v_h") or [])[-4:] + ([round(max(vv), 1)] if max(vv) > 150 else [])
+    p["v_h"] = vh
+    if len(vh) >= 5 and max(vh) - min(vh) < 1.0:
+        score += 1
+        why.append(f"напряжение 5 проверок подряд почти не меняется ({vh[-1]:.0f} В)")
     if dkw is not None and dkw > 0.5:
         score += 1
         why.append(f"при «сети» АКБ разряжается ({dkw:.1f} кВт) — источнику не хватает мощности")
@@ -2548,6 +2598,83 @@ def suspect_score(dev, dtek, q, t, st, sid, p, f, dkw):
         score += 1
         why.append("на объекте отмечен генератор через АВР")
     return score, why
+
+
+GA_KB = lambda sid: {"inline_keyboard": [[{"text": "💡 Дали світло", "callback_data": f"ga:{sid}:grid"},
+                                             {"text": "⚙️ Працює генератор", "callback_data": f"ga:{sid}:gen"}],
+                                            [{"text": "🚫 Генератора немає", "callback_data": f"ga:{sid}:none"}]]}
+
+
+def gen_ask(tg, st, sid, p, title, chat, t):
+    """«Світло» повернулося, але є ознаки генератора (1-2 бали) - питаємо клієнта, а повідомлення «світло увімкнули»
+    притримуємо до відповіді (не довше 20 хв). Не більше 2 разів за одне відключення."""
+    if p.get("gen_kind") in ("none", "port") or not p.get("off_since") or p.get("gen_sc", 0) < 1:
+        return
+    if p.get("ga_grid_n", 0) >= 3 and not p.get("has_gen") and p.get("gen_kind") != "ats":
+        return  # трижды отвечали «дали світло», генератора ни разу не было - больше не дёргаем
+    n = p.get("ga_n", 0) if p.get("ga_for") == p["off_since"] else 0
+    if n >= 2 or (p.get("ga_for") == p["off_since"] and p.get("ga_t") and not p.get("ga_ans")):
+        return
+    p["ga_for"], p["ga_n"] = p["off_since"], n + 1
+    p.pop("ga_ans", None)
+    if tg.clients(chat, f"❓ <b>{title}</b>: інвертор знову бачить живлення на вході мережі. Це дали світло чи запустили генератор?\n"
+                        "Підкажіть, будь ласка, — так бот не сплутає генератор зі світлом.", markup=GA_KB(sid)):
+        p["ga_t"] = t.isoformat()
+
+
+def ga_hold(p, t):
+    """Чекаємо відповіді клієнта про генератор - «світло увімкнули» поки не пишемо."""
+    return bool(p.get("ga_t") and p.get("ga_for") == p.get("off_since") and not p.get("ga_ans")
+                and (t - datetime.fromisoformat(p["ga_t"])).total_seconds() < 1200)
+
+
+def gen_answer(tg, st, chat, sid, p, ans, who):
+    title, name, t = esc(p.get("title") or p.get("name")), esc(p.get("name")), now()
+    if ans == "gen":
+        p["ga_ans"] = "gen"
+        if p.get("gen_kind") != "port":
+            p["gen_kind"] = "ats"
+        if p.get("no_grid"):
+            p["gen_force"] = True
+            for k in ("on_since", "on_soc"):
+                p.pop(k, None)
+            if not p.get("gen_on"):
+                p["gen_on"], p["gen_since"], p["gen_how"], p["has_gen"] = True, t.isoformat(), "client", True
+        tg.send(chat, f"⚙️ Дякую! <b>{title}</b>: працює генератор, відключення світла триває. "
+                      "Коли дадуть світло — натисніть кнопку нижче, або бот сам побачить за графіком і мережею.",
+                {"inline_keyboard": [[{"text": "💡 Світло дали", "callback_data": f"ga:{sid}:grid"}]]})
+        tg.staff_msg(f"⚙️ <b>{name}</b>: клиент {who} подтвердил — работает генератор (через перемикач/АВР). Отмечено, дальше определяю увереннее.")
+    elif ans == "grid":
+        p["ga_ans"] = "grid"
+        p["ga_grid_n"] = p.get("ga_grid_n", 0) + 1
+        p["ga_grid_until"] = (t + timedelta(hours=4)).isoformat()  # до нового отключения не считаем это генератором
+        p.pop("gen_force", None)
+        if p.get("gen_on") and p.get("gen_how") != "port":
+            p["gen_flip"] = 1  # следующая проверка без генератора выключит его сразу
+        tg.send(chat, f"💡 Дякую! <b>{title}</b>: світло від мережі.", KEYBOARD)
+    elif ans == "none":
+        p["ga_ans"], p["gen_kind"] = "grid", "none"
+        p.pop("gen_force", None)
+        tg.send(chat, f"Зрозумів: на <b>{title}</b> генератора немає, більше не питатиму. Змінити — «{BTN_SET}» → «Генератор».", KEYBOARD)
+        tg.staff_msg(f"⚙️ <b>{name}</b>: клиент {who} сообщил — генератора нет.")
+
+
+def gen_force(p, no_grid, g_on, g_how, dtek, q, t):
+    """Клиент сказал «генератор»: держим его включённым, пока не пропадёт вход, город не «оживит» частоту
+    или не закончится отключение по графику (тогда спросим ещё раз)."""
+    if no_grid is True:
+        p.pop("ga_grid_until", None)
+    if not p.get("gen_force"):
+        return g_on, g_how
+    h = p.get("f_h") or []
+    jitter = len(h) >= 5 and max(h) - min(h) >= 0.03
+    over = bool(q and dtek) and planned_now(dtek, q, t, margin_min=0) is False
+    if no_grid is True or jitter or over:
+        p.pop("gen_force", None)
+        if over and not jitter and no_grid is False:
+            p.pop("ga_t", None)  # по графику уже свет - спросим клиента ещё раз
+        return g_on, g_how
+    return True, g_how if g_on else "client"
 
 
 def gen_track(tg, st, sid, p, title, chat, t, on, how, f, v, soc, dkw, no_grid):
@@ -2581,7 +2708,8 @@ def gen_track(tg, st, sid, p, title, chat, t, on, how, f, v, soc, dkw, no_grid):
                 p["gen_hours"] = round(p.get("gen_hours", 0) + mins / 60, 2)
                 for k in ("gen_on", "gen_since", "gen_how", "gen_bad", "gen_drain"):
                     p.pop(k, None)
-                tg.clients(chat, f"⚙️ <b>{title}</b>: генератор зупинено, працював {dur(mins)}." + (" Світла від мережі немає — об'єкт працює від АКБ." if no_grid else ""))
+                tg.clients(chat, f"⚙️ <b>{title}</b>: генератор зупинено, працював {dur(mins)}." + (" Світло від мережі є." if p.get("ga_ans") == "grid" and p.get("ga_for") == p.get("off_since")
+                                                                          else " Світла від мережі немає — об'єкт працює від АКБ." if no_grid else ""))
                 svc = p.get("gen_service", 200)
                 done = p.get("gen_service_at", 0)
                 if p["gen_hours"] - done >= svc and day_once(p, "gen_svc", t):
@@ -3198,6 +3326,7 @@ def check(api, tg, st, dtek):
             # Генератор: через вход GEN или через АВР на входе сети. Если через АВР - для клиента это не «світло є».
             raw_d = num(lt.get("dischargePower"))  # мгновенная, не сглаженная: при раннем возврате света медиана ещё помнит отключение
             g_on, g_how, g_f, g_v = gen_detect(dev, no_grid is False, dtek, q, t, st, sid, p, raw_d / 1000 if raw_d is not None else None)
+            g_on, g_how = gen_force(p, no_grid, g_on, g_how, dtek, q, t)
             if (g_on and g_how != "port") or (p.get("gen_on") and p.get("gen_how") != "port" and no_grid is False and not g_on and p.get("gen_flip") is None):
                 no_grid, how = True, "generator"  # пока генератор на входе сети, отключение продолжается
             gen_track(tg, st, sid, p, title, chat, t, g_on, g_how, g_f, g_v, soc, dkw, no_grid is True or bool(p.get("no_grid")))
@@ -3224,7 +3353,11 @@ def check(api, tg, st, dtek):
                 if p.get("no_grid") and p.get("on_since"):
                     # свет дали и снова забрали - это то же отключение, отдельно не пишем
                     p.pop("on_since", None)
-                    p["flaps"] = p.get("flaps", 0) + 1
+                    if not g_on:  # «свет» оказался генератором - это не моргание сети
+                        p["flaps"] = p.get("flaps", 0) + 1
+                    if p.get("ga_ans") == "grid":  # «дали світло» было про прошлый раз - снова можно спросить
+                        for k in ("ga_ans", "ga_t"):
+                            p.pop(k, None)
                 if not p.get("no_grid") and p["off_n"] >= need:
                     p["no_grid"] = True
                     p["off_since"] = t.isoformat()
@@ -3251,7 +3384,8 @@ def check(api, tg, st, dtek):
                     # Пишем «увімкнули» один раз, когда сеть держится стабильно, а не на каждое моргание.
                     p.setdefault("on_since", t.isoformat())
                     back = datetime.fromisoformat(p["on_since"])
-                    if (t - back).total_seconds() / 60 >= stable_min:
+                    gen_ask(tg, st, sid, p, title, chat, t)
+                    if (t - back).total_seconds() / 60 >= stable_min and not ga_hold(p, t):
                         start = datetime.fromisoformat(p["off_since"])
                         mins = (back - start).total_seconds() / 60
                         st["log"].append({"sid": sid, "name": name, "start": p["off_since"], "end": p["on_since"],
@@ -3268,7 +3402,8 @@ def check(api, tg, st, dtek):
                         fl = f"\nЗа цей час світло з'являлось і знову зникало: {p['flaps']} раз(и)." if p.get("flaps") else ""
                         tg.clients(chat, f"🟢 <b>{title}</b>: світло увімкнули о ~{hm(back)}, мережа стабільна.\nБез мережі: {dur(mins)}.{fl}{bat}", urgent=True)
                         good_moment(tg, p, mins, min(p.get("min_soc", 100), p.get("on_soc", soc) if p.get("on_soc", soc) is not None else 100), t)
-                        for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until", "off_kwh", "off_t", "off_snap", "off_emerg"):
+                        for k in ("no_grid", "off_since", "off_soc", "off_planned", "on_since", "on_soc", "flaps", "min_soc", "off_until", "off_kwh", "off_t", "off_snap", "off_emerg",
+                                  "ga_for", "ga_t", "ga_n", "ga_ans", "gen_force"):
                             p.pop(k, None)
                     elif "on_soc" not in p and soc is not None:
                         p["on_soc"] = soc
@@ -3774,7 +3909,7 @@ def main():
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
             for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected",
-                      "dkw_h", "last_soc_t", "soc_sus", "miss_n", "gen_flip", "gen_bad", "gen_drain", "ph_over", "f_h", "gen_why", "gen_t"):
+                      "dkw_h", "last_soc_t", "soc_sus", "miss_n", "gen_flip", "gen_bad", "gen_drain", "ph_over", "f_h", "gen_why", "gen_t", "v_h", "gen_sc"):
                 q.pop(k, None)
         return x
 
