@@ -701,22 +701,139 @@ def runtime(st, sid, p, soc, dkw):
     return min(est) if est else (None, "")
 
 
-def forecast_line(st, sid, soc, t, until, p=None, dkw=None):
-    """Строка «хватит ли заряда до конца отключения»."""
-    out = f"\nЗа графіком світло мають дати о {hm(until)}." if until else ""
-    left_h, how = runtime(st, sid, p or {}, soc, dkw)
-    if left_h is None:
-        return out
-    word = "за поточного споживання" if how == "energy" else "за звичного споживання"
-    empty = t + timedelta(hours=left_h)
-    if until:
-        if empty >= until + timedelta(minutes=30):
-            out += f" Заряду має вистачити: {word} його стане до ~{hm(empty)}."
+WX_URL = "https://api.open-meteo.com/v1/forecast"
+ODESA = (46.48, 30.73)
+
+
+def wx_key(p):
+    lat, lon = p.get("lat") or ODESA[0], p.get("lon") or ODESA[1]
+    return f"{lat:.1f},{lon:.1f}", lat, lon
+
+
+def wx_fetch(st, p, t):
+    """Прогноз солнца (Open-Meteo, без ключа): суммарная солнечная радиация по часам на 2 дня. Раз в час на точку."""
+    key, lat, lon = wx_key(p)
+    w = st.setdefault("wx", {}).get(key)
+    if w and (t - datetime.fromisoformat(w["t"])).total_seconds() < 3600:
+        return
+    if w and w.get("err") and (t - datetime.fromisoformat(w["err"])).total_seconds() < 900:
+        return
+    try:
+        r = requests.get(WX_URL, params={"latitude": lat, "longitude": lon, "hourly": "shortwave_radiation",
+                                         "forecast_days": 2, "past_days": 1, "timezone": "Europe/Kyiv"}, timeout=15)
+        h = r.json()["hourly"]
+        st["wx"][key] = {"t": t.isoformat(), "h": {k[:13]: v for k, v in zip(h["time"], h["shortwave_radiation"]) if v is not None}}
+    except Exception:
+        if w:
+            w["err"] = t.isoformat()
         else:
-            out += f"\n⚠️ Заряду може не вистачити: {word} АКБ опуститься до 15% близько {hm(empty)}. Вимкніть потужні прилади."
-    else:
-        out += f"\n{word[0].upper() + word[1:]} заряду вистачить приблизно на {dur(left_h * 60)}."
-    return out
+            st["wx"][key] = {"t": "2000-01-01T00:00:00+02:00", "h": {}, "err": t.isoformat()}
+
+
+def ghi(st, p, x):
+    """Солнечная радиация (Вт/м²) в момент x по прогнозу. Значение часа у Open-Meteo - среднее за предыдущий час,
+    поэтому для момента x берём час, который закончится после x; между часами - линейно."""
+    h = ((st.get("wx") or {}).get(wx_key(p)[0]) or {}).get("h") or {}
+    if not h:
+        return None
+    x = x.astimezone(KYIV) if x.tzinfo else x
+    a = x.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=30)
+    b = a + timedelta(hours=1)
+    if x < a:
+        a, b = a - timedelta(hours=1), a
+    va = h.get((a + timedelta(minutes=30)).strftime("%Y-%m-%dT%H"))
+    vb = h.get((b + timedelta(minutes=30)).strftime("%Y-%m-%dT%H"))
+    if va is None or vb is None:
+        return va if vb is None else vb
+    return va + (vb - va) * (x - a).total_seconds() / 3600
+
+
+def pv_learn(st, p, t):
+    """Сколько кВт дают панели станции на 1000 Вт/м² радиации - по факту: выработка ÷ радиация в те моменты,
+    когда панели не ограничены (АКБ не полная). Последние 60 замеров."""
+    last = p.get("last") or {}
+    g = ghi(st, p, t)
+    pv, soc = last.get("pv"), last.get("soc")
+    if g is None or g < 120 or pv is None or soc is None or soc >= 95:
+        return
+    h = (p.get("pvk_h") or [])[-59:] + [round(pv / g, 4)]  # кВт на кВт/м²: (Вт / 1000) / (Вт/м² / 1000)
+    p["pvk_h"] = h
+
+
+def pv_k(p):
+    h = sorted(p.get("pvk_h") or [])
+    if len(h) >= 6:
+        return h[int(len(h) * 0.8) - 1]  # верхний квантиль: в облачные моменты прогноз завышен, факт ниже
+    return (p.get("kwp") or 0) * 0.75 or None
+
+
+def sun_sim(st, sid, p, soc, dkw, t, until):
+    """Заряд АКБ шаг за шагом (10 мин) с учётом солнца по прогнозу: нагрузка - как сейчас, панели - по радиации.
+    Возвращает {empty: когда 15% или None, pv: кВт·ч панелей до конца отключения/24 ч, low: наименьший %}."""
+    cap, _ = capacity(st, sid, p)
+    k = pv_k(p)
+    if not cap or soc is None or not k or ghi(st, p, t) is None or not p.get("has_pv"):
+        return None
+    last = p.get("last") or {}
+    pv_now = (last.get("pv") or 0) / 1000
+    load = (last.get("load") or 0) / 1000 or ((dkw or 0) / 1.05 + pv_now)
+    if load <= 0:
+        return None
+    s, x, pv_kwh, low, dt = soc, t, 0.0, soc, 1 / 6
+    end = until or t + timedelta(hours=24)
+    empty = None
+    while x < t + timedelta(hours=24):
+        pv = k * (ghi(st, p, x) or 0) / 1000
+        if p.get("kwp"):
+            pv = min(pv, p["kwp"])
+        net = load - pv
+        s = s - net * 1.05 * dt / cap * 100 if net > 0 else min(100.0, s - net * 0.95 * dt / cap * 100)
+        if x < end:
+            pv_kwh += pv * dt
+            low = min(low, s)
+        x += timedelta(hours=dt)
+        if s <= 15:
+            empty = x
+            break
+    return {"empty": empty, "pv": pv_kwh, "low": max(15.0, low)}
+
+
+def fore_text(st, sid, p, soc, dkw, t, until):
+    """Хватит ли заряда: с учётом солнца по прогнозу (если есть панели и днём), иначе - как раньше."""
+    left_h, how = runtime(st, sid, p, soc, dkw)
+    base = t + timedelta(hours=left_h) if left_h else None
+    sim = sun_sim(st, sid, p, soc, dkw, t, until)
+    if sim and (sim["pv"] >= 0.5 or how == "pv"):
+        sun = f"панелі за прогнозом погоди дадуть ще ~{kwh(sim['pv'])} кВт·год"
+        if until:
+            if sim["empty"] is None or sim["empty"] >= until + timedelta(minutes=30):
+                txt = f"Заряду має вистачити: з урахуванням сонця ({sun}) АКБ до {hm(until)} опуститься щонайбільше до ~{sim['low']:.0f}%."
+                if base and base < until + timedelta(minutes=30):
+                    txt += f" Без сонця заряду стало б лише до ~{hm(base)}."
+                return txt
+            return (f"⚠️ Заряду може не вистачити: навіть з урахуванням сонця ({sun}) АКБ опуститься до 15% близько {hm(sim['empty'])}. "
+                    "Вимкніть потужні прилади.")
+        if sim["empty"] is None:
+            return f"З урахуванням сонця ({sun}) за такого споживання заряду вистачить більше ніж на добу."
+        txt = f"З урахуванням сонця ({sun}) за такого споживання заряду вистачить приблизно до {hm(sim['empty'])}"
+        return txt + (f" (без сонця — до ~{hm(base)})." if base and sim["empty"] > base + timedelta(minutes=10) else ".")
+    if how == "pv":
+        return "Зараз АКБ не розряджається: навантаження покривають сонячні панелі."
+    if left_h is None:
+        return ""
+    word = "за поточного споживання" if how == "energy" else "за звичного споживання"
+    if until:
+        if base >= until + timedelta(minutes=30):
+            return f"Заряду має вистачити: {word} його стане до ~{hm(base)}."
+        return f"⚠️ Заряду може не вистачити: {word} АКБ опуститься до 15% близько {hm(base)}. Вимкніть потужні прилади."
+    return f"{word[0].upper() + word[1:]} заряду вистачить приблизно на {dur(left_h * 60)}."
+
+
+def forecast_line(st, sid, soc, t, until, p=None, dkw=None):
+    """Строки «когда дадут свет» и «хватит ли заряда»."""
+    out = f"\nЗа графіком світло мають дати о {hm(until)}." if until else ""
+    txt = fore_text(st, sid, p or {}, soc, dkw, t, until)
+    return out + ("\n" + txt if txt else "")
 
 
 def is_emergency(text):
@@ -1808,15 +1925,10 @@ def client_status(st, chat, api=None, only=None):
                 left, how = runtime(st, sid, p, last["soc"], last.get("dkw"))
                 if p.get("gen_on"):
                     line += f"\n⚙️ Працює генератор з {since_hm(datetime.fromisoformat(p['gen_since']))}."
-                elif how == "pv":
-                    line += "\nЗараз АКБ не розряджається: навантаження покривають сонячні панелі."
-                elif left is not None and left > 0:
-                    word = "За такого споживання" if how == "energy" else "За звичного споживання"
-                    line += f"\n{word} заряду вистачить ще приблизно на {dur(left * 60)} (до залишку 15%)."
+                else:
                     until = datetime.fromisoformat(p["off_until"]) if p.get("off_until") else None
-                    if until and until > now():
-                        ok = now() + timedelta(hours=left) >= until + timedelta(minutes=30)
-                        line += f"\nЗа графіком світло мають дати о {hm(until)} — " + ("заряду має вистачити." if ok else "⚠️ заряду може не вистачити, вимкніть потужні прилади.")
+                    until = until if until and until > now() else None
+                    line += forecast_line(st, sid, last["soc"], now(), until, p, last.get("dkw"))
             line += f"\nДані станом на {last.get('at', '')[11:16]}."
         out.append(line)
     return "\n\n".join(out)
@@ -2597,6 +2709,11 @@ def suspect_score(dev, dtek, q, t, st, sid, p, f, dkw):
     if p.get("gen_kind") == "ats":
         score += 1
         why.append("на объекте отмечен генератор через АВР")
+    # «застывшие» частота и напряжение и разряд АКБ при сети бывают и у городской сети (режим самопотребления,
+    # округление данных Deye). Одних их мало: нужен сильный признак - график, сосед без света, одна фаза или АВР.
+    strong = any(w.startswith(("по графику", "у станции", "напряжение только", "на объекте отмечен")) and "свет есть" not in w for w in why)
+    if not strong:
+        score = min(score, 2)
     return score, why
 
 
@@ -3171,6 +3288,8 @@ def check(api, tg, st, dtek):
             p = st["stations"].setdefault(sid, {})
             p["name"] = name
             p["kwp"] = num(s.get("installedCapacity")) or p.get("kwp")  # мощность панелей, кВт
+            if num(s.get("locationLat")) and num(s.get("locationLng")):
+                p["lat"], p["lon"] = round(num(s["locationLat"]), 2), round(num(s["locationLng"]), 2)
             p.setdefault("code", secrets.token_urlsafe(9))
             cfg = setup(st, cfgs, sid)
             title, chat, q = esc(cfg["title"]), cfg["chats"], cfg["queue"]
@@ -3315,6 +3434,9 @@ def check(api, tg, st, dtek):
                 p["last_soc"], p["last_soc_t"] = soc, t.isoformat()
             p.pop("last", None)
             apply_latest(p, lt, t)
+            if p.get("has_pv"):
+                wx_fetch(st, p, t)
+                pv_learn(st, p, t)
             dkw = p["last"].get("dkw")
             pv_detect(api, tg, sid, p, lt, t)
             if dkw is not None:  # мощность разряда - медиана последних 3 проверок: один скачок прогноз не дёргает
