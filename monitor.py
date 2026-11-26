@@ -2932,6 +2932,7 @@ def gen_detect(dev, grid_on, dtek, q, t, st=None, sid=None, p=None, dkw=None):
         p["gen_by_est"] = False
         if p.get("gen_kind") == "none":  # сотрудник или клиент сказал «генератора нет» - не определяем его вообще
             p.pop("gen_sc", None)
+            p.pop("gen_strong", None)
             return False, "", num((dev or {}).get("GridFrequency")), None
     if gp is None and p is not None and p.get("gen_kind") == "port" and p.get("mi_gen") is not None:
         gp = p["mi_gen"]  # 50 кВт Deye: генератор = порт GEN сверх обычной солнечной доли
@@ -2952,6 +2953,7 @@ def gen_detect(dev, grid_on, dtek, q, t, st=None, sid=None, p=None, dkw=None):
             return True, "freq+schedule", f, v
     if p is not None:
         p.pop("gen_sc", None)
+        p.pop("gen_strong", None)
     told_grid = p is not None and ((p.get("ga_ans") == "grid" and p.get("ga_for") and p.get("ga_for") == p.get("off_since"))
                                    or (p.get("ga_grid_until") and t < datetime.fromisoformat(p["ga_grid_until"])))
     if grid_on and p is not None and p.get("gen_kind") not in ("none", "port") and not told_grid:
@@ -3016,6 +3018,7 @@ def suspect_score(dev, dtek, q, t, st, sid, p, f, dkw):
     strong = any(w.startswith(("у станции", "напряжение только", "на объекте отмечен")) and "свет есть" not in w for w in why)
     if not strong:
         score = min(score, 2)
+    p["gen_strong"] = strong
     return score, why
 
 
@@ -3025,10 +3028,12 @@ GA_KB = lambda sid: {"inline_keyboard": [[{"text": "💡 Дали світло",
 
 
 def gen_ask(tg, st, sid, p, title, chat, t):
-    """«Світло» повернулося, але є ознаки генератора (1-2 бали) - питаємо клієнта, а повідомлення «світло увімкнули»
+    """«Світло» повернулося, але є ознаки генератора (1-2 бали) і хоча б одна сильна (сусід без світла, одна фаза, АВР) - питаємо клієнта, а повідомлення «світло увімкнули»
     притримуємо до відповіді (не довше 20 хв). Не більше 2 разів за одне відключення."""
     if p.get("gen_kind") in ("none", "port") or not p.get("off_since") or p.get("gen_sc", 0) < 1:
         return
+    if not p.get("gen_strong"):
+        return  # только график/«ровные» 50 Гц - это обычно сеть (свет часто дают раньше графика), клиента не дёргаем
     if p.get("ga_grid_n", 0) >= 3 and not p.get("has_gen") and p.get("gen_kind") != "ats":
         return  # трижды отвечали «дали світло», генератора ни разу не было - больше не дёргаем
     n = p.get("ga_n", 0) if p.get("ga_for") == p["off_since"] else 0
@@ -3080,7 +3085,7 @@ def gen_answer(tg, st, chat, sid, p, ans, who):
 
 def gen_clear(p):
     """Генератора нет: молча забываем всё, что бот о нём «насчитал», без сообщений клиенту."""
-    for k in ("gen_on", "gen_since", "gen_how", "gen_bad", "gen_drain", "gen_flip", "gen_force", "gen_sc", "gen_why",
+    for k in ("gen_on", "gen_since", "gen_how", "gen_bad", "gen_drain", "gen_flip", "gen_force", "gen_sc", "gen_strong", "gen_why",
               "has_gen", "gen_starts", "gen_how_est", "gen_t"):
         p.pop(k, None)
 
@@ -4409,7 +4414,7 @@ def main():
             x.get("dtek", {}).pop(k, None)
         for q in x.get("stations", {}).values():
             for k in ("last", "last_soc", "pv", "off_n", "min_soc", "on_soc", "lowv_min", "ovl_max", "nosoc", "how", "off_kwh", "off_t", "cap_deye", "cap_deye1", "cap_sig", "cap_sig_new", "cap_sig_n", "cap_rejected",
-                      "dkw_h", "last_soc_t", "soc_sus", "miss_n", "gen_flip", "gen_bad", "gen_drain", "ph_over", "f_h", "gen_why", "gen_t", "v_h", "gen_sc"):
+                      "dkw_h", "last_soc_t", "soc_sus", "miss_n", "gen_flip", "gen_bad", "gen_drain", "ph_over", "f_h", "gen_why", "gen_t", "v_h", "gen_sc", "gen_strong"):
                 q.pop(k, None)
         return x
 
