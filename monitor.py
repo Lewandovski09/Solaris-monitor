@@ -948,8 +948,9 @@ HELP = ("📋 <b>Команды бота</b>\n"
 
         "<b>Генератор</b>\n"
         "<code>/gen пбс</code> — работает ли сейчас и моточасы. <code>/gen пбс то</code> — отметить ТО. <code>/gen пбс интервал 250</code> — интервал ТО в часах (по умолчанию 200). "
-        "<code>/gen пбс авр</code> — генератор через АВР на входе сети, <code>/gen пбс нет</code> — генератора нет, <code>/gen пбс авто</code> — как по умолчанию. "
-        "Включение и выключение бот определяет сам: по входу GEN инвертора или по частоте, если генератор подключён через АВР.\n\n"
+        "<code>/gen пбс анкета</code> — заполнить анкету генератора здесь (если клиент не заполнит сам), <code>/gen пбс нет</code> — генератора нет. "
+        "Генератор отслеживается и считается только после анкеты (клиент — кнопка «⚙️ Генератор» в боте). "
+        "Без анкеты бот генератор не угадывает; увидит мощность на входе GEN — предложит клиенту заполнить анкету.\n\n"
         "<b>Состояние самого бота</b>\n"
         "<code>/health</code> — когда была последняя проверка, отвечают ли Deye и ДТЭК, были ли ошибки программы.\n\n"
         "<b>Эта памятка</b>\n"
@@ -964,6 +965,7 @@ BTN_PV = "☀️ Виробіток"
 BTN_SET = "⚙️ Налаштування"
 BTN_SCHED_OFF, BTN_SCHED_ON = "🔕 Вимкнути графіки", "🔔 Увімкнути графіки"
 BTN_SAVE = "💰 Економія"
+BTN_GEN = "⚙️ Генератор"
 KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
 
@@ -995,7 +997,8 @@ def obj_menu(st, chat, sid):
     rows = [[b("🔌 Стан", "status"), b("🗓 Графік", "grafik")],
             [b("🔁 Черга", "queue"), b("🔕 Вимкнути графіки" if on else "🔔 Увімкнути графіки", "notify")]]
     rows.append([b("☀️ Виробіток", "pv"), b("💰 Економія", "save")] if p.get("has_pv") else [b("💰 Економія", "save")])
-    rows.append([b("⚙️ Налаштування", "set"), b("❓ Допомога", "help")])
+    rows.append([b("⚙️ Генератор", "gen"), b("⚙️ Налаштування", "set")])
+    rows.append([b("❓ Допомога", "help")])
     return f"<b>{esc(p.get('title') or p.get('name'))}</b>: {head}. Що зробити?", {"inline_keyboard": rows}
 
 
@@ -1011,17 +1014,19 @@ def kb_for(st, chat):
     notify = BTN_SCHED_OFF if ons == {True} else BTN_SCHED_ON if ons == {False} else BTN_NOTIFY  # кнопка сразу показывает, что сделает
     rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": notify}]]
     rows.append([{"text": BTN_PV}, {"text": BTN_SAVE}] if has_pv_chat(st, chat) else [{"text": BTN_SAVE}])
-    rows.append([{"text": BTN_SET}, {"text": BTN_HELP}])
+    rows.append([{"text": BTN_GEN}, {"text": BTN_SET}])
+    rows.append([{"text": BTN_HELP}])
     return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
 
 
 # нажатия, после которых у старого сообщения убираем кнопки
-CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr", "zk", "ga")
+CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr", "zk", "ga", "gq")
 
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
                    ("nalashtuvannia", "Налаштування: графіки ДТЕК і зведення виробітку"),
+                   ("generator", "Генератор: облік роботи, мотогодини, ТО, витрати"),
                    ("help", "Що вміє бот і як змінити чергу"),
                    ("stop", "Вимкнути сповіщення")]
 STAFF_COMMANDS = [("menu", "Кнопки: станции, ссылки, состояние"),
@@ -1177,6 +1182,8 @@ def callback(tg, st, chat, data, who, dtek, api=None):
             save_menu(tg, st, chat, c_sid)
         elif act == "set":
             settings_menu(tg, st, chat, c_sid)
+        elif act == "gen":
+            gen_menu(tg, st, chat, c_sid)
         elif act == "menu":
             tg.send(chat, *obj_menu(st, chat, c_sid))
         elif act == "help":
@@ -1188,6 +1195,16 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         if not p or chat not in (p.get("clients") or []):
             return
         gen_answer(tg, st, chat, c_sid, p, ans, who)
+        return
+    if kind in ("gm", "gq"):  # генератор: меню и анкета (клиенты объекта и группа сотрудников)
+        c_sid, _, act = rest.partition(":")
+        p = st["stations"].get(c_sid)
+        if not p or (chat not in (p.get("clients") or []) and chat != str(tg.staff)):
+            return
+        if kind == "gm":
+            gen_menu(tg, st, chat, c_sid)
+        else:
+            gen_set(tg, st, chat, c_sid, act, who)
         return
     if kind in ("zs", "zg", "zr", "zk"):  # настройки клиента
         c_sid, _, arg = rest.partition(":")
@@ -1201,18 +1218,9 @@ def callback(tg, st, chat, data, who, dtek, api=None):
                 p.pop("nosched", None)
             # короткое подтверждение с кнопками внизу - чтобы кнопка «Вимкнути/Увімкнути графіки» сразу поменялась
             tg.send(chat, "🔔 Графіки ДТЕК увімкнено." if sched_on(p, chat) else "🔕 Графіки ДТЕК вимкнено.", KEYBOARD)
-        elif kind == "zk":
-            if arg not in GEN_KINDS:
-                gen_kind_menu(tg, st, chat, c_sid)
-                return
-            if arg == "auto":
-                p.pop("gen_kind", None)
-            else:
-                p["gen_kind"] = arg
-            if arg in ("none", "port"):
-                p.pop("gen_force", None)
-            tg.staff_msg(f"⚙️ <b>{esc(p.get('name'))}</b>: клиент {who} указал генератор — {GEN_KINDS_RU[arg]}.")
-            tg.send(chat, f"✅ Генератор: {GEN_KINDS_SHORT[arg]}.", KEYBOARD)
+        elif kind == "zk":  # старая кнопка «Генератор» в настройках - теперь анкета
+            gen_menu(tg, st, chat, c_sid)
+            return
         elif kind == "zr":
             cur = pv_pref(p, chat)
             if arg == "none":
@@ -1328,13 +1336,8 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         q1 = (queue_key(p.get("queue")) or "не указана").replace("GPV", "")
         tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: " + (f"две линии, обе на очереди {q1}. График общий; смена очереди меняет обе."
                                                            if arg == "same" else f"одна линия, очередь {q1}."))
-    elif kind == "G" and not arg:
-        p = st["stations"][sid]
-        tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>: есть ли генератор?",
-                {"inline_keyboard": [[{"text": "🚫 Нет", "callback_data": f"G:{sid}:нет"}, {"text": "🔀 Через АВР", "callback_data": f"G:{sid}:авр"},
-                                      {"text": "🔌 На порт GEN", "callback_data": f"G:{sid}:порт"}],
-                                     [
-                                      {"text": "❓ Определять самому", "callback_data": f"G:{sid}:авто"}]]})
+    elif kind == "G" and not arg:  # анкета генератора прямо в группе (для объектов, где клиент её не заполнит)
+        gen_menu(tg, st, tg.staff, sid)
     elif kind == "G":
         staff_command(tg, st, "/gen", f"{sid} {arg}")
 
@@ -1364,6 +1367,7 @@ def client_help(st, chat=None):
             + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
                if chat is None or has_pv_chat(st, chat) else "") +
             f"{BTN_SAVE} — економія (панелі, інвертор з АКБ під час відключень) і витрати (заряд АКБ з мережі, генератор), і підсумок.\n" +
+            f"{BTN_GEN} — облік генератора: дайте відповіді на кілька запитань, і бот рахуватиме його роботу, мотогодини, ТО і витрати.\n" +
             f"{BTN_HELP} — ця підказка.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
@@ -1706,7 +1710,7 @@ def save_calc(api, st, sid, per, prices=None):
         if loss >= 0.1:
             cost += loss * tf
             lines.append(f"🔄 Втрати на заряд і розряд АКБ: ~{kwh(loss)} кВт·год (зарядили {kwh(charge)}, віддала {kwh(dis)}) → <b>~{grn(loss * tf)} грн</b>")
-    if gh or p.get("has_gen"):
+    if gen_ready(p):
         cost += gk * gp
         g_since = ""
         if p.get("gen_day"):
@@ -1851,7 +1855,7 @@ def staff_weekly(api, tg, st, t):
             line += " · ⚠️ сейчас не на связи"
         gh = p.get("gen_hours", 0) - p.get("gen_hours_week", 0)
         p["gen_hours_week"] = p.get("gen_hours", 0)
-        if gh > 0.05:
+        if gh > 0.05 and gen_ready(p):
             line += f" · генератор {gh:.1f} ч"
         week.append(line)
     if week:
@@ -1891,8 +1895,8 @@ def sales_leads(api, st, t):
             offers.append(f"больше АКБ: за 30 дней {len(deep)} раз(а) разряжалась до ≤20%")
         elif full_h and longest > full_h:
             offers.append(f"больше АКБ: самое длинное отключение {longest:.0f} ч, полного заряда хватает на ~{full_h:.0f} ч")
-        if full_h and longest > full_h and not p.get("has_gen"):
-            offers.append("генератор: отключения длиннее, чем хватает АКБ, а генератора на объекте не видно")
+        if full_h and longest > full_h and not gen_ready(p):
+            offers.append("генератор: отключения длиннее, чем хватает АКБ, а генератора нет (или клиент не указал его в боте)")
         ovl = [d for d in p.get("ovl") or [] if d >= (t - timedelta(days=7)).strftime("%Y-%m-%d")]
         if len(ovl) >= 2 and p.get("rated"):
             offers.append(f"инвертор мощнее: {len(ovl)} дн. за неделю нагрузка выше 90% номинала ({p['rated'] / 1000:.0f} кВт)")
@@ -1968,7 +1972,8 @@ def kb_sync(tg, st, t):
             continue
         if True:  # у новичков кнопки отмечаются при /start (любое сообщение с кнопками), сюда попадают те, у кого кнопки старые
             extra = (f"\n{BTN_PV} — скільки виробили панелі: сьогодні, вчора, тиждень, місяць." if has_pv_chat(st, chat) else "") + \
-                (f"\n{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ (робота без світла), і разом.")
+                (f"\n{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ (робота без світла), і разом.") + \
+                (f"\n{BTN_GEN} — якщо на об'єкті є генератор: дайте відповіді на кілька запитань, і бот рахуватиме його роботу, мотогодини, ТО і витрати.")
             tg.send(chat, f"🔄 Бот оновився — нові кнопки внизу екрана:\n{BTN_SET} — що надсилати: графіки ДТЕК"
                           + (", зведення виробітку щодня / щотижня / щомісяця" if has_pv_chat(st, chat) else "") + f".{extra}", kb)
         sent[chat] = h
@@ -2007,29 +2012,251 @@ def settings_menu(tg, st, chat, sid):
         rows += [[{"text": f"{'✅' if k in pref else '▫️'} Зведення виробітку: {v}", "callback_data": f"zr:{sid}:{k}"}] for k, v in PV_REP.items()]
         rows.append([{"text": ("✅ " if not pref else "") + "Не надсилати зведення виробітку", "callback_data": f"zr:{sid}:none"}])
         txt += "\nЗведення — коротко скільки виробили панелі. Можна обрати кілька або жодного."
-    rows.append([{"text": f"⚙️ Генератор: {GEN_KINDS_SHORT[p.get('gen_kind') or 'auto']}", "callback_data": f"zk:{sid}"}])
+    rows.append([{"text": f"⚙️ Генератор: {gen_label(p)}", "callback_data": f"gm:{sid}"}])
     nl = ("2, черги " + " і ".join(q.replace("GPV", "") for q in queues(p))) if p.get("queue2") else "2, одна черга" if p.get("lines_same") else "1"
     rows.append([{"text": f"🔌 Лінії (вводи) від ДТЕК: {nl}", "callback_data": f"c2:{sid}"}])
     tg.send(chat, txt, {"inline_keyboard": rows})
 
 
-GEN_KINDS = {"none": "🚫 Генератора немає",
-             "port": "🔌 Підключений до інвертора (вхід GEN)",
-             "ats": "🔀 Через перемикач / АВР на вхід мережі",
-             "auto": "❓ Не знаю"}
-GEN_KINDS_SHORT = {"none": "немає", "port": "до інвертора", "ats": "через перемикач", "auto": "не вказано"}
-GEN_KINDS_RU = {"none": "генератора нет", "port": "генератор на входе GEN инвертора", "ats": "генератор через перемикач/АВР на вход сети",
-                "auto": "не знает — определяю автоматически"}
+# ---------------------------------------------------------------- генератор: анкета
+# Бот сам генератор не угадывает: инверторный генератор через перемикач инвертор видит как обычную сеть.
+# Учёт генератора (сообщения «запущено/зупинено», моточасы, кВт·ч, ТО, строка в «Економії») - только когда на все
+# вопросы анкеты ответили (клиент кнопкой «⚙️ Генератор» или сотрудник в группе). Исключение - вход GEN инвертора:
+# мощность на нём бывает только от генератора, поэтому на объекте без анкеты бот раз в 7 дней предлагает её заполнить.
+GENQ_URL = "https://solaris.org.ua/#genq:"
+GEN_STEPS = ("conn", "inv", "run", "kw", "pr", "svc")  # что нужно для учёта (плюс «генератор есть»)
+GEN_CONN = {"port": "до інвертора (вхід GEN)", "ats": "через перемикач / АВР на вхід мережі"}
+GEN_CONN_RU = {"port": "на входе GEN инвертора", "ats": "через перемикач/АВР на вход сети"}
+GEN_INV = {"1": "інверторний", "0": "звичайний (не інверторний)", "x": "тип невідомий"}
+GEN_RUN = {"a": "запускається сам", "m": "запускають вручну"}
+GEN_KW_BTNS = (2, 3, 5, 6, 8, 10, 15, 20, 30, 50)
+GEN_SVC_BTNS = (100, 200, 250, 500)
 
 
-def gen_kind_menu(tg, st, chat, sid):
+def gen_ready(p):
+    """Анкета генератора заполнена полностью - только тогда бот следит за генератором и считает его."""
+    return p.get("gen_kind") in ("port", "ats") and bool(p.get("gen_done"))
+
+
+def gen_label(p):
+    return "налаштовано" if gen_ready(p) else "немає" if p.get("gen_kind") == "none" else "не налаштовано"
+
+
+def gen_label_ru(p):
+    if gen_ready(p):
+        return f"есть, {GEN_CONN_RU[p['gen_kind']]} (анкета заполнена)"
+    return "нет" if p.get("gen_kind") == "none" else "анкета не заполнена — не отслеживаю"
+
+
+def gen_summary(p):
+    return (f"{GEN_CONN[p['gen_kind']]}, {GEN_INV.get(p.get('gen_inv'), '—')}, {GEN_RUN.get(p.get('gen_run'), '—')}, "
+            f"{p.get('gen_kw', 0):g} кВт, {p.get('gen_price', GEN_PRICE):g} грн за кВт·год, ТО кожні {p.get('gen_service', 200)} мотогодин")
+
+
+def gen_menu(tg, st, chat, sid):
+    """Кнопка «⚙️ Генератор»: заполненная анкета - сводка и учёт; иначе - приглашение ответить на вопросы."""
     p = st["stations"][sid]
-    cur = p.get("gen_kind") or "auto"
-    rows = [[{"text": ("✅ " if k == cur else "") + v, "callback_data": f"zk:{sid}:{k}"}] for k, v in GEN_KINDS.items()]
-    tg.send(chat, f"⚙️ <b>{esc(p.get('title') or p.get('name'))}</b> — чи є генератор і як він підключений?\n"
-                  "Це допомагає боту не плутати роботу генератора зі світлом від мережі. "
-                  "Інверторний генератор через перемикач інвертор бачить як «мережу» — тому важливо вказати.",
-            {"inline_keyboard": rows})
+    title = esc(p.get("title") or p.get("name"))
+    b = lambda txt, act: {"text": txt, "callback_data": f"gq:{sid}:{act}"}
+    if gen_ready(p):
+        t = now()
+        gh, gk, _ = gen_usage(p, (t - timedelta(days=30)).isoformat(), t.isoformat())
+        h, done, svc = p.get("gen_hours", 0), p.get("gen_service_at", 0), p.get("gen_service", 200)
+        now_txt = f"працює з {since_hm(datetime.fromisoformat(p['gen_since']))}" if p.get("gen_on") and p.get("gen_since") else "зараз не працює"
+        txt = (f"⚙️ <b>{title}</b> — генератор: {now_txt}.\n"
+               f"За 30 днів: {dur(gh * 60)}, ~{kwh(gk)} кВт·год.\n"
+               f"Мотогодин після ТО: {max(0.0, h - done):.0f} з {svc}.\n\n"
+               f"Ваші відповіді: {gen_summary(p)}.")
+        rows = []
+        if p.get("gen_kind") == "ats" and p.get("gen_run") == "m":
+            rows.append([b("▶️ Запустив генератор", "on")])
+        rows += [[b("🔧 ТО зроблено", "svc0"), b("✏️ Змінити відповіді", "go")], [b("🚫 Генератора більше немає", "has:0")]]
+    elif p.get("gen_kind") == "none":
+        txt = f"⚙️ <b>{title}</b>: записано, що генератора немає — бот його не шукає і не рахує."
+        rows = [[b("📝 Генератор є — налаштувати", "go")]]
+    else:
+        txt = (f"⚙️ <b>{title}</b> — генератор.\n"
+               "Бот показує роботу генератора, мотогодини, нагадує про ТО і рахує його в «Економії» "
+               "тільки після того, як ви дасте відповіді на кілька запитань (1 хвилина). "
+               "Без цього бот генератор не шукає: інверторний генератор через перемикач інвертор бачить так само, як світло з мережі.")
+        rows = [[b("📝 Відповісти на запитання", "go")], [b("🚫 Генератора немає", "has:0")]]
+    tg.send(chat, txt, {"inline_keyboard": rows})
+
+
+def gen_q(tg, st, chat, sid, step, pre=""):
+    """Один вопрос анкеты. Следующий вопрос всегда один и тот же (не зависит от памяти) - так быстрый ответ
+    Vercel из снимка совпадает с тем, что ответит бот."""
+    p = st["stations"][sid]
+    title = esc(p.get("title") or p.get("name"))
+    b = lambda txt, act: {"text": txt, "callback_data": f"gq:{sid}:{act}"}
+    staff = str(chat) == str(tg.staff)  # в группе свой текст не напишешь - только кнопки
+    n = {"has": 1, "conn": 2, "inv": 3, "run": 4, "kw": 5, "pr": 6, "svc": 7}[step]
+    head = (pre + "\n\n" if pre else "") + f"⚙️ <b>{title}</b> · питання {n} з 7\n"
+    if step == "has":
+        txt, rows = "Чи є на об'єкті генератор?", [[b("✅ Так", "has:1"), b("🚫 Ні", "has:0")]]
+    elif step == "conn":
+        txt = ("Як генератор підключений?\n"
+               "• <b>До інвертора</b> — кабель генератора йде у вхід GEN інвертора.\n"
+               "• <b>Через перемикач або АВР</b> — генератор подає живлення туди ж, куди й мережа.\n"
+               "Якщо не знаєте — запитайте монтажника або техпідтримку.")
+        rows = [[b("🔌 До інвертора (вхід GEN)", "conn:port")], [b("🔀 Через перемикач або АВР", "conn:ats")], [b("❓ Не знаю", "conn:x")]]
+    elif step == "inv":
+        txt = "Генератор інверторний?\nІнверторні — тихі й легкі, на корпусі зазвичай написано «Inverter»."
+        rows = [[b("Інверторний", "inv:1"), b("Звичайний", "inv:0")], [b("❓ Не знаю", "inv:x")]]
+    elif step == "run":
+        txt, rows = "Як генератор запускається?", [[b("🤖 Сам (автозапуск)", "run:a"), b("✋ Вручну", "run:m")]]
+    elif step == "kw":
+        txt = "Яка потужність генератора, кВт?\nВона є на табличці генератора. Якщо вказано кВА — оберіть ту саму цифру."
+        btn = [b(f"{k:g}", f"kw:{k:g}") for k in GEN_KW_BTNS]
+        rows = [btn[:5], btn[5:]] + ([] if staff else [[b("✏️ Інша — написати", "kw:w")]])
+    elif step == "pr":
+        txt = (f"Скільки коштує 1 кВт·год від генератора?\nЯкщо не знаєте — бот рахуватиме {GEN_PRICE:g} грн "
+               "(дизель ~101 грн/л, генератор витрачає ~0,35 л на кВт·год).")
+        rows = [[b(f"{GEN_PRICE:g} грн", "pr:d")]] + ([] if staff else [[b("✏️ Написати свою ціну", "pr:w")]])
+    else:
+        txt = "Через скільки мотогодин робите ТО генератора?\nЯкщо не знаєте — оберіть 200: бот нагадає техпідтримці, коли настане час."
+        rows = [[b(str(k), f"svc:{k}") for k in GEN_SVC_BTNS]] + ([] if staff else [[b("✏️ Інше — написати", "svc:w")]])
+    tg.send(chat, head + txt, {"inline_keyboard": rows})
+
+
+GEN_ASK_NUM = {"gkw": ("Напишіть потужність генератора в кВт, наприклад: <b>7.5</b>", "Потужність, кВт", (0.5, 500)),
+               "gpr": ("Напишіть ціну 1 кВт·год від генератора в гривнях, наприклад: <b>40</b>", "Ціна за кВт·год", (5, 200)),
+               "gsvc": ("Напишіть, через скільки мотогодин ТО, наприклад: <b>150</b>", "Мотогодин", (20, 3000))}
+
+
+def gen_ask_num(tg, st, chat, sid, kind):
+    st.setdefault("await", {})[str(chat)] = {"kind": kind, "sid": sid, "at": now().isoformat()}
+    p = st["stations"][sid]
+    txt, ph, _ = GEN_ASK_NUM[kind]
+    tg.send(chat, f'<a href="{GENQ_URL}{kind}:{sid}">⚙️</a> <b>{esc(p.get("title") or p.get("name"))}</b>: {txt}',
+            {"force_reply": True, "input_field_placeholder": ph})
+
+
+def gen_input(tg, st, chat, text, who="клиент"):
+    """Клиент написал число для анкеты генератора. True - сообщение обработано."""
+    w = (st.get("await") or {}).get(str(chat))
+    if not w or w.get("kind") not in GEN_ASK_NUM or (now() - datetime.fromisoformat(w["at"])).total_seconds() > 1800:
+        return False
+    if w.get("sid") not in st["stations"]:
+        st["await"].pop(str(chat), None)
+        return False
+    m = re.search(r"\d+(?:[.,]\d+)?", text or "")
+    val = float(m.group(0).replace(",", ".")) if m else None
+    lo, hi = GEN_ASK_NUM[w["kind"]][2]
+    if val is None or not lo <= val <= hi:
+        tg.send(chat, f"Не схоже на правильне число. {GEN_ASK_NUM[w['kind']][0]}", KEYBOARD)
+        return True
+    st["await"].pop(str(chat), None)
+    gen_set(tg, st, chat, w["sid"], {"gkw": "kw", "gpr": "pr", "gsvc": "svc"}[w["kind"]] + f":{val:g}", who)
+    return True
+
+
+def gen_set(tg, st, chat, sid, act, who):
+    """Ответ на вопрос анкеты (кнопка или число) и действия из меню генератора."""
+    p = st["stations"][sid]
+    title, name = esc(p.get("title") or p.get("name")), esc(p.get("name"))
+    step, _, val = act.partition(":")
+    ans = p.setdefault("gen_ans", [])
+    mark = lambda k: ans.append(k) if k not in ans else None
+    if step == "go":
+        gen_q(tg, st, chat, sid, "has")
+    elif step == "has" and val == "0":
+        p["gen_kind"] = "none"
+        for k in ("gen_done", "gen_ans", "gen_inv", "gen_run", "gen_kw", "gen_from"):
+            p.pop(k, None)
+        gen_clear(p)
+        tg.send(chat, f"✅ <b>{title}</b>: записано — генератора немає. Бот його не шукає і не рахує. "
+                      f"Якщо з'явиться — кнопка «{BTN_GEN}».", KEYBOARD)
+        tg.staff_msg(f"⚙️ <b>{name}</b>: {who} указал — генератора нет.")
+    elif step == "has":
+        if p.get("gen_kind") == "none":
+            p.pop("gen_kind", None)
+        p.pop("gen_done", None)
+        p["gen_ans"] = []
+        gen_q(tg, st, chat, sid, "conn")
+    elif step == "conn" and val in GEN_CONN:
+        p["gen_kind"] = val
+        mark("conn")
+        gen_q(tg, st, chat, sid, "inv")
+    elif step == "conn":
+        tg.send(chat, f"Без цього бот не відрізнить генератор від світла з мережі. Уточніть у монтажника або техпідтримки"
+                      f" і натисніть «{BTN_GEN}», коли дізнаєтесь.{support(st)}", KEYBOARD)
+    elif step == "inv" and val in GEN_INV:
+        p["gen_inv"] = val
+        mark("inv")
+        gen_q(tg, st, chat, sid, "run")
+    elif step == "run" and val in GEN_RUN:
+        p["gen_run"] = val
+        mark("run")
+        gen_q(tg, st, chat, sid, "kw")
+    elif step in ("kw", "pr", "svc") and val == "w":
+        gen_ask_num(tg, st, chat, sid, "g" + step)
+    elif step == "kw" and num(val):
+        p["gen_kw"] = num(val)
+        mark("kw")
+        gen_q(tg, st, chat, sid, "pr", f"✅ Записано: {num(val):g} кВт.")
+    elif step == "pr" and (val == "d" or num(val)):
+        if val == "d":
+            p.pop("gen_price", None)
+        else:
+            p["gen_price"] = num(val)
+        mark("pr")
+        gen_q(tg, st, chat, sid, "svc", f"✅ Записано: {p.get('gen_price', GEN_PRICE):g} грн за кВт·год.")
+    elif step == "svc" and num(val):
+        p["gen_service"] = int(round(num(val)))
+        mark("svc")
+        miss = [k for k in GEN_STEPS if k not in ans]
+        if miss or p.get("gen_kind") not in GEN_CONN:
+            tg.send(chat, f"⚙️ <b>{title}</b>: відповіді є не на всі запитання, тому бот поки генератор не рахує. "
+                          "Натисніть «📝 Відповісти на запитання» і пройдіть їх ще раз.",
+                    {"inline_keyboard": [[{"text": "📝 Відповісти на запитання", "callback_data": f"gq:{sid}:go"}]]})
+            return
+        p["gen_done"] = True
+        p.pop("gen_ans", None)
+        if not p.get("gen_from"):  # учёт - с момента анкеты: всё, что бот «насчитал» догадками раньше, не считаем
+            p["gen_from"] = now().strftime("%Y-%m-%d")
+            for k in ("gen_day", "gen_starts"):
+                p.pop(k, None)
+            p["gen_hours"], p["gen_service_at"] = 0, 0
+        manual = p["gen_kind"] == "ats" and p.get("gen_run") == "m"
+        tg.send(chat, f"✅ Готово! <b>{title}</b>: генератор {gen_summary(p)}.\n"
+                      "Тепер бот повідомляє, коли генератор запустили і зупинили, рахує мотогодини, нагадує про ТО "
+                      "і враховує генератор в «Економії»."
+                      + ("\nКоли запускаєте генератор — натисніть «▶️ Запустив генератор» (у меню «⚙️ Генератор» або під повідомленням "
+                         "«світло вимкнули»): так бот точно не сплутає генератор зі світлом." if manual else ""), KEYBOARD)
+        tg.staff_msg(f"⚙️ <b>{name}</b>: {who} заполнил анкету генератора — {GEN_CONN_RU[p['gen_kind']]}, "
+                     f"{ {'1': 'инверторный', '0': 'обычный', 'x': 'тип неизвестен'}.get(p.get('gen_inv'))}, "
+                     f"{'автозапуск' if p.get('gen_run') == 'a' else 'запуск вручную'}, {p.get('gen_kw', 0):g} кВт, "
+                     f"{p.get('gen_price', GEN_PRICE):g} грн/кВт·ч, ТО каждые {p['gen_service']} ч. Учёт генератора включён.")
+    elif step == "svc0" and gen_ready(p):
+        p["gen_service_at"] = p.get("gen_hours", 0)
+        tg.send(chat, f"🔧 <b>{title}</b>: ТО генератора відмічено. Наступне — через {p.get('gen_service', 200)} мотогодин.", KEYBOARD)
+        tg.staff_msg(f"🔧 <b>{name}</b>: {who} отметил ТО генератора ({p.get('gen_hours', 0):.0f} моточасов всего).")
+    elif step == "on" and gen_ready(p):
+        if p.get("no_grid") or p.get("gen_on"):
+            gen_answer(tg, st, chat, sid, p, "gen", who)
+        else:
+            tg.send(chat, f"<b>{title}</b>: зараз бот бачить світло з мережі, відключення немає. "
+                          "Якщо світло вимкнуть і ви запустите генератор — натисніть кнопку ще раз.", KEYBOARD)
+    else:
+        gen_menu(tg, st, chat, sid)
+
+
+def gen_offer(tg, st, sid, p, title, chat, t):
+    """Анкеты нет, а на входе GEN инвертора есть мощность (2 проверки подряд) - это точно генератор.
+    Предлагаем заполнить анкету: не чаще раза в 7 дней, без учёта и без сообщений «запущено»."""
+    if gen_ready(p) or not chat:
+        p.pop("gen_port_n", None)
+        return
+    p["gen_port_n"] = p.get("gen_port_n", 0) + 1 if p.get("gen_port_seen") else 0
+    if p["gen_port_n"] < 2 or tg.quiet() or not once_days(p, "gen_offer", t, 7):
+        return
+    tg.clients(chat, f"⚙️ <b>{title}</b>: бачу, що на вході GEN інвертора працює генератор. "
+                     "Щоб бот показував його роботу, рахував мотогодини, нагадував про ТО і враховував витрати в «Економії», "
+                     "дайте відповіді на кілька запитань (1 хвилина).",
+               markup={"inline_keyboard": [[{"text": "📝 Відповісти на запитання", "callback_data": f"gq:{sid}:go"}]]})
+    tg.staff_msg(f"⚙️ <b>{esc(p.get('name'))}</b>: на входе GEN инвертора работает генератор, а анкета генератора не заполнена — "
+                 f"клиенту предложено заполнить. Заполнить здесь: <code>/gen {esc(p.get('name'))} анкета</code>.")
 
 
 def pv_daily(api, tg, st, t):
@@ -2345,7 +2572,7 @@ def write_snapshot(st, dtek, api=None):
     for chat in sorted({str(c) for p in st["stations"].values() for c in p.get("clients") or []}):
         kb = kb_for(st, chat)
         texts = [b["text"] for row in kb["keyboard"] for b in row] + ["/status", "/grafik", "/help", "/cherga",
-                                                                      "/nalashtuvannia", "/ekonomiya", "/vyrobitok", "/grafiky"]
+                                                                      "/nalashtuvannia", "/ekonomiya", "/vyrobitok", "/grafiky", "/generator"]
         t_ans, cb_ans, queue = {}, {}, []
         for x in dict.fromkeys(texts):
             r = rehearse(st, chat, staff, dtek, x)
@@ -2355,8 +2582,8 @@ def write_snapshot(st, dtek, api=None):
         seen = set()
         while queue and len(seen) < 120:  # кнопки внутри ответов, на 2 уровня вглубь
             d = queue.pop(0)
-            if not d or d in seen or d == "cq:?":
-                continue
+            if not d or d in seen or d == "cq:?" or (d.startswith("gq:") and (":svc:" in d or d.endswith(":on"))):
+                continue  # итог анкеты генератора и «Запустив» зависят от памяти - их отвечает только бот
             seen.add(d)
             r = rehearse(st, chat, staff, dtek, "cb:" + d)
             if r:
@@ -2394,7 +2621,7 @@ def write_snapshot(st, dtek, api=None):
                 queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
         while queue and len(seen) < 200:
             d = queue.pop(0)
-            if not d or d in seen or d.startswith(("r:", "x:")):  # сброс клиентов - только по-настоящему
+            if not d or d in seen or d.startswith(("r:", "x:")) or (d.startswith("gq:") and (":svc:" in d or d.endswith(":on"))):  # сброс клиентов - только по-настоящему
                 continue
             seen.add(d)
             r = rehearse(st, staff, staff, dtek, "cb:" + d)
@@ -2496,6 +2723,10 @@ def handle_update(tg, st, u, dtek=None, api=None):
             kind, _, sid = url[len(PRICE_URL):].partition(":")
             if sid in st["stations"] and chat in (st["stations"][sid].get("clients") or []) and kind in ("tariff", "gen"):
                 st.setdefault("await", {})[chat] = {"kind": kind, "sid": sid, "at": now().isoformat()}
+        if url.startswith(GENQ_URL):  # ответ на вопрос анкеты генератора
+            kind, _, sid = url[len(GENQ_URL):].partition(":")
+            if sid in st["stations"] and chat in (st["stations"][sid].get("clients") or []) and kind in GEN_ASK_NUM:
+                st.setdefault("await", {})[chat] = {"kind": kind, "sid": sid, "at": now().isoformat()}
     handle_message(tg, st, chat, text, who, dtek, api)
 
 
@@ -2504,7 +2735,7 @@ def handle_message(tg, st, chat, text, who, dtek=None, api=None):
     cmd, arg = cmd.split("@")[0].lower(), arg.strip()
     if True:
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_SCHED_OFF: "/grafiky", BTN_SCHED_ON: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_SCHED_OFF: "/grafiky", BTN_SCHED_ON: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia", BTN_GEN: "/generator"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         if chat == str(tg.staff):
             staff_command(tg, st, cmd, arg)
@@ -2548,6 +2779,15 @@ def handle_message(tg, st, chat, text, who, dtek=None, api=None):
             sched_toggle(tg, st, chat)
         elif cmd == "/ekonomiya" and is_client:
             save_start(tg, st, chat)
+        elif cmd == "/generator" and is_client:
+            objs = my_objects(st, chat)
+            if len(objs) == 1:
+                gen_menu(tg, st, chat, objs[0][0])
+            else:
+                tg.send(chat, "Генератор якого об'єкта?", {"inline_keyboard": [[
+                    {"text": str(p.get("title") or p.get("name"))[:40], "callback_data": f"gm:{k}"}] for k, p in objs]})
+        elif not text.startswith("/") and is_client and gen_input(tg, st, chat, text, who):
+            pass  # клиент прислал число для анкеты генератора
         elif not text.startswith("/") and is_client and save_input(tg, st, chat, text):
             pass  # клиент прислал цену за кВт·ч
         elif cmd == "/vyrobitok" and is_client:
@@ -2653,9 +2893,9 @@ def staff_command(tg, st, cmd, arg):
             return
         p = S[sid]
         cap, src = capacity(st, sid, p)
-        gk = {"none": "нет", "ats": "через АВР", "port": "на входе GEN"}.get(p.get("gen_kind"), "определяю сам")
+        gk = gen_label_ru(p)
         card_kb = {"inline_keyboard": [[{"text": "🔗 Ссылка для клиента", "callback_data": f"L:{sid}"}, {"text": "🔁 Очередь", "callback_data": f"Q:{sid}"}],
-                                       [{"text": f"⚙️ Генератор: {gk}", "callback_data": f"G:{sid}"},
+                                       [{"text": "⚙️ Генератор: " + ("есть" if gen_ready(p) else "нет" if p.get("gen_kind") == "none" else "анкета"), "callback_data": f"G:{sid}"},
                                         {"text": "🔌 Линии: " + ("2, разные очереди" if p.get("queue2") else "2, одна очередь" if p.get("lines_same") else "1"), "callback_data": f"W:{sid}"}],
                                        [{"text": "📋 Меню", "callback_data": "M:"}]]}
         tg.send(tg.staff, f"<b>{esc(p.get('name'))}</b>" + (f" → «{esc(p['title'])}»" if p.get("title") else "") +
@@ -2671,26 +2911,35 @@ def staff_command(tg, st, cmd, arg):
                         + "; ".join(f"{k[8:]}.{k[5:7]} — {v['kwh']:.0f} кВт·ч (ночью {v['night']:.0f})" for k, v in sorted(p['mi_day'].items())[-3:])
                         if p.get("mi_day") else ""), card_kb)
     elif cmd == "/gen":
-        m = re.match(r"(.+?)\s+(то|сброс|интервал\s+\d+|нет|авр|порт|gen|auto|авто)\s*$", arg, re.I)
+        m = re.match(r"(.+?)\s+(то|сброс|интервал\s+\d+|нет|авр|порт|gen|auto|авто|анкета)\s*$", arg, re.I)
         sid, err = find_station(st, m.group(1) if m else arg)
         if err:
             tg.staff_msg(err if arg else "Пример: /gen ПБС — моточасы генератора. /gen ПБС то — отметить ТО. /gen ПБС интервал 250 — интервал ТО, ч.")
             return
         p = S[sid]
+        if m and m.group(2).lower() == "анкета":
+            gen_menu(tg, st, tg.staff, sid)
+            return
         if m and m.group(2).lower() in ("то", "сброс"):
             p["gen_service_at"] = p.get("gen_hours", 0)
         elif m and m.group(2).lower() in ("нет", "авр", "порт", "gen", "auto", "авто"):
             kind = {"нет": "none", "авр": "ats", "порт": "port", "gen": "port"}.get(m.group(2).lower())
+            if kind == "none":
+                p["gen_kind"] = "none"
+                for k in ("gen_done", "gen_ans", "gen_inv", "gen_run", "gen_kw", "gen_from"):
+                    p.pop(k, None)
+                gen_clear(p)
+                tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: генератора нет — не отслеживаю и не считаю.")
+                return
             if kind:
                 p["gen_kind"] = kind
-                if kind == "none":
-                    gen_clear(p)
-            else:
+            elif not gen_ready(p):
                 p.pop("gen_kind", None)
-            tg.staff_msg(f"✅ <b>{esc(p.get('name'))}</b>: " + {"none": "генератора нет — по косвенным признакам генератор не ищу.",
-                                                                 "ats": "генератор через АВР — определяю его увереннее.",
-                                                                 "port": "генератор на порту GEN инвертора — вижу его, только если инвертор передаёт в Deye данные порта GEN (6 кВт передают, 50 кВт — нет). Косвенно не угадываю.",
-                                                                 None: "определяю генератор автоматически."}[kind])
+            tg.send(tg.staff, f"✅ <b>{esc(p.get('name'))}</b>: " + (
+                f"генератор {GEN_CONN_RU[kind]}. " if kind else "") + (
+                "Анкета заполнена — генератор отслеживается." if gen_ready(p) else
+                "Генератор отслеживается и считается только после анкеты: клиент — кнопка «⚙️ Генератор» в боте, или здесь — кнопка ниже."),
+                None if gen_ready(p) else {"inline_keyboard": [[{"text": "📝 Анкета генератора", "callback_data": f"G:{sid}"}]]})
             return
         elif m:
             p["gen_service"] = int(re.findall(r"\d+", m.group(2))[0])
@@ -2698,7 +2947,7 @@ def staff_command(tg, st, cmd, arg):
         tg.staff_msg(f"⚙️ <b>{esc(p.get('name'))}</b>: " + (
             f"генератор {'работает с ' + since_hm(datetime.fromisoformat(p['gen_since'])) if p.get('gen_on') else 'сейчас не работает'}.\n"
             f"Моточасов всего (с начала наблюдения): {h:.1f} · после ТО: {h - done:.1f} из {svc}."
-            if p.get("has_gen") else "генератор на этом объекте бот ещё ни разу не видел."))
+            if gen_ready(p) else f"генератор не отслеживаю: {gen_label_ru(p)}. Анкета: <code>/gen {esc(p.get('name'))} анкета</code>."))
     elif cmd == "/health":
         tg.staff_msg(health(st))
     elif cmd == "/id":  # айди этой группы - нужен для TELEGRAM_CHAT_ID в Vercel
@@ -2930,9 +3179,12 @@ def gen_detect(dev, grid_on, dtek, q, t, st=None, sid=None, p=None, dkw=None):
     gp, gv, gf = dev_val(dev, GEN_P), dev_val(dev, GEN_V), dev_val(dev, GEN_F)
     if p is not None:
         p["gen_by_est"] = False
-        if p.get("gen_kind") == "none":  # сотрудник или клиент сказал «генератора нет» - не определяем его вообще
-            p.pop("gen_sc", None)
-            p.pop("gen_strong", None)
+        if not gen_ready(p):
+            # анкеты нет (или «генератора нет») - генератор не определяем и не считаем. Только отмечаем мощность на входе GEN:
+            # по ней бот предложит клиенту заполнить анкету (gen_offer).
+            p["gen_port_seen"] = bool((gp is not None and gp > 150) or (gv and gv > 150 and gf and 45 < gf < 55))
+            for k in ("gen_sc", "gen_strong", "gen_on", "gen_since", "gen_how", "gen_flip", "gen_bad", "gen_drain", "gen_force", "gen_t"):
+                p.pop(k, None)
             return False, "", num((dev or {}).get("GridFrequency")), None
     if gp is None and p is not None and p.get("gen_kind") == "port" and p.get("mi_gen") is not None:
         gp = p["mi_gen"]  # 50 кВт Deye: генератор = порт GEN сверх обычной солнечной доли
@@ -3030,7 +3282,7 @@ GA_KB = lambda sid: {"inline_keyboard": [[{"text": "💡 Дали світло",
 def gen_ask(tg, st, sid, p, title, chat, t):
     """«Світло» повернулося, але є ознаки генератора (1-2 бали) і хоча б одна сильна (сусід без світла, одна фаза, АВР) - питаємо клієнта, а повідомлення «світло увімкнули»
     притримуємо до відповіді (не довше 20 хв). Не більше 2 разів за одне відключення."""
-    if p.get("gen_kind") in ("none", "port") or not p.get("off_since") or p.get("gen_sc", 0) < 1:
+    if not gen_ready(p) or p.get("gen_kind") != "ats" or not p.get("off_since") or p.get("gen_sc", 0) < 1:
         return
     if not p.get("gen_strong"):
         return  # только график/«ровные» 50 Гц - это обычно сеть (свет часто дают раньше графика), клиента не дёргаем
@@ -3078,8 +3330,10 @@ def gen_answer(tg, st, chat, sid, p, ans, who):
         tg.send(chat, f"💡 Дякую! <b>{title}</b>: світло від мережі.", KEYBOARD)
     elif ans == "none":
         p["ga_ans"], p["gen_kind"] = "grid", "none"
+        for k in ("gen_done", "gen_ans", "gen_inv", "gen_run", "gen_kw", "gen_from"):
+            p.pop(k, None)
         gen_clear(p)
-        tg.send(chat, f"Зрозумів: на <b>{title}</b> генератора немає, більше не питатиму. Змінити — «{BTN_SET}» → «Генератор».", KEYBOARD)
+        tg.send(chat, f"Зрозумів: на <b>{title}</b> генератора немає, більше не питатиму. Змінити — кнопка «{BTN_GEN}».", KEYBOARD)
         tg.staff_msg(f"⚙️ <b>{name}</b>: клиент {who} сообщил — генератора нет.")
 
 
@@ -3117,7 +3371,10 @@ def est_trial(p, t):
 
 
 def gen_track(tg, st, sid, p, title, chat, t, on, how, f, v, soc, dkw, no_grid):
-    """Генератор: события клиенту, моточасы, проблемы сотрудникам. Включение/выключение - после 2 проверок подряд."""
+    """Генератор: события клиенту, моточасы, проблемы сотрудникам. Включение/выключение - после 2 проверок подряд.
+    Только для объектов с заполненной анкетой."""
+    if not gen_ready(p):
+        return
     name = esc(p.get("name"))
     if (p.get("has_gen") and p.get("gen_how_last") == "suspect" and p.get("gen_kind") != "ats" and p.get("ga_ans") != "gen"
             and not p.get("gen_fix1")):
@@ -3836,8 +4093,9 @@ def check(api, tg, st, dtek):
             if (g_on and g_how != "port") or (p.get("gen_on") and p.get("gen_how") != "port" and no_grid is False and not g_on and p.get("gen_flip") is None):
                 no_grid, how = True, "generator"  # пока генератор на входе сети, отключение продолжается
             gen_track(tg, st, sid, p, title, chat, t, g_on, g_how, g_f, g_v, soc, dkw, no_grid is True or bool(p.get("no_grid")))
+            gen_offer(tg, st, sid, p, title, chat, t)
             # Учёт генератора: сколько кВт·ч дал (мощность входа GEN или сети при АВР) и сколько из них ушло в заряд АКБ.
-            if p.get("gen_on") and (p.get("gen_how") != "suspect" or p.get("has_gen") or p.get("ga_ans") == "gen"):
+            if gen_ready(p) and p.get("gen_on"):
                 p["gen_how_last"] = p.get("gen_how")
                 prev_t, p["gen_t"] = p.get("gen_t"), t.isoformat()
                 gdt = (t - datetime.fromisoformat(prev_t)).total_seconds() / 3600 if prev_t else 0
@@ -3882,7 +4140,9 @@ def check(api, tg, st, dtek):
                     until = planned_end(dtek, q, t) if plan is True else None
                     p["off_until"] = until.isoformat() if until else None
                     fore = forecast_line(st, sid, soc, t, until, p, dkw)
-                    tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{fore}\nОб'єкт працює від станції.", urgent=True)
+                    gkb = ({"inline_keyboard": [[{"text": "▶️ Запустив генератор", "callback_data": f"gq:{sid}:on"}]]}
+                           if gen_ready(p) and p.get("gen_kind") == "ats" and p.get("gen_run") == "m" else None)
+                    tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{fore}\nОб'єкт працює від станції.", urgent=True, markup=gkb)
             elif no_grid is False:
                 p["off_n"] = 0
                 if p.get("no_grid"):
