@@ -32,7 +32,7 @@ async function snapshot(key) {
   return snap.age < 600 ? snap : null; // older than 10 minutes - not trusted
 }
 
-// «На скільки вистачить заряду»: клиент ждёт данные на этот момент - снимок не старше 4 минут, иначе бот спросит Deye сам
+// «На скільки вистачить заряду»: клиент ждёт данные на этот момент - снимок не старше 7 минут, иначе бот спросит Deye сам
 const LEFT_KEYS = new Set(["⏳ На скільки вистачить заряду", "/zaryad"]);
 function needsFresh(cq, look) { return cq ? /^o:[^:]+:left$/.test(look) : LEFT_KEYS.has(look); }
 
@@ -59,7 +59,7 @@ async function fast(key, upd) {
   try { snap = await snapshot(key); } catch (e) { return null; }
   const c = snap && snap.chats && snap.chats[chat];
   if (!c) return null;
-  if (needsFresh(cq, look) && snap.age > 240) return null;
+  if (needsFresh(cq, look) && snap.age > 420) return null;
   const sv = saveFast(snap, c, chat, cq, msg);
   if (sv) return sv;
   const ans = ((cq ? c.cb : c.t) || {})[look];
@@ -70,7 +70,7 @@ async function fast(key, upd) {
 }
 
 // ---- экономия: шаблон «в общем виде» из снимка + цены из кнопки или из ответа клиента
-const VERSION = "2026-11-27a";
+const VERSION = "2026-11-27b";
 const PRICE_URL = "https://solaris.org.ua/#price:";
 
 function grn(v) {

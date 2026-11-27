@@ -2559,7 +2559,7 @@ class SimTG:
         return False
 
 
-def rehearse(st, chat, staff, dtek, inp):
+def rehearse(st, chat, staff, dtek, inp, base=None):
     """Прогнать нажатие на копии памяти: что бот ответит и поменяет ли что-то. None - заранее не готовим."""
     import copy
     sim = copy.deepcopy({k: v for k, v in st.items() if k != "hcache"})
@@ -2578,7 +2578,7 @@ def rehearse(st, chat, staff, dtek, inp):
     if not stg.out or any("не віддав" in t or "не відповідає" in t for t, _ in stg.out):
         return None
     drop = ("hcache", "await")
-    a = json.dumps({k: v for k, v in st.items() if k not in drop}, sort_keys=True, default=str)
+    a = base if base is not None else json.dumps({k: v for k, v in st.items() if k not in drop}, sort_keys=True, default=str)
     b_ = json.dumps({k: v for k, v in sim.items() if k not in drop}, sort_keys=True, default=str)
     changed = a != b_ or (sim.get("await") or {}).get(str(chat)) != (st.get("await") or {}).get(str(chat))
     return {"m": stg.out, "ch": changed, "h": hashlib.sha1(stg.out[0][0].encode()).hexdigest()[:12]}
@@ -2617,27 +2617,31 @@ def write_snapshot(st, dtek, api=None):
         safe(Telegram(), st, "кэш истории", warm_cache, api, st, now())
     staff = env("TELEGRAM_CHAT_ID")
     chats = {}
+    deadline = time.time() + 120  # на всё не больше 2 минут: следующий запуск через 2 минуты
+    base = json.dumps({k: v for k, v in st.items() if k not in ("hcache", "await")}, sort_keys=True, default=str)
     for chat in sorted({str(c) for p in st["stations"].values() for c in p.get("clients") or []}):
         kb = kb_for(st, chat)
         texts = [b["text"] for row in kb["keyboard"] for b in row] + ["/status", "/grafik", "/help", "/info", "/cherga",
                                                                       "/nalashtuvannia", "/ekonomiya", "/vyrobitok", "/grafiky", "/generator", "/zaryad"]
         t_ans, cb_ans, queue = {}, {}, []
         for x in dict.fromkeys(texts):
-            r = rehearse(st, chat, staff, dtek, x)
+            r = rehearse(st, chat, staff, dtek, x, base)
             if r:
                 t_ans[x] = r
                 queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
         seen = set()
-        while queue and len(seen) < 120:  # кнопки внутри ответов, на 2 уровня вглубь
-            d = queue.pop(0)
+        cap = 150 + 120 * len(my_objects(st, chat))  # чем больше объектов, тем больше кнопок
+        queue = [(d, 1) for d in queue]
+        while queue and len(seen) < cap and time.time() < deadline:  # кнопки внутри ответов, до 7 уровней вглубь (анкета генератора)
+            d, lvl = queue.pop(0)
             if not d or d in seen or d == "cq:?" or (d.startswith("gq:") and (":svc:" in d or d.endswith(":on"))):
                 continue  # итог анкеты генератора и «Запустив» зависят от памяти - их отвечает только бот
             seen.add(d)
-            r = rehearse(st, chat, staff, dtek, "cb:" + d)
+            r = rehearse(st, chat, staff, dtek, "cb:" + d, base)
             if r:
                 cb_ans[d] = r
-                if len(seen) < 60:
-                    queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
+                if lvl < 7:
+                    queue += [(b.get("callback_data"), lvl + 1) for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
         chats[chat] = {"kb": kb, "t": t_ans, "cb": cb_ans}
     save = {}  # экономия «в общем виде» - Vercel подставляет цены сам
     sapi = SimAPI(st)
@@ -2667,16 +2671,17 @@ def write_snapshot(st, dtek, api=None):
             if r:
                 t_ans[x] = r
                 queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
-        while queue and len(seen) < 200:
-            d = queue.pop(0)
+        queue = [(d, 1) for d in queue]
+        while queue and len(seen) < 300 + 40 * len(st["stations"]) and time.time() < deadline:
+            d, lvl = queue.pop(0)
             if not d or d in seen or d.startswith(("r:", "x:")) or (d.startswith("gq:") and (":svc:" in d or d.endswith(":on"))):  # сброс клиентов - только по-настоящему
                 continue
             seen.add(d)
-            r = rehearse(st, staff, staff, dtek, "cb:" + d)
+            r = rehearse(st, staff, staff, dtek, "cb:" + d, base)
             if r:
                 cb_ans[d] = r
-                if len(seen) < 120:
-                    queue += [b.get("callback_data") for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
+                if lvl < 3:
+                    queue += [(b.get("callback_data"), lvl + 1) for _, mk in r["m"] for row in ((mk or {}).get("inline_keyboard") or []) for b in row]
         chats[str(staff)] = {"kb": None, "t": t_ans, "cb": cb_ans}
     data = json.dumps({"at": int(time.time()), "v": 2, "clear": list(CLEAR_KINDS), "chats": chats, "save": save,
                        "saved_txt": f"Змінити можна будь-коли кнопкою «{BTN_SAVE}». За який період порахувати?"}, ensure_ascii=False).encode("utf-8")
