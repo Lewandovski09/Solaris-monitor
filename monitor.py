@@ -1029,7 +1029,8 @@ CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд
                    ("cherga", "Змінити чергу ДТЕК"),
                    ("nalashtuvannia", "Налаштування: графіки ДТЕК і зведення виробітку"),
                    ("generator", "Генератор: облік роботи, мотогодини, ТО, витрати"),
-                   ("help", "Що вміє бот і як змінити чергу"),
+                   ("help", "Поставити питання технічному менеджеру"),
+                   ("info", "Що вміє бот: усі кнопки"),
                    ("stop", "Вимкнути сповіщення")]
 STAFF_COMMANDS = [("menu", "Кнопки: станции, ссылки, состояние"),
                   ("link", "Ссылка для клиента: /link пбс"),
@@ -1191,7 +1192,7 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         elif act == "menu":
             tg.send(chat, *obj_menu(st, chat, c_sid))
         elif act == "help":
-            tg.send(chat, client_help(st, chat), KEYBOARD)
+            tg.send(chat, help_prompt(), KEYBOARD)
         return
     if kind == "ga":  # клиент ответил: свет от сети или генератор
         c_sid, _, ans = rest.partition(":")
@@ -1380,6 +1381,13 @@ def support(st):
     return f"\nТехнічна підтримка Solaris: {esc(c)}" if c else ""
 
 
+def help_prompt():
+    """Кнопка «Допомога»: клиент просто пишет вопрос, технический менеджер ответит через бот."""
+    return ("✍️ <b>Напишіть своє питання</b> одним повідомленням сюди, у чат. Можна додати фото або голосове.\n\n"
+            "Технічний менеджер Solaris відповість тут же, щойно звільниться.\n\n"
+            "Що вміє бот і які є кнопки — /info")
+
+
 def client_help(st, chat=None):
     c = st.get("contact")
     return ("ℹ️ <b>Бот Solaris стежить за вашою станцією і сам пише, коли щось змінюється:</b>\n"
@@ -1402,9 +1410,9 @@ def client_help(st, chat=None):
                if chat is None or has_pv_chat(st, chat) else "") +
             f"{BTN_SAVE} — економія (панелі, інвертор з АКБ під час відключень) і витрати (заряд АКБ з мережі, генератор), і підсумок.\n" +
             f"{BTN_GEN} — облік генератора: дайте відповіді на кілька запитань, і бот рахуватиме його роботу, мотогодини, ТО і витрати.\n" +
-            f"{BTN_HELP} — ця підказка.\n\n"
-            "✍️ <b>Є питання?</b> Просто напишіть його сюди, у чат (можна з фото або голосовим). "
-            "Команда Solaris відповість тут же.\n\n"
+            f"{BTN_HELP} — поставити питання технічному менеджеру: просто напишіть його сюди, у чат "
+            "(можна з фото або голосовим), і менеджер відповість тут же, щойно звільниться.\n"
+            "Ця підказка — /info\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
 
@@ -2011,7 +2019,7 @@ def kb_sync(tg, st, t):
                 (f"\n{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ (робота без світла), і разом.") + \
                 (f"\n{BTN_GEN} — якщо на об'єкті є генератор: дайте відповіді на кілька запитань, і бот рахуватиме його роботу, мотогодини, ТО і витрати.")
             extra = f"\n{BTN_LEFT} — до котрої години протримається станція за вашого споживання саме зараз." + extra + \
-                "\n\n✍️ Є питання? Просто напишіть його сюди, у чат — команда Solaris відповість тут же."
+                f"\n{BTN_HELP} — тепер це питання технічному менеджеру: просто напишіть його сюди, у чат, і він відповість тут же."
             tg.send(chat, f"🔄 Бот оновився — нові кнопки внизу екрана:\n{BTN_SET} — що надсилати: графіки ДТЕК"
                           + (", зведення виробітку щодня / щотижня / щомісяця" if has_pv_chat(st, chat) else "") + f".{extra}", kb)
         sent[chat] = h
@@ -2611,7 +2619,7 @@ def write_snapshot(st, dtek, api=None):
     chats = {}
     for chat in sorted({str(c) for p in st["stations"].values() for c in p.get("clients") or []}):
         kb = kb_for(st, chat)
-        texts = [b["text"] for row in kb["keyboard"] for b in row] + ["/status", "/grafik", "/help", "/cherga",
+        texts = [b["text"] for row in kb["keyboard"] for b in row] + ["/status", "/grafik", "/help", "/info", "/cherga",
                                                                       "/nalashtuvannia", "/ekonomiya", "/vyrobitok", "/grafiky", "/generator", "/zaryad"]
         t_ans, cb_ans, queue = {}, {}, []
         for x in dict.fromkeys(texts):
@@ -2813,9 +2821,9 @@ def handle_message(tg, st, chat, text, who, dtek=None, api=None, msg=None):
                 tg.staff_msg(f"👤 {who} подключился к <b>{title}</b>. Очередь ДТЭК {p['queue'].replace('GPV', '')}.")
             else:  # ждём, пока пришлёт очередь, и напишем одним сообщением
                 p.setdefault("joins", {})[chat] = {"who": who, "at": now().isoformat()}
-        elif cmd in ("/status", "/grafik", "/help") and is_client:
+        elif cmd in ("/status", "/grafik", "/help", "/info") and is_client:
             tg.send(chat, {"/status": lambda: client_status(st, chat, api), "/grafik": lambda: client_schedule(st, chat, dtek),
-                           "/help": lambda: client_help(st, chat)}[cmd](), KEYBOARD)
+                           "/help": help_prompt, "/info": lambda: client_help(st, chat)}[cmd](), KEYBOARD)
         elif cmd == "/zaryad" and is_client:
             tg.send(chat, client_runtime(st, chat, api), KEYBOARD)
         elif cmd == "/cherga" and is_client:
@@ -2904,7 +2912,7 @@ def ask_forward(tg, st, chat, m, text, who):
     acks = st.setdefault("ask_ack", {})
     last = acks.get(chat)
     if not last or (now() - datetime.fromisoformat(last)).total_seconds() > 600:  # подтверждаем не чаще раза в 10 минут
-        tg.send(chat, "✅ Питання передано команді Solaris. Відповідь прийде сюди, у цей чат.", KEYBOARD)
+        tg.send(chat, "✅ Питання передано технічному менеджеру. Він відповість тут, у цьому чаті, щойно звільниться.", KEYBOARD)
         acks[chat] = now().isoformat()
 
 
@@ -2918,13 +2926,13 @@ def staff_answer(tg, st, m):
     rp = {"message_id": a["mid"], "allow_sending_without_reply": True} if a.get("mid") else None
     text = (m.get("text") or "").strip()
     if text:
-        body = {"chat_id": client, "text": f"💬 <b>Відповідь Solaris</b>\n\n{esc(text)}"[:4000], "parse_mode": "HTML",
+        body = {"chat_id": client, "text": f"💬 <b>Відповідь технічного менеджера Solaris</b>\n\n{esc(text)}"[:4000], "parse_mode": "HTML",
                 "disable_web_page_preview": True}
         if rp:
             body["reply_parameters"] = rp
         ok = (tg.call("sendMessage", **body) or {}).get("ok")
     else:
-        tg.send(client, "💬 <b>Відповідь Solaris</b>")
+        tg.send(client, "💬 <b>Відповідь технічного менеджера Solaris</b>")
         body = {"chat_id": client, "from_chat_id": tg.staff, "message_id": m.get("message_id")}
         if rp:
             body["reply_parameters"] = rp
