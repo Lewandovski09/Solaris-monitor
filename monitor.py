@@ -1021,7 +1021,7 @@ def kb_for(st, chat):
 
 
 # нажатия, после которых у старого сообщения убираем кнопки
-CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr", "zk", "ga", "gq")
+CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr", "zk", "zx", "zy", "zn", "ga", "gq")
 
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
                    ("zaryad", "До котрої години вистачить заряду АКБ"),
@@ -1210,6 +1210,34 @@ def callback(tg, st, chat, data, who, dtek, api=None):
         else:
             gen_set(tg, st, chat, c_sid, act, who)
         return
+    if kind in ("zx", "zy", "zn"):  # клиент отключает один объект: спросить -> отключить / передумал
+        c_sid = rest.split(":")[0]
+        p = st["stations"].get(c_sid)
+        if not p or chat not in (p.get("clients") or []):
+            return
+        title = esc(p.get("title") or p.get("name"))
+        if kind == "zx":
+            tg.send(chat, f"Відключити <b>{title}</b>? Повідомлення про світло, графіки й звіти по цьому об'єкту більше не надходитимуть."
+                          + (" Інші ваші об'єкти залишаться." if len(my_objects(st, chat)) > 1 else "")
+                          + "\nПідключитися знову можна буде лише за посиланням від менеджера.",
+                    {"inline_keyboard": [[{"text": "🚫 Так, відключити", "callback_data": f"zy:{c_sid}"},
+                                          {"text": "↩️ Ні, залишити", "callback_data": f"zn:{c_sid}"}]]})
+        elif kind == "zn":
+            settings_menu(tg, st, chat, c_sid)
+        else:
+            p["clients"].remove(chat)
+            for k in ("names", "joins", "pvrep"):
+                (p.get(k) or {}).pop(chat, None)
+            if chat in (p.get("nosched") or []):
+                p["nosched"].remove(chat)
+            left = my_objects(st, chat)
+            if left:
+                tg.send(chat, f"✅ <b>{title}</b> відключено. Інші об'єкти: " + ", ".join(esc(q.get("title") or q.get("name")) for _, q in left) + ".", KEYBOARD)
+            else:
+                tg.send(chat, f"✅ <b>{title}</b> відключено. Інших об'єктів у вас немає, тож сповіщення більше не надходитимуть. "
+                              "Щоб підключитися знову, відкрийте посилання від менеджера.", {"remove_keyboard": True})
+            tg.staff_msg(f"👤 {who} отключился от <b>{title}</b> (сам, в настройках)." + ("" if p["clients"] else " Клиентов у станции больше нет."))
+        return
     if kind in ("zs", "zg", "zr", "zk"):  # настройки клиента
         c_sid, _, arg = rest.partition(":")
         if chat not in (st["stations"].get(c_sid, {}).get("clients") or []):
@@ -1368,7 +1396,8 @@ def client_help(st, chat=None):
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
             f"{BTN_SCHED_OFF} / {BTN_SCHED_ON} — одним натиском вимкнути або увімкнути графіки ДТЕК і нагадування.\n"
-            f"{BTN_SET} — що надсилати: графіки ДТЕК, зведення виробітку панелей (щодня, щотижня, щомісяця), окремо по кожному об'єкту.\n"
+            f"{BTN_SET} — що надсилати: графіки ДТЕК, зведення виробітку панелей (щодня, щотижня, щомісяця), окремо по кожному об'єкту. "
+            "Там же можна відключити від бота окремий об'єкт.\n"
             + (f"{BTN_PV} — скільки виробили сонячні панелі: сьогодні, вчора, за тиждень і місяць. Раз на тиждень бот надсилає підсумок сам.\n"
                if chat is None or has_pv_chat(st, chat) else "") +
             f"{BTN_SAVE} — економія (панелі, інвертор з АКБ під час відключень) і витрати (заряд АКБ з мережі, генератор), і підсумок.\n" +
@@ -2024,6 +2053,7 @@ def settings_menu(tg, st, chat, sid):
     rows.append([{"text": f"⚙️ Генератор: {gen_label(p)}", "callback_data": f"gm:{sid}"}])
     nl = ("2, черги " + " і ".join(q.replace("GPV", "") for q in queues(p))) if p.get("queue2") else "2, одна черга" if p.get("lines_same") else "1"
     rows.append([{"text": f"🔌 Лінії (вводи) від ДТЕК: {nl}", "callback_data": f"c2:{sid}"}])
+    rows.append([{"text": "🚫 Відключити цей об'єкт від бота", "callback_data": f"zx:{sid}"}])
     tg.send(chat, txt, {"inline_keyboard": rows})
 
 
