@@ -28,8 +28,13 @@ async function snapshot(key) {
   const [iv, body] = (await r.text()).split("\n");
   const d = crypto.createDecipheriv("aes-256-cbc", crypto.createHash("sha256").update(key).digest(), Buffer.from(iv.trim(), "hex"));
   const snap = JSON.parse(Buffer.concat([d.update(Buffer.from(body.trim(), "base64")), d.final()]).toString("utf8"));
-  return Date.now() / 1000 - snap.at < 600 ? snap : null; // older than 10 minutes - not trusted
+  snap.age = Date.now() / 1000 - snap.at;
+  return snap.age < 600 ? snap : null; // older than 10 minutes - not trusted
 }
+
+// «На скільки вистачить заряду»: клиент ждёт данные на этот момент - снимок не старше 4 минут, иначе бот спросит Deye сам
+const LEFT_KEYS = new Set(["⏳ На скільки вистачить заряду", "/zaryad"]);
+function needsFresh(cq, look) { return cq ? /^o:[^:]+:left$/.test(look) : LEFT_KEYS.has(look); }
 
 async function tgCall(method, body) {
   return fetch("https://api.telegram.org/bot" + process.env.TELEGRAM_TOKEN + "/" + method, {
@@ -54,6 +59,7 @@ async function fast(key, upd) {
   try { snap = await snapshot(key); } catch (e) { return null; }
   const c = snap && snap.chats && snap.chats[chat];
   if (!c) return null;
+  if (needsFresh(cq, look) && snap.age > 240) return null;
   const sv = saveFast(snap, c, chat, cq, msg);
   if (sv) return sv;
   const ans = ((cq ? c.cb : c.t) || {})[look];
@@ -64,7 +70,7 @@ async function fast(key, upd) {
 }
 
 // ---- экономия: шаблон «в общем виде» из снимка + цены из кнопки или из ответа клиента
-const VERSION = "2026-11-25b";
+const VERSION = "2026-11-27a";
 const PRICE_URL = "https://solaris.org.ua/#price:";
 
 function grn(v) {
@@ -159,10 +165,15 @@ module.exports = async (req, res) => {
   const msg = upd.message || {};
   const text = (msg.text || "").trim();
   const isPrivate = (msg.chat || {}).type === "private";
-  // groups: commands only; private chats: also short plain replies; button presses: always
+  const staffChat = String(process.env.TELEGRAM_CHAT_ID || "");
+  const rep = msg.reply_to_message || {};
+  // ответ сотрудника (свайпом) на сообщение бота в группе - может быть ответом на вопрос клиента
+  const staffReply = !!staffChat && String((msg.chat || {}).id) === staffChat && !!(rep.from && rep.from.is_bot);
+  const media = ["photo", "document", "video", "voice", "audio", "video_note", "sticker", "animation"].some(k => msg[k]);
+  // кнопки - всегда; команды - везде; личка клиента - любой текст или вложение (вопросы); группа - ответы на сообщения бота
   if (!upd.update_id) return res.status(200).send("skip");
-  if (!cq && (!text || text.length > 300 || (!text.startsWith("/") && !isPrivate)))
-    return res.status(200).send("skip");
+  const ok = cq || (text.startsWith("/") && text.length <= 300) || ((isPrivate || staffReply) && (text || media) && text.length <= 4000);
+  if (!ok) return res.status(200).send("skip");
 
   const quick = await fast(key, upd);
   if (quick && process.env.TELEGRAM_TOKEN) {

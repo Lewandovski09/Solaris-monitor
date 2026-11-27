@@ -966,6 +966,7 @@ BTN_SET = "⚙️ Налаштування"
 BTN_SCHED_OFF, BTN_SCHED_ON = "🔕 Вимкнути графіки", "🔔 Увімкнути графіки"
 BTN_SAVE = "💰 Економія"
 BTN_GEN = "⚙️ Генератор"
+BTN_LEFT = "⏳ На скільки вистачить заряду"
 KEYBOARD = {"keyboard": [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": BTN_NOTIFY}], [{"text": BTN_HELP}]],
             "resize_keyboard": True, "is_persistent": True}
 
@@ -994,7 +995,7 @@ def obj_menu(st, chat, sid):
         head = "🟢 світло є" + (f", АКБ {last['soc']:.0f}%" if last.get("soc") is not None else "")
     on = sched_on(p, chat)
     b = lambda txt, act: {"text": txt, "callback_data": f"o:{sid}:{act}"}
-    rows = [[b("🔌 Стан", "status"), b("🗓 Графік", "grafik")],
+    rows = [[b("🔌 Стан", "status"), b("🗓 Графік", "grafik")], [b(BTN_LEFT, "left")],
             [b("🔁 Черга", "queue"), b("🔕 Вимкнути графіки" if on else "🔔 Увімкнути графіки", "notify")]]
     rows.append([b("☀️ Виробіток", "pv"), b("💰 Економія", "save")] if p.get("has_pv") else [b("💰 Економія", "save")])
     rows.append([b("⚙️ Генератор", "gen"), b("⚙️ Налаштування", "set")])
@@ -1007,12 +1008,12 @@ def kb_for(st, chat):
     objs = my_objects(st, chat)
     if len(objs) > 1:  # несколько объектов: сначала объекты, меню - по нажатию на объект
         btns = [{"text": obj_button(p)} for _, p in objs]
-        return {"keyboard": [btns[i:i + 2] for i in range(0, len(btns), 2)] + [[{"text": BTN_STATUS}, {"text": BTN_HELP}]],
+        return {"keyboard": [btns[i:i + 2] for i in range(0, len(btns), 2)] + [[{"text": BTN_STATUS}, {"text": BTN_LEFT}], [{"text": BTN_HELP}]],
                 "resize_keyboard": True, "is_persistent": True}
     mine = [p for _, p in objs]
     ons = {sched_on(p, chat) for p in mine}
     notify = BTN_SCHED_OFF if ons == {True} else BTN_SCHED_ON if ons == {False} else BTN_NOTIFY  # кнопка сразу показывает, что сделает
-    rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_QUEUE}, {"text": notify}]]
+    rows = [[{"text": BTN_STATUS}, {"text": BTN_SCHED}], [{"text": BTN_LEFT}], [{"text": BTN_QUEUE}, {"text": notify}]]
     rows.append([{"text": BTN_PV}, {"text": BTN_SAVE}] if has_pv_chat(st, chat) else [{"text": BTN_SAVE}])
     rows.append([{"text": BTN_GEN}, {"text": BTN_SET}])
     rows.append([{"text": BTN_HELP}])
@@ -1023,6 +1024,7 @@ def kb_for(st, chat):
 CLEAR_KINDS = ("cq", "cs", "q", "r", "x", "L", "S", "Q", "R", "qk", "gs", "c2", "cr", "cx", "pw", "sv", "sp", "st", "sg", "zs", "zg", "zr", "zk", "ga", "gq")
 
 CLIENT_COMMANDS = [("status", "Стан станції: світло, заряд, навантаження"),
+                   ("zaryad", "До котрої години вистачить заряду АКБ"),
                    ("grafik", "Графік відключень ДТЕК на сьогодні і завтра"),
                    ("cherga", "Змінити чергу ДТЕК"),
                    ("nalashtuvannia", "Налаштування: графіки ДТЕК і зведення виробітку"),
@@ -1172,6 +1174,8 @@ def callback(tg, st, chat, data, who, dtek, api=None):
             tg.send(chat, client_status(st, chat, api, only=c_sid), KEYBOARD)
         elif act == "grafik":
             tg.send(chat, client_schedule(st, chat, dtek, only=c_sid), KEYBOARD)
+        elif act == "left":
+            tg.send(chat, client_runtime(st, chat, api, only=c_sid), KEYBOARD)
         elif act == "queue":
             ask_queue(tg, st, chat, change=True, sid=c_sid)
         elif act == "notify":
@@ -1360,6 +1364,7 @@ def client_help(st, chat=None):
                f"{BTN_STATUS} — стан усіх об'єктів одразу.\n\n" if chat is not None and len(my_objects(st, chat)) > 1 else "") +
             "<b>Кнопки внизу екрана:</b>\n"
             f"{BTN_STATUS} — чи є світло, заряд АКБ, навантаження.\n"
+            f"{BTN_LEFT} — до котрої години протримається станція за вашого споживання саме зараз.\n"
             f"{BTN_SCHED} — коли сьогодні й завтра не буде світла.\n"
             f"{BTN_QUEUE} — обрати іншу чергу ДТЕК зі списку або додати другу лінію.\n"
             f"{BTN_SCHED_OFF} / {BTN_SCHED_ON} — одним натиском вимкнути або увімкнути графіки ДТЕК і нагадування.\n"
@@ -1369,6 +1374,8 @@ def client_help(st, chat=None):
             f"{BTN_SAVE} — економія (панелі, інвертор з АКБ під час відключень) і витрати (заряд АКБ з мережі, генератор), і підсумок.\n" +
             f"{BTN_GEN} — облік генератора: дайте відповіді на кілька запитань, і бот рахуватиме його роботу, мотогодини, ТО і витрати.\n" +
             f"{BTN_HELP} — ця підказка.\n\n"
+            "✍️ <b>Є питання?</b> Просто напишіть його сюди, у чат (можна з фото або голосовим). "
+            "Команда Solaris відповість тут же.\n\n"
             "<b>Вимкнути сповіщення</b> — /stop"
             + (f"\n\n<b>Технічна підтримка Solaris:</b>\n{esc(c)}" if c else ""))
 
@@ -1974,6 +1981,8 @@ def kb_sync(tg, st, t):
             extra = (f"\n{BTN_PV} — скільки виробили панелі: сьогодні, вчора, тиждень, місяць." if has_pv_chat(st, chat) else "") + \
                 (f"\n{BTN_SAVE} — скільки грошей заощадила станція: окремо панелі, окремо інвертор з АКБ (робота без світла), і разом.") + \
                 (f"\n{BTN_GEN} — якщо на об'єкті є генератор: дайте відповіді на кілька запитань, і бот рахуватиме його роботу, мотогодини, ТО і витрати.")
+            extra = f"\n{BTN_LEFT} — до котрої години протримається станція за вашого споживання саме зараз." + extra + \
+                "\n\n✍️ Є питання? Просто напишіть його сюди, у чат — команда Solaris відповість тут же."
             tg.send(chat, f"🔄 Бот оновився — нові кнопки внизу екрана:\n{BTN_SET} — що надсилати: графіки ДТЕК"
                           + (", зведення виробітку щодня / щотижня / щомісяця" if has_pv_chat(st, chat) else "") + f".{extra}", kb)
         sent[chat] = h
@@ -2370,7 +2379,8 @@ def client_status(st, chat, api=None, only=None):
                 else:
                     until = datetime.fromisoformat(p["off_until"]) if p.get("off_until") else None
                     until = until if until and until > now() else None
-                    line += forecast_line(st, sid, last["soc"], now(), until, p, last.get("dkw"))
+                    line += (f"\nЗа графіком світло мають дати о {hm(until)}." if until else "") + \
+                        f"\nНа скільки вистачить заряду — кнопка «{BTN_LEFT}»."
             line += f"\nДані станом на {last.get('at', '')[11:16]}."
         out.append(line)
     return "\n\n".join(out)
@@ -2572,7 +2582,7 @@ def write_snapshot(st, dtek, api=None):
     for chat in sorted({str(c) for p in st["stations"].values() for c in p.get("clients") or []}):
         kb = kb_for(st, chat)
         texts = [b["text"] for row in kb["keyboard"] for b in row] + ["/status", "/grafik", "/help", "/cherga",
-                                                                      "/nalashtuvannia", "/ekonomiya", "/vyrobitok", "/grafiky", "/generator"]
+                                                                      "/nalashtuvannia", "/ekonomiya", "/vyrobitok", "/grafiky", "/generator", "/zaryad"]
         t_ans, cb_ans, queue = {}, {}, []
         for x in dict.fromkeys(texts):
             r = rehearse(st, chat, staff, dtek, x)
@@ -2714,6 +2724,14 @@ def handle_update(tg, st, u, dtek=None, api=None):
     chat = str((m.get("chat") or {}).get("id", ""))
     text = (m.get("text") or "").strip()
     private = (m.get("chat") or {}).get("type", "private") == "private"
+    if chat and chat == str(tg.staff) and m.get("reply_to_message") and not text.startswith("/"):
+        staff_answer(tg, st, m)  # сотрудник ответил свайпом на вопрос клиента
+        return
+    if chat and private and not text and any(k in m for k in MEDIA):
+        if any(chat in (p.get("clients") or []) for p in st["stations"].values()):
+            ask_forward(tg, st, chat, m, (m.get("caption") or "").strip(),
+                        esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент"))
+        return
     if not chat or not text or (not text.startswith("/") and (chat == str(tg.staff) or not private)):
         return
     who = esc(" ".join(x for x in ((m.get("from") or {}).get("first_name"), (m.get("from") or {}).get("last_name")) if x) or "клиент")
@@ -2727,15 +2745,15 @@ def handle_update(tg, st, u, dtek=None, api=None):
             kind, _, sid = url[len(GENQ_URL):].partition(":")
             if sid in st["stations"] and chat in (st["stations"][sid].get("clients") or []) and kind in GEN_ASK_NUM:
                 st.setdefault("await", {})[chat] = {"kind": kind, "sid": sid, "at": now().isoformat()}
-    handle_message(tg, st, chat, text, who, dtek, api)
+    handle_message(tg, st, chat, text, who, dtek, api, m)
 
 
-def handle_message(tg, st, chat, text, who, dtek=None, api=None):
+def handle_message(tg, st, chat, text, who, dtek=None, api=None, msg=None):
     cmd, _, arg = text.partition(" ")
     cmd, arg = cmd.split("@")[0].lower(), arg.strip()
     if True:
         if chat != str(tg.staff):  # кнопки внизу экрана у клиента - это те же команды
-            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_SCHED_OFF: "/grafiky", BTN_SCHED_ON: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia", BTN_GEN: "/generator"}.get(text, cmd)
+            cmd = {BTN_STATUS: "/status", BTN_SCHED: "/grafik", BTN_HELP: "/help", BTN_QUEUE: "/cherga", BTN_NOTIFY: "/grafiky", BTN_SCHED_OFF: "/grafiky", BTN_SCHED_ON: "/grafiky", BTN_PV: "/vyrobitok", BTN_SAVE: "/ekonomiya", BTN_SET: "/nalashtuvannia", BTN_GEN: "/generator", BTN_LEFT: "/zaryad"}.get(text, cmd)
         is_client = any(chat in (p.get("clients") or []) for p in st["stations"].values())
         if chat == str(tg.staff):
             staff_command(tg, st, cmd, arg)
@@ -2768,6 +2786,8 @@ def handle_message(tg, st, chat, text, who, dtek=None, api=None):
         elif cmd in ("/status", "/grafik", "/help") and is_client:
             tg.send(chat, {"/status": lambda: client_status(st, chat, api), "/grafik": lambda: client_schedule(st, chat, dtek),
                            "/help": lambda: client_help(st, chat)}[cmd](), KEYBOARD)
+        elif cmd == "/zaryad" and is_client:
+            tg.send(chat, client_runtime(st, chat, api), KEYBOARD)
         elif cmd == "/cherga" and is_client:
             ask_queue(tg, st, chat, change=True)
         elif is_client and any(text == obj_button(p) for _, p in my_objects(st, chat)):
@@ -2792,6 +2812,8 @@ def handle_message(tg, st, chat, text, who, dtek=None, api=None):
             pass  # клиент прислал цену за кВт·ч
         elif cmd == "/vyrobitok" and is_client:
             tg.send(chat, pv_reply(st, chat, api), KEYBOARD)
+        elif not text.startswith("/") and is_client and is_question(st, chat, text):
+            ask_forward(tg, st, chat, msg, text, who)  # вопрос клиента - в группу, ответ сотрудника вернётся клиенту
         elif cmd == "/queue" or not text.startswith("/") or not is_client:
             client_queue(tg, st, chat, arg if cmd == "/queue" else text, who)
         elif cmd == "/stop":
@@ -2805,6 +2827,159 @@ def handle_message(tg, st, chat, text, who, dtek=None, api=None):
                 (p.get("joins") or {}).pop(chat, None)
             if n:
                 tg.staff_msg(f"👤 {who} отключил уведомления.")
+
+
+# ---------------------------------------------------------------- вопросы клиентов -> группа -> ответ клиенту
+MEDIA = ("photo", "document", "video", "voice", "audio", "video_note", "sticker", "animation")
+QUEUE_RX = re.compile(r"(?<!\d)([1-6])\s*[.,/ ]\s*([12])(?!\d)")
+
+
+def is_question(st, chat, text):
+    """Свободный текст клиента - вопрос, если это не номер очереди («3.1», «черга 3,1»)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if QUEUE_RX.search(t) and len(t) <= 25 and len(t.split()) <= 4:
+        return False  # это очередь - обрабатывает client_queue
+    return True
+
+
+def ask_forward(tg, st, chat, m, text, who):
+    """Вопрос клиента -> в группу сотрудников. Ответ свайпом на это сообщение бот перешлёт клиенту."""
+    m = m or {}
+    objs = my_objects(st, chat)
+    names = ", ".join(esc(p.get("title") or p.get("name")) for _, p in objs) or "—"
+    head = f"❓ <b>Вопрос от клиента</b> {who} · {names}"
+    how = "\n\n↩️ Ответьте на это сообщение (свайп влево) — бот отправит ответ клиенту."
+    ids = []
+    if any(k in m for k in MEDIA):
+        if tg.send(tg.staff, head + (f"\n\n{esc(text)}" if text else "") + "\n\n↩️ Вложение — следующим сообщением. "
+                   "Ответьте на любое из двух (свайп влево) — бот отправит ответ клиенту.") and tg.last_id:
+            ids.append(tg.last_id)
+        r = tg.call("copyMessage", chat_id=tg.staff, from_chat_id=chat, message_id=m.get("message_id"))
+        if (r or {}).get("ok"):
+            ids.append((r.get("result") or {}).get("message_id"))
+    elif tg.send(tg.staff, f"{head}\n\n{esc(text)}{how}") and tg.last_id:
+        ids.append(tg.last_id)
+    ids = [i for i in ids if i]
+    if not ids:
+        tg.send(chat, "Не вдалося передати питання. Напишіть, будь ласка, у технічну підтримку." + support(st), KEYBOARD)
+        return
+    q = st.setdefault("ask", {})
+    for i in ids:
+        q[str(i)] = {"chat": chat, "mid": m.get("message_id"), "who": who, "at": now().isoformat()}
+    cut = (now() - timedelta(days=60)).isoformat()
+    for k in [k for k, v in q.items() if v.get("at", "") < cut] + sorted(q, key=lambda k: q[k].get("at", ""))[:-1000]:
+        q.pop(k, None)
+    acks = st.setdefault("ask_ack", {})
+    last = acks.get(chat)
+    if not last or (now() - datetime.fromisoformat(last)).total_seconds() > 600:  # подтверждаем не чаще раза в 10 минут
+        tg.send(chat, "✅ Питання передано команді Solaris. Відповідь прийде сюди, у цей чат.", KEYBOARD)
+        acks[chat] = now().isoformat()
+
+
+def staff_answer(tg, st, m):
+    """Сотрудник ответил (свайпом) на вопрос клиента в группе: копируем ответ клиенту."""
+    rep = m.get("reply_to_message") or {}
+    a = (st.get("ask") or {}).get(str(rep.get("message_id")))
+    if not a:
+        return False
+    client = a["chat"]
+    rp = {"message_id": a["mid"], "allow_sending_without_reply": True} if a.get("mid") else None
+    text = (m.get("text") or "").strip()
+    if text:
+        body = {"chat_id": client, "text": f"💬 <b>Відповідь Solaris</b>\n\n{esc(text)}"[:4000], "parse_mode": "HTML",
+                "disable_web_page_preview": True}
+        if rp:
+            body["reply_parameters"] = rp
+        ok = (tg.call("sendMessage", **body) or {}).get("ok")
+    else:
+        tg.send(client, "💬 <b>Відповідь Solaris</b>")
+        body = {"chat_id": client, "from_chat_id": tg.staff, "message_id": m.get("message_id")}
+        if rp:
+            body["reply_parameters"] = rp
+        ok = (tg.call("copyMessage", **body) or {}).get("ok")
+    if ok:
+        tg.sent += 1
+        r = tg.call("setMessageReaction", chat_id=tg.staff, message_id=m.get("message_id"),
+                    reaction=[{"type": "emoji", "emoji": "👍"}])
+        if not (r or {}).get("ok"):
+            tg.staff_msg(f"✅ Ответ отправлен клиенту {a.get('who', '')}.")
+        a["answered"] = now().isoformat()
+    else:
+        tg.staff_msg(f"❌ Ответ не дошёл до клиента {a.get('who', '')}: он заблокировал бота или удалил чат.")
+    return True
+
+
+def client_runtime(st, chat, api=None, only=None):
+    """Кнопка «На скільки вистачить заряду»: до которого часа хватит АКБ при потреблении прямо сейчас (до 15%).
+    Свет есть - считаем, как если бы его выключили сейчас. С солнцем по прогнозу, если есть панели."""
+    out = []
+    for sid, p in my_objects(st, chat):
+        if only and sid != only:
+            continue
+        if api and not p.get("offline"):
+            try:  # свежие данные из Deye, а не то, что сохранила последняя проверка
+                if not api.token:
+                    api.login()
+                apply_latest(p, api.latest(int(sid)), now())
+            except Exception:
+                pass
+        t = now()
+        title = esc(p.get("title") or p.get("name"))
+        last = p.get("last") or {}
+        soc = last.get("soc")
+        if p.get("offline"):
+            out.append(f"🔴 <b>{title}</b>: станція не на зв'язку — порахувати зараз не можна.")
+            continue
+        if soc is None:
+            out.append(f"⏳ <b>{title}</b>: бот ще не отримав даних про заряд АКБ.")
+            continue
+        load = (last.get("load") or 0) / 1000
+        pv_now = (last.get("pv") or 0) / 1000
+        line = f"⏳ <b>{title}</b>: АКБ {soc:.0f}%" + (f", споживання зараз {load:.1f} кВт" if load else "") + "."
+        if p.get("no_grid"):
+            dkw = last.get("dkw")
+            pre = "Світла немає. За "
+        else:
+            dkw = max(load - pv_now, 0) * 1.05 if load else None  # світло є: якби його вимкнули саме зараз
+            pre = "Світло зараз є. Якщо його вимкнуть зараз, за "
+        left_h, how = runtime(st, sid, p, soc, dkw)
+        if p.get("no_grid") and p.get("gen_on"):
+            line += "\n⚙️ Зараз працює генератор — поки він працює, АКБ майже не витрачається."
+        sim = sun_sim(st, sid, p, soc, dkw, t, None)
+        sun = ""
+        if sim and sim["pv"] >= 0.5:
+            end, sun = sim["empty"], f" з урахуванням сонця (панелі дадуть ще ~{kwh(sim['pv'])} кВт·год)"
+            how = how if how != "pv" else "energy"
+        elif how == "pv":
+            out.append(line + "\nЗараз навантаження повністю покривають сонячні панелі — АКБ не розряджається."
+                       f"\nДані станом на {last.get('at', '')[11:16]}.")
+            continue
+        elif left_h is None:
+            out.append(line + "\nПоки не можу порахувати: бот ще не знає ємність АКБ і не бачив відключень на цьому об'єкті.")
+            continue
+        else:
+            end = t + timedelta(hours=left_h)
+        word = "поточного споживання" if how in ("energy", "trend") else "звичного для об'єкта споживання"
+        if end is None or end > t + timedelta(hours=24):
+            line += f"\n{pre}{word}{sun} заряду вистачить більше ніж на добу."
+        else:
+            day = "" if end.date() == t.date() else " завтра" if end.date() == (t + timedelta(days=1)).date() else f" {end.strftime('%d.%m')}"
+            line += (f"\n{pre}{word}{sun} заряду вистачить приблизно{day} до <b>{hm(end)}</b> "
+                     f"(ще ~{dur((end - t).total_seconds() / 60)}).")
+        until = datetime.fromisoformat(p["off_until"]) if p.get("no_grid") and p.get("off_until") else None
+        if until and until > t:
+            ok = end is None or end >= until + timedelta(minutes=30)
+            line += (f"\nЗа графіком світло мають дати о {hm(until)} — " +
+                     ("заряду має вистачити." if ok else "⚠️ заряду може не вистачити. Вимкніть потужні прилади."))
+        line += f"\nДані станом на {last.get('at', '')[11:16]}."
+        out.append(line)
+    if not out:
+        return "Ви не підключені до жодного об'єкта."
+    return ("\n\n".join(out) + "\n\nℹ️ Це середній час <b>на поточний момент</b> з урахуванням вашого споживання. "
+            "Якщо споживання зменшиться — станція протримається довше, якщо збільшиться — розрядиться раніше. "
+            "Рахуємо до 15% заряду: решта — запас, щоб не розряджати АКБ повністю.")
 
 
 HOWTO = ("Дізнатися чергу просто, це 1 хвилина:\n"
@@ -4139,7 +4314,8 @@ def check(api, tg, st, dtek):
                     bat = f"\nАКБ {soc:.0f}%, навантаження {load / 1000:.1f} кВт." if soc is not None else f"\nНавантаження {load / 1000:.1f} кВт."
                     until = planned_end(dtek, q, t) if plan is True else None
                     p["off_until"] = until.isoformat() if until else None
-                    fore = forecast_line(st, sid, soc, t, until, p, dkw)
+                    fore = (f"\nЗа графіком світло мають дати о {hm(until)}." if until else "") + \
+                        (f"\nНа скільки вистачить заряду — кнопка «{BTN_LEFT}»." if soc is not None else "")
                     gkb = ({"inline_keyboard": [[{"text": "▶️ Запустив генератор", "callback_data": f"gq:{sid}:on"}]]}
                            if gen_ready(p) and p.get("gen_kind") == "ats" and p.get("gen_run") == "m" else None)
                     tg.clients(chat, f"🟠 <b>{title}</b>: світло вимкнули о ~{hm(t)}.\n{kind[0].upper() + kind[1:] if kind[0] != chr(9889) else kind}.{bat}{fore}\nОб'єкт працює від станції.", urgent=True, markup=gkb)
